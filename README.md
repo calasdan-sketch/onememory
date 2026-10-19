@@ -112,6 +112,33 @@ namespace isolation, and a Claude Code SessionStart recall hook.
 
 ---
 
+## How it works
+
+```mermaid
+flowchart LR
+    subgraph Agents["Your agents"]
+        CC["Claude Code"]
+        CD["Claude Desktop"]
+        PH["Phone / Web"]
+        CU["Cursor / Copilot"]
+    end
+    subgraph OM["OneMemory (one Node process)"]
+        MCP["MCP server\n(stdio + HTTP)"]
+        REST["REST API + Dashboard"]
+        LINT["Memory linter\n(secrets + injection scan)"]
+        DB[("SQLite\n(one file)")]
+    end
+    CC <--> MCP
+    CD <--> MCP
+    CU <--> MCP
+    PH <-->|tunnel| REST
+    MCP --> LINT --> DB
+    REST --> LINT
+```
+
+Write once from your desktop, read back from your phone — every agent
+shares the same store.
+
 ## How it compares (as of October 2026)
 
 Other good projects solve overlapping problems. This table only lists things
