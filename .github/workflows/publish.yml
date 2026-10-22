@@ -24,7 +24,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
+          # Deliberately NO registry-url: it writes an .npmrc line
+          # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` and
+          # NODE_AUTH_TOKEN is never set in this tokenless workflow. npm sees
+          # an (empty) auth config instead of reaching for the OIDC exchange
+          # and the registry answers the PUT with a misleading E404 on an
+          # existing package (npm/cli#9088: their working config had no
+          # .npmrc auth config either). npm's default registry is already
+          # registry.npmjs.org.
       # Trusted publishing needs npm 11.5.1 or newer. Pin the v11 major:
       # npm@latest became npm 12 in Oct 2026 and breaks the trusted-publishing
       # handshake with a misleading E404 "Not Found - PUT", which looks like a
