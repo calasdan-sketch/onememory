@@ -250,6 +250,20 @@ export interface TokenEntry {
   token: string;
   scope: Scope;
   label: string;
+  /**
+   * Optional per-token namespace pin (PERMISSIONS, not decoration).
+   *
+   * When set, this token is confined to `namespace` for EVERY request,
+   * regardless of the server's own cwd-resolved namespace. That is what makes
+   * one shared bridge safe for several agents: token A in "work" and token B
+   * in "personal" cannot read or write each other's notes even though they
+   * hit the same server process.
+   *
+   * When unset, the token inherits the server's startup-resolved namespace
+   * exactly as before (full backward compatibility). The primary token never
+   * carries one -- it stays the operator's unrestricted escape hatch.
+   */
+  namespace?: string;
 }
 
 function isScope(s: unknown): s is Scope {
@@ -261,7 +275,10 @@ function isScope(s: unknown): s is Scope {
  * (ONEMEMORY_TOKEN or <data dir>/.token) is always admin, so single-token
  * setups behave exactly as before. Extra scoped tokens are optional and come
  * from ONEMEMORY_TOKENS (a JSON array) and/or a <data dir>/tokens.json file,
- * each entry { "token": "...", "scope": "read|write|admin", "label": "..." }.
+ * each entry { "token": "...", "scope": "read|write|admin", "label": "...",
+ * "namespace": "..." }. `namespace` optionally PINS that token to one
+ * namespace (see TokenEntry.namespace) -- per-token isolation on a shared
+ * server. The primary token never carries a namespace pin.
  * Invalid or duplicate entries are skipped rather than failing startup.
  */
 const SCOPE_RANK: Record<Scope, number> = { read: 1, write: 2, admin: 3 };
@@ -269,20 +286,59 @@ const SCOPE_RANK: Record<Scope, number> = { read: 1, write: 2, admin: 3 };
 export function resolveTokens(): TokenEntry[] {
   const byToken = new Map<string, TokenEntry>();
   const locked = new Set<string>(); // the primary admin token's scope is fixed
-  const add = (token: unknown, scope: unknown, label: unknown, lock = false): void => {
+  const add = (
+    token: unknown,
+    scope: unknown,
+    label: unknown,
+    lock = false,
+    namespace?: unknown
+  ): void => {
     if (typeof token !== "string" || !token.trim()) return;
     if (!isScope(scope)) return;
     const t = token.trim();
+    // A namespace pin is only honored when it is a non-empty string. Trimmed
+    // here so "  work  " and "work" are the same pin (a mismatch would be a
+    // silent isolation hole, not a cosmetic diff).
+    const ns = typeof namespace === "string" && namespace.trim() ? namespace.trim() : undefined;
     const existing = byToken.get(t);
     if (existing) {
       // Never downgrade/change the primary token. For any other token listed
-      // more than once, keep the MOST restrictive scope (lowest rank).
-      if (!locked.has(t) && SCOPE_RANK[scope] < SCOPE_RANK[existing.scope]) {
-        byToken.set(t, { token: t, scope, label: typeof label === "string" ? label : "" });
+      // more than once, keep the MOST restrictive scope (lowest rank) AND the
+      // most restrictive namespace: a pin always beats no pin, and on a
+      // genuine conflict (two different pins) keep the first and warn -- an
+      // ambiguous pin must never silently widen to "no pin".
+      if (!locked.has(t)) {
+        const scopeDown = SCOPE_RANK[scope] < SCOPE_RANK[existing.scope];
+        const pinTighter = ns !== undefined && existing.namespace === undefined;
+        if (scopeDown || pinTighter) {
+          const nextNs = pinTighter ? ns : existing.namespace;
+          if (ns !== undefined && existing.namespace !== undefined && ns !== existing.namespace) {
+            console.error(
+              `[onememory] token ${existing.label || "(unnamed)"} is listed with two different ` +
+                `namespaces ("${existing.namespace}" and "${ns}"); keeping "${existing.namespace}"`
+            );
+          }
+          byToken.set(t, {
+            token: t,
+            scope: scopeDown ? scope : existing.scope,
+            label: scopeDown && typeof label === "string" ? label : existing.label,
+            ...(nextNs !== undefined ? { namespace: nextNs } : {}),
+          });
+        } else if (ns !== undefined && existing.namespace !== undefined && ns !== existing.namespace) {
+          console.error(
+            `[onememory] token ${existing.label || "(unnamed)"} is listed with two different ` +
+              `namespaces ("${existing.namespace}" and "${ns}"); keeping "${existing.namespace}"`
+          );
+        }
       }
       return;
     }
-    byToken.set(t, { token: t, scope, label: typeof label === "string" ? label : "" });
+    byToken.set(t, {
+      token: t,
+      scope,
+      label: typeof label === "string" ? label : "",
+      ...(ns !== undefined ? { namespace: ns } : {}),
+    });
     if (lock) locked.add(t);
   };
 
@@ -308,8 +364,8 @@ export function resolveTokens(): TokenEntry[] {
       return;
     }
     for (const e of arr) {
-      const o = e as { token?: unknown; scope?: unknown; label?: unknown };
-      add(o?.token, o?.scope, o?.label);
+      const o = e as { token?: unknown; scope?: unknown; label?: unknown; namespace?: unknown };
+      add(o?.token, o?.scope, o?.label, false, o?.namespace);
     }
   };
 

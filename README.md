@@ -75,6 +75,36 @@ cp .env.example .env     # set ONEMEMORY_TOKEN (openssl rand -hex 32)
 docker compose up -d     # dashboard at http://localhost:8790
 ```
 
+### Backups & restore
+
+```bash
+TOKEN=$(cat ~/.onememory/.token)
+curl -H "Authorization: Bearer $TOKEN" localhost:8790/export > backup.json   # or: onememory export --format json --out backup.json
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  --data-binary @backup.json localhost:8790/import                           # admin scope only
+```
+
+- **Backups are snapshots of current notes, not per-edit history.** OneMemory
+  keeps only the latest version of each note (the `rev` counter tracks edits;
+  it is not a snapshot list), so a store with months of edits exports as one
+  entry per note with its latest body — export time and size track your note
+  count, not how often you rewrote them. The change feed's per-edit log is
+  metadata only (titles, no bodies), pruned after 90 days, and is not part of
+  a JSON backup.
+- **Exports stream.** `GET /export` and `onememory export --format json` page
+  through the store and write as they go, so peak memory is one page (500
+  notes) regardless of store size — a multi-month store dumps in one pass.
+- **Restores keep the history that exists.** `created_at`, `updated_at`,
+  `source` and the `rev` counter all survive the round trip (a note at rev 26
+  stays at rev 26, so `if_rev` guards and the change feed stay accurate).
+  Imports over 200 notes land in seconds and defer the O(n²) similarity-graph
+  rebuild — the response says so and search works immediately; run
+  `onememory rebuild-edges` when you want neighbor ranking back. Restored
+  notes are re-embedded automatically when semantic search is enabled.
+- Markdown (one file per note, git-friendly) is a separate path:
+  `onememory export --format md --dir ~/memory` — see
+  [docs/file-sync.md](./docs/file-sync.md).
+
 ---
 
 ## What makes it different
@@ -206,9 +236,16 @@ without an explicit `ONEMEMORY_TOKEN`. Constant-time bearer auth on every
 data route, scoped tokens, DNS-rebinding Origin checks, per-client rate
 limits, size caps, an append-only audit log without note content, the
 write-time linter above, and an untrusted-data banner on every read so
-agents treat note content as data, not instructions. Your notes stay in one
+agents treat note content as data, not instructions. Optional AES-256-GCM
+encryption at rest for note bodies (`onememory encrypt enable`), per-note
+TTL with reversible soft-archive, and `?explain=1` so a caller can see why
+a memory was retrieved. **Per-token namespace permissions** pin a token to
+one namespace so a single shared bridge stays isolated per agent — a pinned
+admin token is still confined. Your notes stay in one
 file on your machine; a tunnel only carries requests. Details and known
-limits: [SECURITY.md](./SECURITY.md).
+limits: [SECURITY.md](./SECURITY.md),
+[docs/token-namespaces.md](./docs/token-namespaces.md), and
+[docs/encryption-retention.md](./docs/encryption-retention.md).
 
 ## Documentation
 
@@ -222,6 +259,8 @@ limits: [SECURITY.md](./SECURITY.md).
 | [docs/memory-linter.md](./docs/memory-linter.md) | `ONEMEMORY_LINT`, detection rules, quarantine |
 | [docs/file-sync.md](./docs/file-sync.md) | Markdown export/import, GitHub and Syncthing workflows |
 | [docs/sessionstart-hook.md](./docs/sessionstart-hook.md) | automatic recall at Claude Code session start |
+| [docs/encryption-retention.md](./docs/encryption-retention.md) | at-rest encryption, retention (TTL + archive), retrieval visibility |
+| [docs/token-namespaces.md](./docs/token-namespaces.md) | per-token namespace permissions — one shared bridge, isolated agents |
 | [docs/architecture.md](./docs/architecture.md) | modules, tools, REST API, schema |
 | [SKILL.md](./SKILL.md) | when and how an agent should use the memory |
 | [CHANGELOG.md](./CHANGELOG.md) | release notes |

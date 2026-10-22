@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "A small evaluation set of repeated cross-device memory tasks.",
+    "",
+    "Each task models the project's core promise: a fact is WRITTEN from one",
+    "surface (desktop, phone, claude.ai, cursor) and RECALLED later from a",
+    "different one. The eval measures whether search actually surfaces the",
+    "right note -- recall@1, recall@5 and MRR -- so a ranking or schema",
+    "change that quietly degrades retrieval fails CI instead of shipping.",
+    "",
+    "To grow it: add { query, expected } entries. `expected` is the exact",
+    "title of the note that SHOULD rank first for `query`. Keep queries",
+    "realistic (what a human/agent would actually search), and keep the",
+    "expected note unambiguous. The harness seeds every note fresh, in order,",
+    "with no access history, so results are deterministic and reproducible."
+  ],
+  "notes": [
+    { "title": "VPN setup for office", "body": "WireGuard config for the office network. Endpoint vpn.office.net:51820. Rotate keys quarterly.", "tags": ["infra", "vpn"], "written_from": "desktop" },
+    { "title": "Standup notes 2026-10-14", "body": "Shipped the retention sweep. Blocked on the encryption key rotation design. Ask Priya about the D1 backup.", "tags": ["work", "standup"], "written_from": "desktop" },
+    { "title": "Coffee grinder setting", "body": "For the Baratza Encore, espresso needs grind size 3. Pour over is 18. Clean the burrs monthly.", "tags": ["home"], "written_from": "phone" },
+    { "title": "Kids soccer schedule", "body": "U8 practice Tuesdays 4pm at Ridgefield Field 2. Games are Saturdays 9am. Cleats live in the blue bin.", "tags": ["family"], "written_from": "phone" },
+    { "title": "Postgres connection limits", "body": "The Neon pooler caps at 1000 concurrent. Our serverless functions should use pooled mode, not direct.", "tags": ["work", "db"], "written_from": "cursor" },
+    { "title": "Preference: no meeting Wednesdays", "body": "The user prefers to keep Wednesdays meeting-free for deep work. Decline or reschedule Wednesday invites.", "tags": ["preference"], "written_from": "claude.ai" },
+    { "title": "Car service interval", "body": "Subaru Outback needs synthetic oil change every 6000 miles. Last done at 41,200 miles in July.", "tags": ["home", "car"], "written_from": "phone" },
+    { "title": "API rate limit strategy", "body": "Use token bucket with 120 requests per 10s window. Return 429 with Retry-After when exhausted.", "tags": ["work", "api"], "written_from": "cursor" },
+    { "title": "Passphrase hint", "body": "The homelab root passphrase is derived from the band name plus the year we moved in. Never store the raw value.", "tags": ["security"], "written_from": "desktop" },
+    { "title": "Travel: Lisbon hotel", "body": "Booked Casa Balthazar for the March trip. Confirmation code LX-4471. Check-in is 3pm.", "tags": ["travel"], "written_from": "claude.ai" }
+  ],
+  "tasks": [
+    { "query": "wireguard vpn office endpoint", "expected": "VPN setup for office", "why": "infra fact written on desktop, recalled from phone" },
+    { "query": "what did we ship in standup", "expected": "Standup notes 2026-10-14", "why": "work log recalled across sessions" },
+    { "query": "espresso grind size for the baratza", "expected": "Coffee grinder setting", "why": "home fact written on phone, recalled from desktop" },
+    { "query": "when is soccer practice", "expected": "Kids soccer schedule", "why": "family schedule written on phone" },
+    { "query": "neon postgres pooler connection limit", "expected": "Postgres connection limits", "why": "engineering constraint written in cursor, recalled in claude.ai" },
+    { "query": "user prefers no meetings on which day", "expected": "Preference: no meeting Wednesdays", "why": "durable preference must survive a fresh chat" },
+    { "query": "subaru oil change interval miles", "expected": "Car service interval", "why": "personal maintenance fact written on phone" },
+    { "query": "api rate limit token bucket window", "expected": "API rate limit strategy", "why": "coding convention written in cursor" },
+    { "query": "homelab root passphrase hint", "expected": "Passphrase hint", "why": "security note recalled without leaking the secret" },
+    { "query": "lisbon hotel confirmation code", "expected": "Travel: Lisbon hotel", "why": "travel detail written on claude.ai, recalled on desktop" }
+  ]
+}

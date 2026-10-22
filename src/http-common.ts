@@ -9,19 +9,39 @@ import { type TokenEntry } from "./config.js";
 // 1MB cap so a bad client can't OOM the process. Shared by both servers.
 export const MAX_BODY_BYTES = 1_000_000;
 
-// Thrown by readBody when a request body exceeds MAX_BODY_BYTES, so each
-// handler can answer 413 (payload too large) instead of a generic 500.
+// Thrown by readBody when a request body exceeds its cap, so each handler can
+// answer 413 (payload too large) instead of a generic 500.
 export class PayloadTooLargeError extends Error {}
 
 /**
- * Read a request body to a string, capped at MAX_BODY_BYTES. Uses StringDecoder
- * so a multi-byte char (emoji / Greek / CJK) split across TCP chunks is decoded
- * correctly rather than corrupted. On overflow it rejects with
- * PayloadTooLargeError and stops buffering (memory stays bounded); it does NOT
- * destroy the socket, so the handler can still deliver a 413 response rather
- * than resetting the connection.
+ * Body cap for POST /import, the backup-restore path.
+ *
+ * /export is explicitly exempt from the RESPONSE cap ("a backup must dump the
+ * whole store"), but /import never got the symmetric exemption -- so a store
+ * of only ~2000 notes produced a backup larger than the 1MB request cap and
+ * could not be restored over HTTP at all (413). A backup you cannot restore
+ * is not a backup, so restore gets a cap sized for months of notes.
+ *
+ * Still finite: an unbounded request body is a memory-exhaustion vector, and
+ * /import is admin-scoped. Override with ONEMEMORY_IMPORT_MAX_BYTES.
  */
-export function readBody(req: IncomingMessage): Promise<string> {
+export const IMPORT_BODY_BYTES = (() => {
+  const raw = process.env.ONEMEMORY_IMPORT_MAX_BYTES;
+  const n = raw ? Number(raw) : NaN;
+  // Default 256MB; clamp to [1MB, 2GB] so a typo can't disable it entirely.
+  if (!Number.isFinite(n)) return 256 * 1024 * 1024;
+  return Math.min(Math.max(Math.floor(n), 1_000_000), 2_000_000_000);
+})();
+
+/**
+ * Read a request body to a string, capped at `maxBytes` (default
+ * MAX_BODY_BYTES). Uses StringDecoder so a multi-byte char (emoji / Greek /
+ * CJK) split across TCP chunks is decoded correctly rather than corrupted.
+ * On overflow it rejects with PayloadTooLargeError and stops buffering
+ * (memory stays bounded); it does NOT destroy the socket, so the handler can
+ * still deliver a 413 response rather than resetting the connection.
+ */
+export function readBody(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<string> {
   return new Promise((resolve, reject) => {
     const decoder = new StringDecoder("utf8");
     let data = "";
@@ -30,7 +50,7 @@ export function readBody(req: IncomingMessage): Promise<string> {
     req.on("data", (chunk: Buffer) => {
       if (over) return; // past the cap: drain remaining chunks without buffering
       bytes += chunk.length;
-      if (bytes > MAX_BODY_BYTES) {
+      if (bytes > maxBytes) {
         over = true;
         reject(new PayloadTooLargeError("payload too large"));
         return;

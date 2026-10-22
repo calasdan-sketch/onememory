@@ -6,6 +6,88 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-22
+
+### Encryption at rest, retention, per-token namespaces
+
+See `docs/encryption-retention.md` and `docs/token-namespaces.md` for the
+full detail, including the tradeoffs each one makes.
+
+- **Encryption at rest (AES-256-GCM).** Note bodies are encrypted on disk;
+  the key is a 32-byte `0600` file at `~/.onememory/.key`, created on first
+  `onememory encrypt enable`. Enable, status and disable are CLI commands.
+  The honest cost: a plaintext FTS5 index cannot index ciphertext, so with
+  encryption on the body column stays empty, ciphertext lives in `body_enc`,
+  and keyword search covers **title + tags only**. Titles, tags and
+  timestamps stay plaintext for the same reason search and namespace
+  isolation need to read them; use OS disk encryption for full-file cover.
+- **Retention: TTL + archive.** `forget_after` (days) is stored as an
+  absolute `expires_at`, computed from `updated_at` so editing a note resets
+  its clock; `forget_after: 0` clears it and omitting it on update preserves
+  it. `POST /sweep-expired` archives every past-due note (idempotent, returns
+  the count, safe on a timer). An archived note is excluded from `list`,
+  keyword search, semantic search and the SessionStart recall hook —
+  genuinely forgotten by every read surface — but stays on disk and is
+  restorable, the reversible alternative to `DELETE`. `GET /notes` hides
+  archived notes by default (`?includeArchived=1`, `?archived=1`).
+- **Per-token namespace permissions.** A token can now carry an optional
+  `namespace`, so one shared server confines each agent to its own
+  namespace instead of every token seeing the same one. This is the piece
+  that makes a shared bridge safe: scoped tokens gated *actions* but never
+  *which namespace*. Tokens without a namespace behave exactly as before.
+
+### Retrieval quality: evaluation set and explain
+
+- **A retrieval evaluation set (`evals/cross-device-tasks.json`).**
+  Requested by Otherwise_Wave9374: repeated cross-device tasks scored with
+  recall@1, recall@5 and MRR, seeding a fresh store per task so access-count
+  feedback from one query cannot leak into another's ranking. It **gates**:
+  a ranking, FTS or schema change that quietly degrades retrieval fails CI
+  rather than shipping. Access boost is disabled during scoring for the
+  same determinism reason.
+- **Retrieval explain.** Search ranking is three multiplicative stages —
+  native relevance (bm25 / cosine / RRF), recency-decayed access boost, then
+  graded staleness penalty — and every intermediate used to be discarded.
+  `GET /search?q=...&explain=1` now attaches a `breakdown` to each result
+  computed from the same functions the scorer uses, so the explanation
+  cannot drift from the ranking. `finalScore = baseScore × accessBoost ×
+  stalePenalty` holds exactly, and results and their order are identical
+  with and without `explain=1` — explaining never reorders.
+
+### Backup / restore at scale — the "a few months of revisions piled up" case
+
+Answering u/pastoral_theology's question on r/ClaudeAI.
+
+- **`GET /export` streams.** It used to materialize every row, record and the
+  full JSON string at once (~3x the backup size in memory). It now pages the
+  store by primary key (`exportBatch`, 500 notes/page) and writes each page as
+  it is built, with socket backpressure respected. Peak memory is one page
+  regardless of store size; the response body is byte-identical to before
+  (`{"notes":[...]}`). `onememory export --format json` streams the same way
+  to stdout or `--out`.
+- **`POST /import` accepts a real backup.** The restore path had the general
+  1MB request cap, so a ~2000-note backup could be exported but not restored
+  (413). It now has its own cap (`IMPORT_BODY_BYTES`, 256MB), still admin-only.
+- **Bulk restores land in seconds.** Importing wrote one transaction (one WAL
+  fsync) per note, and then rebuilt the similarity graph inline — linking alone
+  is O(n²) and measured at 88–97% of restore time (8000 notes: 3.6s of inserts
+  vs 34.9s of linking). Inserts are now batched one transaction per 500 notes
+  (`IMPORT_INSERT_BATCH`), and imports over 200 notes defer the graph rebuild
+  and say so in the response — run `onememory rebuild-edges` afterwards.
+  Search is unaffected by a deferred graph.
+- **Revisions survive a restore.** `rev` is now part of the backup and is
+  restored (sane values only; garbage falls back to 1), so a note with 25
+  revisions behind it does not restart at 1 after a restore — compare-and-swap
+  guards and the change feed stay accurate. Together with the existing
+  `created_at` / `updated_at` preservation, a backup restores with its
+  history intact.
+- **What a backup is (documented):** OneMemory stores only the *latest*
+  version of each note — `rev` is a counter, not a snapshot — so a
+  revision-heavy store exports as one entry per note with its latest body,
+  and export cost tracks note count, not edit count. Per-edit history lives
+  in the `change_log` (metadata only, pruned after 90 days, not part of a
+  JSON backup). See the README "Backups & restore" section.
+
 ## [1.1.0] - 2026-10-16
 
 ### Upgrade notes

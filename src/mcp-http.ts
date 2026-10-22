@@ -19,9 +19,9 @@ import { resolve } from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Store } from "./store.js";
 import { createMcpServer } from "./mcp-server-core.js";
-import { originAllowed, RateLimiter, clientKey, authenticate } from "./security.js";
+import { originAllowed, RateLimiter, clientKey, authenticateEntry } from "./security.js";
 import { type TokenEntry } from "./config.js";
-import { type ServerNamespaceOpts } from "./namespace.js";
+import { type ServerNamespaceOpts, resolveRequestNamespace } from "./namespace.js";
 import { PayloadTooLargeError, readBody, normalizeTokens, exitOnListenError } from "./http-common.js";
 
 // Small JSON writer that never writes to an already-finished response.
@@ -47,6 +47,16 @@ export function createMcpHttpServer(
   const tokens = normalizeTokens(token);
   const limiter = new RateLimiter();
 
+  // Resolve the namespace context for ONE request: the token's own pin wins
+  // over the server's startup-resolved namespace. A fresh McpServer is built
+  // per request, so this is safe under concurrency -- nothing is shared.
+  const resolveNsForRequest = (tokenNamespace?: string): ServerNamespaceOpts => {
+    const resolved = resolveRequestNamespace(tokenNamespace, opts);
+    return resolved.active
+      ? { namespace: resolved.ownNamespace, readsFrom: resolved.readsFrom }
+      : {};
+  };
+
   return createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? "/", "http://localhost");
 
@@ -69,11 +79,12 @@ export function createMcpHttpServer(
       return;
     }
 
-    const scope = authenticate(req, tokens);
-    if (!scope) {
+    const principal = authenticateEntry(req, tokens);
+    if (!principal) {
       sendJson(res, 401, { error: "unauthorized" });
       return;
     }
+    const scope = principal.scope;
 
     try {
       let parsedBody: unknown;
@@ -92,10 +103,14 @@ export function createMcpHttpServer(
 
       // Stateless: fresh server + transport per request, same underlying Store.
       // The caller's token scope flows into the tools so a read-only token
-      // can't write or delete over this transport. The startup-resolved
-      // namespace opts are shared across requests (resolved once, not per
-      // request).
-      const server = createMcpServer(store, scope, opts);
+      // can't write or delete over this transport.
+      //
+      // Per-request namespace: a token's own pin WINS over the server's
+      // startup-resolved namespace (see resolveRequestNamespace). Because a
+      // fresh McpServer is built per request here, threading the resolved
+      // context in as `opts` is sufficient -- and concurrency-safe, since no
+      // state is shared between requests.
+      const server = createMcpServer(store, scope, resolveNsForRequest(principal.namespace));
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
       });

@@ -52,9 +52,14 @@ describe("resolveSince", () => {
 describe("Store.changes", () => {
   let store: Store;
   let t0: string;
-  before(() => {
+  before(async () => {
     store = new Store(":memory:");
     store.create({ title: "old note", source: "desktop" });
+    // SQLite's trigger stamps changed_at in whole milliseconds. Sleep so the
+    // seed note is stamped strictly BEFORE t0 -- otherwise a same-millisecond
+    // capture makes `changed_at >= t0` include it and the sanity check below
+    // fails intermittently (seen ~1-in-10 standalone).
+    await sleep(5);
     t0 = new Date().toISOString();
   });
   after(() => store.close());

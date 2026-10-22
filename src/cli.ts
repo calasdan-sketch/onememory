@@ -60,6 +60,15 @@ function usage(): void {
       "            Runs through the memory linter.",
       "  quarantine [list | approve <id> | reject <id>]",
       "            Review writes the memory linter held (ONEMEMORY_LINT).",
+      "  encrypt <enable|status|disable>",
+      "            enable   Create the AES-256-GCM key and encrypt every note",
+      "                     body at rest. Keyword search then covers title+tags",
+      "                     only (bodies cannot be indexed as ciphertext).",
+      "            status   Report whether at-rest encryption is on, the key",
+      "                     path, and how many bodies are encrypted.",
+      "            disable  Decrypt every body and remove the key file.",
+      "            When: running OneMemory as a shared / multi-agent store.",
+      "            See: docs/encryption-retention.md for the real tradeoffs.",
       "  help      Show this help",
       "",
     ].join("\n")
@@ -747,19 +756,57 @@ async function exportCmd(): Promise<void> {
     bools: ["no-prune", "force"],
   });
   const format = str(flags.format) ?? (str(flags.dir) ? "md" : undefined);
+  const { EXPORT_PAGE_SIZE } = await import("./store.js");
   const store = new Store(DB_PATH);
   try {
     if (format === "json") {
       const ns = str(flags.namespace);
-      const notes = store.exportAll().filter((n) => !ns || n.namespace === ns);
-      const text = JSON.stringify({ notes }, null, 2) + "\n";
-      if (str(flags.out)) {
-        const { writeFileSync } = await import("node:fs");
-        const { chmodQuiet } = await import("./config.js");
-        writeFileSync(str(flags.out)!, text, { mode: 0o600 }); // a full dump of your notes: owner-only
-        chmodQuiet(str(flags.out)!, 0o600); // mode only applies on create
-        console.error(`Exported ${notes.length} note(s) to ${str(flags.out)}`);
-      } else process.stdout.write(text);
+      // STREAMED export: the old path called exportAll() then JSON.stringify
+      // on the whole array, holding every row + record + the finished string
+      // in memory at once (~3x the backup). With months of notes that spikes
+      // hard on a small box. exportBatch pages by primary key so peak memory
+      // is one page. The output is still valid {"notes":[...]} JSON, only
+      // pretty-printed with one note per line so diffs stay readable.
+      const { createWriteStream, mkdirSync } = await import("node:fs");
+      const { dirname } = await import("node:path");
+      const { chmodQuiet } = await import("./config.js");
+
+      const outPath = str(flags.out);
+      let out: NodeJS.WritableStream;
+      if (outPath) {
+        mkdirSync(dirname(outPath), { recursive: true });
+        out = createWriteStream(outPath, { mode: 0o600 });
+      } else {
+        out = process.stdout;
+      }
+      const write = (s: string): Promise<void> =>
+        out.write(s) ? Promise.resolve() : new Promise((r) => out.once("drain", r));
+
+      await write('{\n  "notes": [\n');
+      let afterId = 0;
+      let first = true;
+      let count = 0;
+      for (;;) {
+        const page = store.exportBatch(afterId, EXPORT_PAGE_SIZE);
+        if (page.length === 0) break;
+        afterId = page[page.length - 1].id;
+        for (const note of page) {
+          if (ns && note.namespace !== ns) continue;
+          await write((first ? "" : ",\n") + "    " + JSON.stringify(note));
+          first = false;
+          count++;
+        }
+        if (page.length < EXPORT_PAGE_SIZE) break;
+      }
+      await write("\n  ]\n}\n");
+      if (outPath && "end" in out) {
+        await new Promise<void>((resolve, reject) => {
+          out.end(() => resolve());
+          out.on("error", reject);
+        });
+        chmodQuiet(outPath, 0o600); // mode only applies on create
+        console.error(`Exported ${count} note(s) to ${outPath}`);
+      }
       return;
     }
     if (format !== "md" || !str(flags.dir)) {
@@ -881,6 +928,82 @@ async function quarantineCmd(): Promise<void> {
   }
 }
 
+/**
+ * `onememory encrypt <enable|status|disable>` -- at-rest body encryption.
+ *
+ * enable  creates the AES-256-GCM key (if absent) and encrypts every
+ *         plaintext body in place. disable decrypts them and removes the key.
+ * Both open the store AFTER touching the key file, so the Store constructor
+ * picks up the new encryption state. See docs/encryption-retention.md.
+ */
+async function encryptCmd(): Promise<void> {
+  const { DB_PATH, DATA_DIR } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const crypto = await import("./crypto.js");
+  const [action] = process.argv.slice(3);
+
+  if (action !== "enable" && action !== "status" && action !== "disable") {
+    console.error("Usage: onememory encrypt <enable|status|disable>");
+    process.exit(1);
+  }
+
+  if (action === "status") {
+    const enabled = crypto.encryptionEnabled(DATA_DIR);
+    const keyFile = crypto.keyPath(DATA_DIR);
+    const store = new Store(DB_PATH);
+    try {
+      console.log(`encryption: ${enabled ? "on" : "off"}`);
+      console.log(`key file:   ${keyFile}${enabled ? "" : " (not present)"}`);
+      console.log(`encrypted bodies: ${store.encryptedCount()}`);
+      if (enabled) {
+        console.log(
+          "note: keyword search covers title+tags only for encrypted notes " +
+            "(bodies are not indexed as ciphertext)."
+        );
+      }
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  if (action === "enable") {
+    // Create the key BEFORE opening the store, so the constructor sees the
+    // encryption state and every subsequent write seals its body.
+    const key = crypto.ensureKey(DATA_DIR);
+    const store = new Store(DB_PATH);
+    try {
+      const n = store.encryptAll(key);
+      console.log(`Enabled at-rest encryption. Encrypted ${n} note ${n === 1 ? "body" : "bodies"}.`);
+      console.log(`Key file: ${crypto.keyPath(DATA_DIR)} -- back it up; losing it loses the bodies.`);
+      console.log("Keyword search now covers title+tags only (bodies cannot be indexed as ciphertext).");
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  // disable: decrypt everything BEFORE removing the key, so a failure leaves
+  // the store untouched and still readable.
+  const key = crypto.loadKey(DATA_DIR);
+  if (!key) {
+    console.error("Encryption is not enabled (no key file); nothing to disable.");
+    process.exit(1);
+  }
+  const store = new Store(DB_PATH);
+  let decrypted: number;
+  try {
+    decrypted = store.decryptAll(key);
+  } finally {
+    store.close();
+  }
+  // Remove the key file only after every body decrypted cleanly.
+  const { rmSync } = await import("node:fs");
+  rmSync(crypto.keyPath(DATA_DIR), { force: true });
+  console.log(`Disabled at-rest encryption. Decrypted ${decrypted} note ${decrypted === 1 ? "body" : "bodies"}.`);
+  console.log("Key file removed. Keyword search again covers full body text.");
+}
+
 /** TTY yes/no prompt; anything but y/yes aborts. */
 function askYesNo(prompt: string): Promise<boolean> {
   return new Promise((resolve) => {
@@ -940,6 +1063,9 @@ async function main(): Promise<void> {
       break;
     case "quarantine":
       await quarantineCmd();
+      break;
+    case "encrypt":
+      await encryptCmd();
       break;
     case "help":
     case "--help":

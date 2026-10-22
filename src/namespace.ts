@@ -238,6 +238,17 @@ export function readableNamespaces(
   return out;
 }
 
+/** readableNamespaces() for a per-request NsCtx. */
+export function readableIn(ctx: NsCtx): string[] {
+  return ctx.active ? readableNamespaces(ctx.ownNamespace, ctx.readsFrom) : [];
+}
+
+/** canRead() for a per-request NsCtx. Always false when the ctx is disabled. */
+export function ctxCanRead(ctx: NsCtx, targetNamespace: string): boolean {
+  if (!ctx.active) return true; // no boundary: legacy permissive
+  return canRead(ctx.readsFrom, ctx.ownNamespace, targetNamespace);
+}
+
 /**
  * Read-access check: a server resolved to `ownNamespace` may read `target`
  * when it IS its own namespace, or when its grants list the target.
@@ -273,6 +284,73 @@ export function validateSpacePaths(cfg: NamespaceConfig): string[] {
 export interface ResolvedNamespace {
   namespace: string;
   readsFrom: Record<string, string[]>;
+}
+
+/**
+ * Per-REQUEST namespace context, resolved from the authenticated token plus
+ * the server's startup config.
+ *
+ * This is what turns per-token namespace pins into real isolation. Before
+ * this existed, `namespace` was a per-PROCESS constant (resolved once from
+ * the cwd), so every token hitting one shared server saw the same namespace
+ * -- scoped tokens gated ACTIONS (read/write/admin) but never WHICH
+ * namespace. That is exactly the "shared memory every agent can read" hole.
+ *
+ * `active` mirrors the old `nsActive`: when false there is no boundary to
+ * enforce and behavior is the legacy permissive one.
+ */
+export interface NsCtx {
+  /** True when a namespace boundary must be enforced for this request. */
+  active: boolean;
+  /** The namespace this request may write to, and read without a grant. */
+  ownNamespace: string;
+  /** One-directional read grants, keyed by the GRANTOR namespace. */
+  readsFrom: Record<string, string[]>;
+}
+
+/** No boundary: legacy permissive behavior (every note readable/writable). */
+export const NS_DISABLED: NsCtx = { active: false, ownNamespace: "", readsFrom: {} };
+
+/**
+ * Resolve the namespace context for ONE request.
+ *
+ * Precedence, deliberately:
+ *   1. The token's `namespace` pin, when present -- PER-TOKEN ISOLATION WINS.
+ *      A pinned token is confined to its namespace no matter what the server
+ *      resolved from its cwd. This is the property that makes one shared
+ *      bridge safe for several agents.
+ *   2. Otherwise the server's startup-resolved namespace (legacy behavior,
+ *      fully backward compatible).
+ *   3. Otherwise disabled.
+ *
+ * Grants (`reads_from`) are keyed by namespace and always come from the
+ * server's operator-controlled config, never from the token: a token may say
+ * WHERE it lives, but only the operator can say WHAT it may additionally
+ * read. A pinned token's grants are therefore `grants[pinnedNamespace]` --
+ * the operator grants access to a namespace, and any token pinned there
+ * inherits it.
+ */
+export function resolveRequestNamespace(
+  tokenNamespace: string | undefined,
+  server: ResolvedNamespace | ServerNamespaceOpts | null | undefined
+): NsCtx {
+  const serverNs =
+    server && typeof server.namespace === "string" && server.namespace.trim()
+      ? server.namespace.trim()
+      : undefined;
+  const grants = server?.readsFrom ?? {};
+
+  // 1. Token pin wins: this request is confined to the token's namespace.
+  if (tokenNamespace && tokenNamespace.trim()) {
+    const own = tokenNamespace.trim();
+    return { active: true, ownNamespace: own, readsFrom: grants };
+  }
+  // 2. Server-resolved namespace applies to unpinned tokens.
+  if (serverNs) {
+    return { active: true, ownNamespace: serverNs, readsFrom: grants };
+  }
+  // 3. No boundary configured at all.
+  return NS_DISABLED;
 }
 
 /**

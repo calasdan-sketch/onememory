@@ -16,6 +16,7 @@ import { extractKeywords } from "./keywords.js";
 import {
   stalenessConfig,
   stalePenaltyFactor,
+  isStale,
   type StalenessConfig,
 } from "./staleness.js";
 
@@ -101,18 +102,31 @@ function daysSinceAccess(lastAccessed: string | null | undefined): number | null
   return Math.max(0, (Date.now() - t) / 86_400_000);
 }
 
+/**
+ * The access-boost MULTIPLIER (>= 1.0) for a note's read history, exposed
+ * separately so the retrieval-explain layer can report the exact factor that
+ * ranking applied rather than reverse-engineering it from two scores.
+ * Refactor of accessBoost(): identical math, factored so 1.0 means "no boost".
+ */
+export function accessBoostFactor(
+  accessCount: number,
+  lastAccessed: string | null
+): number {
+  const c = Math.max(0, Math.floor(accessCount));
+  if (c === 0) return 1; // no read signal -> no boost
+  const days = daysSinceAccess(lastAccessed);
+  // Unparseable last_accessed with a positive count shouldn't happen
+  // (touch() always sets both); trust the count rather than zeroing it.
+  const decay = days === null ? 1 : Math.exp(-days / ACCESS_BOOST_TAU_DAYS);
+  return 1 + ACCESS_BOOST_FACTOR * Math.log10(1 + c) * decay;
+}
+
 function accessBoost(
   baseScore: number,
   accessCount: number,
   lastAccessed: string | null
 ): number {
-  const c = Math.max(0, Math.floor(accessCount));
-  if (c === 0) return baseScore; // no read signal -> no boost
-  const days = daysSinceAccess(lastAccessed);
-  // Unparseable last_accessed with a positive count shouldn't happen
-  // (touch() always sets both); trust the count rather than zeroing it.
-  const decay = days === null ? 1 : Math.exp(-days / ACCESS_BOOST_TAU_DAYS);
-  return baseScore * (1 + ACCESS_BOOST_FACTOR * Math.log10(1 + c) * decay);
+  return baseScore * accessBoostFactor(accessCount, lastAccessed);
 }
 
 /** Multiply each hit's recency-aware access boost and re-rank (stable). */
@@ -188,6 +202,116 @@ function finalizeResults(
   const notes = ranked.slice(0, limit).map((h) => h.note);
   bumpAccess(store, notes);
   return notes;
+}
+
+// ---- Retrieval visibility --------------------------------------------------
+// "Visibility into why a memory was retrieved." Search ranking is three
+// multiplicative stages -- native relevance (bm25/cosine/RRF) -> recency-
+// decayed access boost -> graded staleness penalty -- and until now every
+// intermediate was discarded, so an agent (or a user) could see WHICH notes
+// came back but never WHY one outranked another. These types expose the
+// actual factors the scorer used, computed from the same functions, so the
+// explanation can never drift from the ranking.
+
+/** Why one note outranked another, using the scorer's real factors. */
+export interface ScoreBreakdown {
+  /** Final score after all stages (higher = better). */
+  finalScore: number;
+  /** Native relevance before boosts/penalties: bm25, cosine, or RRF fusion. */
+  baseScore: number;
+  /** Recency-decayed access boost multiplier (1.0 = no boost). */
+  accessBoost: number;
+  /** Graded staleness penalty (1.0 = fresh, <1 = demoted). */
+  stalePenalty: number;
+  /** Read count that produced the boost (0 = never read). */
+  accessCount: number;
+  /** Whole days since the last read; null = never read. */
+  daysSinceAccess: number | null;
+  /** Days since updated_at; the staleness input. */
+  ageDays: number;
+  /** True when the staleness penalty was applied. */
+  stale: boolean;
+  /** Human-readable one-liner, e.g. "strong keyword match; read 3x yesterday; 40d old (demoted)". */
+  explanation: string;
+}
+
+/** A search hit carrying its ranking rationale alongside the note. */
+export interface ExplainedHit {
+  note: NoteRecord;
+  breakdown: ScoreBreakdown;
+}
+
+/**
+ * Build the human-readable one-liner from the computed factors. Kept pure and
+ * separate so it is testable without running a search.
+ */
+export function describeBreakdown(b: Omit<ScoreBreakdown, "explanation">): string {
+  const parts: string[] = [];
+  // Base-relevance descriptor: rough bands on the multiplicative base score.
+  if (b.baseScore <= 0) parts.push("no native relevance signal");
+  else if (b.baseScore >= 1) parts.push("strong text match");
+  else if (b.baseScore >= 0.3) parts.push("moderate text match");
+  else parts.push("weak text match");
+
+  if (b.accessCount > 0) {
+    const when =
+      b.daysSinceAccess === null
+        ? "time unknown"
+        : b.daysSinceAccess < 1
+          ? "today"
+          : `${Math.round(b.daysSinceAccess)}d ago`;
+    parts.push(`read ${b.accessCount}x, last ${when} (boost x${b.accessBoost.toFixed(3)})`);
+  } else {
+    parts.push("never read (no boost)");
+  }
+
+  if (b.stale) {
+    parts.push(`${b.ageDays}d old (demoted x${b.stalePenalty.toFixed(3)})`);
+  } else {
+    parts.push(`fresh (${b.ageDays}d old)`);
+  }
+  return parts.join("; ") + ".";
+}
+
+/**
+ * finalizeResults twin that keeps the intermediate factors. Ranking order is
+ * byte-identical to finalizeResults -- both call the same boostAndRank /
+ * applyStalePenalty functions -- so adding explain never reorders results.
+ */
+function finalizeExplained(
+  store: Store,
+  hits: Array<{ note: NoteRecord; score: number }>,
+  limit: number,
+  staleCfg: StalenessConfig
+): ExplainedHit[] {
+  // Capture native relevance per id BEFORE any boost, so the breakdown can
+  // report the true base rather than the post-boost score.
+  const baseById = new Map<number, number>(hits.map((h) => [h.note.id, h.score]));
+  const ranked = accessRerankEnabled()
+    ? applyStalePenalty(boostAndRank(hits), staleCfg)
+    : [...hits].sort((a, b) => b.score - a.score);
+  const top = ranked.slice(0, limit);
+  bumpAccess(store, top.map((h) => h.note));
+
+  return top.map((h) => {
+    const base = baseById.get(h.note.id) ?? h.score;
+    const accessBoost = accessRerankEnabled()
+      ? accessBoostFactor(h.note.access_count, h.note.last_accessed)
+      : 1;
+    const staleInfo = isStale(h.note, staleCfg);
+    const stalePenalty = accessRerankEnabled() ? stalePenaltyFactor(h.note, staleCfg) : 1;
+    const partial = {
+      finalScore: h.score,
+      baseScore: base,
+      accessBoost,
+      stalePenalty,
+      accessCount: h.note.access_count ?? 0,
+      daysSinceAccess: daysSinceAccess(h.note.last_accessed),
+      ageDays: staleInfo.ageDays,
+      stale: staleInfo.stale,
+    };
+    return { note: h.note, breakdown: { ...partial, explanation: describeBreakdown(partial) } };
+  });
 }
 
 /**
@@ -333,6 +457,113 @@ export async function runSearch(
     hits = hits.filter((h) => inRange.has(h.note.id));
   }
   return finalize(hits);
+}
+
+/**
+ * runSearch twin that also returns each hit's ranking rationale.
+ *
+ * Mirrors runSearch's branching exactly (time-only list, keyword-only,
+ * semantic, hybrid) and swaps finalizeExplained for finalizeResults, so the
+ * notes and their order are identical to runSearch -- only the explanation
+ * is added. Exposed on the API via GET /search?explain=1 and on the MCP
+ * state_search tool, so an agent can see WHY a memory was recalled instead
+ * of silently trusting the ranking.
+ */
+export async function runSearchExplained(
+  store: Store,
+  query: string,
+  opts: SearchOpts = {}
+): Promise<ExplainedHit[]> {
+  const limit = clampInt(opts.limit, 20, 1, 200);
+  const mode: SearchMode = opts.mode ?? parseMode(undefined);
+  const range = opts.timeRange;
+  const rangeOpts =
+    range !== undefined
+      ? { startISO: range.start.toISOString(), endISO: range.end.toISOString() }
+      : {};
+  const staleCfg = stalenessConfig();
+
+  // Time-only query: a recency list has no relevance score to explain, but
+  // the notes were still read by the caller, so bump access like runSearch.
+  if (range !== undefined && !query.trim()) {
+    const listed = store.list({ namespace: opts.namespace, limit, ...rangeOpts }).notes;
+    bumpAccess(store, listed);
+    return listed.map((note) => ({
+      note,
+      breakdown: explainedRecencyOnly(note),
+    }));
+  }
+
+  const keyword = (fetchLimit: number): Array<{ note: NoteRecord; score: number }> =>
+    store.searchRanked(query, {
+      namespace: opts.namespace,
+      limit: fetchLimit,
+      ...rangeOpts,
+    });
+
+  const finalize = (hits: Array<{ note: NoteRecord; score: number }>): ExplainedHit[] =>
+    finalizeExplained(store, hits, limit, staleCfg);
+
+  if (mode === "keyword" || !embeddingsEnabled()) return finalize(keyword(limit));
+
+  const qv = await embed(query);
+  if (!qv) return finalize(keyword(limit));
+
+  const poolLimit = clampInt(limit * 5, 100, 1, 200);
+  const semHits = store.semanticSearch(qv, {
+    namespace: opts.namespace,
+    limit: poolLimit,
+    ...rangeOpts,
+  });
+
+  if (mode === "semantic") {
+    let hits = semHits.map((h) => ({ note: h.note, score: h.score }));
+    if (range !== undefined) {
+      const inRange = new Set(
+        filterByTimeRange(hits.map((h) => h.note), range).map((n) => n.id)
+      );
+      hits = hits.filter((h) => inRange.has(h.note.id));
+    }
+    return finalize(hits);
+  }
+
+  // hybrid
+  const ftsHits = keyword(poolLimit);
+  const fusedScores = rrfScores([
+    ftsHits.map((h) => h.note.id),
+    semHits.map((h) => h.note.id),
+  ]);
+  const byId = new Map<number, NoteRecord>();
+  for (const h of ftsHits) byId.set(h.note.id, h.note);
+  for (const h of semHits) byId.set(h.note.id, h.note);
+  let hits = [...fusedScores.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([id, score]) => ({ note: byId.get(id)!, score }))
+    .filter((h) => h.note !== undefined);
+  if (range !== undefined) {
+    const inRange = new Set(filterByTimeRange(hits.map((h) => h.note), range).map((n) => n.id));
+    hits = hits.filter((h) => inRange.has(h.note.id));
+  }
+  return finalize(hits);
+}
+
+/** Breakdown for a recency-only listing: no relevance signal to report. */
+function explainedRecencyOnly(note: NoteRecord): ScoreBreakdown {
+  const staleInfo = isStale(note, stalenessConfig());
+  const partial = {
+    finalScore: 0,
+    baseScore: 0,
+    accessBoost: 1,
+    stalePenalty: 1,
+    accessCount: note.access_count ?? 0,
+    daysSinceAccess: daysSinceAccess(note.last_accessed),
+    ageDays: staleInfo.ageDays,
+    stale: staleInfo.stale,
+  };
+  return {
+    ...partial,
+    explanation: `recency listing (no relevance query); ${describeBreakdown(partial)}`,
+  };
 }
 
 export interface RelevantOpts {

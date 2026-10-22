@@ -20,8 +20,10 @@ import {
   clampInt,
   resolveEdgeThreshold,
   REBUILD_CONFIRM_NOTE_COUNT,
+  EXPORT_PAGE_SIZE,
+  type ImportNote,
 } from "./store.js";
-import { originAllowed, RateLimiter, clientKey, authenticate, scopeAllows, LIMITS } from "./security.js";
+import { originAllowed, RateLimiter, clientKey, authenticateEntry, scopeAllows, LIMITS } from "./security.js";
 import { type Scope, type TokenEntry, TIME_ZONE, PROJECT_ROOT } from "./config.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -48,13 +50,27 @@ function signAsset(file: string): string | null {
   }
   return signCache.get(file) ?? null;
 }
-import { PayloadTooLargeError, readBody, normalizeTokens } from "./http-common.js";
+import { PayloadTooLargeError, readBody, normalizeTokens, IMPORT_BODY_BYTES } from "./http-common.js";
+
+/**
+ * Import size above which the similarity-graph rebuild is DEFERRED rather
+ * than done inline. Linking is O(n^2) and dominates bulk-restore time
+ * (measured 88-97%), while only affecting neighbor ranking -- not search,
+ * not the stored notes. 200 is where inline linking starts to cost seconds;
+ * below it the graph is ready immediately, which matters more for a 1-note
+ * import than the saved milliseconds.
+ */
+const IMPORT_EDGE_DEFER_THRESHOLD = 200;
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard.js";
-import { runSearch, parseMode, maybeEmbed, runRelevantSearch, roundRobin } from "./search-service.js";
+import { runSearch, runSearchExplained, parseMode, maybeEmbed, runRelevantSearch, roundRobin, type ExplainedHit } from "./search-service.js";
 import {
   type ServerNamespaceOpts,
-  canRead,
-  readableNamespaces,
+  type ResolvedNamespace,
+  type NsCtx,
+  NS_DISABLED,
+  resolveRequestNamespace,
+  readableIn,
+  ctxCanRead,
 } from "./namespace.js";
 import { parseTimePhrase } from "./time-parse.js";
 import { annotateStaleness } from "./staleness.js";
@@ -73,6 +89,11 @@ function requiredScope(method: string | undefined, path: string): Scope {
   if (method === "POST" && path === "/relevant") return "read";
   // /rebuild-edges rewrites the similarity graph: admin-only, like delete.
   if (method === "POST" && path === "/rebuild-edges") return "admin";
+  // Retention: archiving hides a note from every read surface (a soft
+  // delete) and the sweep archives many at once -- both admin, like DELETE.
+  // Restoring is equally admin: it re-exposes a note an operator retired.
+  if (method === "POST" && /^\/notes\/\d+\/(archive|restore)$/.test(path)) return "admin";
+  if (method === "POST" && path === "/sweep-expired") return "admin";
   if (method === "POST" || method === "PUT") return "write";
   return "read";
 }
@@ -129,21 +150,36 @@ export function createApiServer(
   const limiter = new RateLimiter();
 
   // Server-side namespace resolution, active only when the entry point
-  // resolved a namespace at startup (see resolveStartupNamespace). Mirrors
-  // the MCP layer: writes are forced into the resolved namespace, reads
-  // are limited to it plus its grants, and any client-supplied `namespace`
-  // is an untrusted hint.
-  const nsActive = typeof opts.namespace === "string" && opts.namespace.length > 0;
-  const ownNs = opts.namespace ?? "";
-  const grants = opts.readsFrom ?? {};
-  const readable = (): string[] => readableNamespaces(ownNs, grants);
-  const trustedHint = (hint: string | undefined): string | undefined =>
-    hint && canRead(grants, ownNs, hint) ? hint : undefined;
+  // resolved a namespace at startup (see resolveStartupNamespace), OR when
+  // the AUTHENTICATED TOKEN carries a namespace pin.
+  //
+  // Per-token pinning is what makes one shared bridge safe for several
+  // agents: `resolveRequestNamespace` runs per REQUEST (not per process), so
+  // a token pinned to "work" is confined to "work" even though the server
+  // process resolved a different namespace from its cwd. Tokens with no pin
+  // fall back to the server's resolution -- byte-identical legacy behavior.
+  const serverNs: ResolvedNamespace | null =
+    typeof opts.namespace === "string" && opts.namespace.length > 0
+      ? { namespace: opts.namespace, readsFrom: opts.readsFrom ?? {} }
+      : null;
+
+  // The request-scoped namespace context is NOT declared here: it lives as a
+  // local inside each request handler (see `ns` below), because this server
+  // handles CONCURRENT requests and a factory-scoped `let` mutated per
+  // request would be clobbered by an interleaved request while an earlier one
+  // sits in an `await` -- which is exactly the cross-namespace leak per-token
+  // pinning exists to prevent. The helpers below take the context as their
+  // first argument for the same reason.
+
+  const readable = (ctx: NsCtx): string[] => readableIn(ctx);
+  const trustedHint = (ctx: NsCtx, hint: string | undefined): string | undefined =>
+    hint && ctxCanRead(ctx, hint) ? hint : undefined;
   // 404 helper for a note outside the readable set (or missing): a distinct
   // 403 would let the caller probe which ids exist in other namespaces.
   // When namespace resolution is inactive there is no readable set to
   // enforce -- every note is readable (legacy behavior).
   const denyUnreadable = (
+    ctx: NsCtx,
     res: ServerResponse,
     note: NoteRecord | null
   ): note is NoteRecord => {
@@ -151,20 +187,21 @@ export function createApiServer(
       sendJson(res, 404, { error: "not found" });
       return false;
     }
-    if (nsActive && !canRead(grants, ownNs, note.namespace)) {
+    if (ctx.active && !ctxCanRead(ctx, note.namespace)) {
       sendJson(res, 404, { error: "not found" });
       return false;
     }
     return true;
   };
   // Write/delete access never crosses namespaces: the note must live in the
-  // server's own namespace (a read grant confers no write access). Uniform
+  // request's own namespace (a read grant confers no write access). Uniform
   // 404 again, so cross-namespace writes are no existence oracle either.
   const denyUnwritable = (
+    ctx: NsCtx,
     res: ServerResponse,
     note: NoteRecord | null
   ): note is NoteRecord => {
-    if (!note || note.namespace !== ownNs) {
+    if (!note || note.namespace !== ctx.ownNamespace) {
       sendJson(res, 404, { error: "not found" });
       return false;
     }
@@ -173,12 +210,24 @@ export function createApiServer(
   // List across every readable namespace, newest-first like store.list,
   // paged in SQL so total and deep offsets are exact.
   const listReadable = (
+    ctx: NsCtx,
     limit?: number,
-    offset?: number
+    offset?: number,
+    includeArchived?: boolean,
+    archivedOnly?: boolean
   ): { notes: NoteRecord[]; total: number } =>
-    store.list({ namespaces: readable(), limit, offset });
+    store.list({ namespaces: readable(ctx), limit, offset, includeArchived, archivedOnly });
 
   return createServer(async (req, res) => {
+    // Per-request namespace context. A LOCAL, not a factory-scoped mutable:
+    // this server serves concurrent requests, and a shared `let` would be
+    // overwritten by an interleaved request while an earlier one is parked in
+    // an await (readBody) -- leaking one token's namespace into another's
+    // response. Named `nsCtx` (not `ns`) so it can never be shadowed by the
+    // `for (const ns of readable(nsCtx))` loop variables below.
+    let nsCtx: NsCtx = serverNs
+      ? { active: true, ownNamespace: serverNs.namespace, readsFrom: serverNs.readsFrom }
+      : NS_DISABLED;
     try {
       const url = new URL(req.url ?? "/", "http://localhost");
       const path = url.pathname;
@@ -260,11 +309,16 @@ export function createApiServer(
         return;
       }
 
-      const scope = authenticate(req, tokens);
-      if (!scope) {
+      const principal = authenticateEntry(req, tokens);
+      if (!principal) {
         sendJson(res, 401, { error: "unauthorized" });
         return;
       }
+      const scope = principal.scope;
+      // Per-request namespace: a token's own pin WINS over the server's
+      // cwd-resolved namespace. This is the isolation boundary for this
+      // request -- resolved here, once, so every gate below reads `ns`.
+      nsCtx = resolveRequestNamespace(principal.namespace, serverNs);
       // Enforce the token's scope: a read-only token can't write/delete, etc.
       const need = requiredScope(req.method, path);
       if (!scopeAllows(scope, need)) {
@@ -289,7 +343,7 @@ export function createApiServer(
         try {
           // When namespace resolution is active the client-supplied namespace
           // is untrusted: writes always land in the server-resolved namespace.
-          if (nsActive) parsed.namespace = ownNs;
+          if (nsCtx.active) parsed.namespace = nsCtx.ownNamespace;
           const warnings: LintFinding[] = [];
           const note = store.create(parsed, { lintWarnings: warnings });
           await maybeEmbed(store, note);
@@ -310,10 +364,10 @@ export function createApiServer(
         // importance weighting or search ranking. Without namespace
         // resolution there is no cross-namespace boundary, so the probe is
         // just a 404 check (denyUnreadable's canRead gate would 404 every
-        // read when ownNs is "").
+        // read when nsCtx.ownNamespace is "").
         const probe = store.read(id);
-        if (nsActive) {
-          if (!denyUnreadable(res, probe)) return;
+        if (nsCtx.active) {
+          if (!denyUnreadable(nsCtx, res, probe)) return;
         } else if (!probe) {
           sendJson(res, 404, { error: "not found" });
           return;
@@ -360,13 +414,13 @@ export function createApiServer(
           return;
         }
         try {
-          if (nsActive) {
+          if (nsCtx.active) {
             // The client-supplied namespace is dropped (the note keeps its
             // existing namespace), and the note must live in the server's
             // own namespace -- otherwise a PUT by id could rewrite a granted
             // namespace's notes (grants are read-only).
             const existing = store.read(id);
-            if (!denyUnwritable(res, existing)) return;
+            if (!denyUnwritable(nsCtx, res, existing)) return;
             delete parsed.namespace;
           }
           const warnings: LintFinding[] = [];
@@ -386,10 +440,10 @@ export function createApiServer(
       // DELETE /notes/:id
       if (req.method === "DELETE" && idMatch) {
         const id = Number(idMatch[1]);
-        if (nsActive) {
+        if (nsCtx.active) {
           // Same own-namespace rule as the MCP state_delete tool: a read
           // grant never confers delete access.
-          if (!denyUnwritable(res, store.read(id))) return;
+          if (!denyUnwritable(nsCtx, res, store.read(id))) return;
         }
         const removed = store.delete(id);
         if (!removed) {
@@ -400,30 +454,81 @@ export function createApiServer(
         return;
       }
 
-      // GET /notes?namespace=&limit=&offset=
+      // Retention: POST /notes/:id/archive -> soft-archive a note. It drops
+      // out of list/search/recall but stays on disk and is restorable. This is
+      // the reversible alternative to DELETE for "forget this".
+      const archMatch = /^\/notes\/(\d+)\/archive$/.exec(path);
+      if (req.method === "POST" && archMatch) {
+        const id = Number(archMatch[1]);
+        const note = store.read(id);
+        if (!note) {
+          sendJson(res, 404, { error: "not found" });
+          return;
+        }
+        if (nsCtx.active && !denyUnwritable(nsCtx, res, note)) return;
+        const archived = store.archive(id);
+        sendJson(res, 200, { archived: id, note: annotateStaleness(archived!) });
+        return;
+      }
+
+      // Retention: POST /notes/:id/restore -> bring an archived note back.
+      const restoreMatch = /^\/notes\/(\d+)\/restore$/.exec(path);
+      if (req.method === "POST" && restoreMatch) {
+        const id = Number(restoreMatch[1]);
+        const note = store.read(id);
+        if (!note) {
+          sendJson(res, 404, { error: "not found" });
+          return;
+        }
+        if (nsCtx.active && !denyUnwritable(nsCtx, res, note)) return;
+        const restored = store.restore(id);
+        sendJson(res, 200, { restored: id, note: annotateStaleness(restored!) });
+        return;
+      }
+
+      // Retention: POST /sweep-expired -> archive every note past its TTL.
+      // Returns how many were archived. Safe to call on a timer/cron.
+      if (req.method === "POST" && path === "/sweep-expired") {
+        const archived = store.sweepExpired();
+        sendJson(res, 200, { archived });
+        return;
+      }
+
+      // GET /notes?namespace=&limit=&offset=&includeArchived=1&archived=1
       if (req.method === "GET" && path === "/notes") {
         const namespace = url.searchParams.get("namespace") ?? undefined;
         const limit = url.searchParams.get("limit");
         const offset = url.searchParams.get("offset");
-        if (nsActive) {
+        // Retention: archived notes are excluded by default. includeArchived
+        // shows everything; archived=1 shows ONLY the archive (the restore
+        // view). Both are read-scoped -- seeing that a note was archived is
+        // not privileged, and the namespace filter still applies.
+        const includeArchived = url.searchParams.get("includeArchived") === "1";
+        const archivedOnly = url.searchParams.get("archived") === "1";
+        if (nsCtx.active) {
           // Untrusted hint intersected with the readable set, like the MCP
           // state_list tool.
-          const hint = trustedHint(namespace);
+          const hint = trustedHint(nsCtx, namespace);
           if (hint) {
             const result = store.list({
               namespace: hint,
               limit: limit ? Number(limit) : undefined,
               offset: offset ? Number(offset) : undefined,
+              includeArchived,
+              archivedOnly,
             });
             sendJson(res, 200, { ...result, searchedNamespaces: [hint] });
             return;
           }
           sendJson(res, 200, {
             ...listReadable(
+              nsCtx,
               limit ? Number(limit) : undefined,
-              offset ? Number(offset) : undefined
+              offset ? Number(offset) : undefined,
+              includeArchived,
+              archivedOnly
             ),
-            searchedNamespaces: readable(),
+            searchedNamespaces: readable(nsCtx),
           });
           return;
         }
@@ -431,6 +536,8 @@ export function createApiServer(
           namespace,
           limit: limit ? Number(limit) : undefined,
           offset: offset ? Number(offset) : undefined,
+          includeArchived,
+          archivedOnly,
         });
         sendJson(res, 200, {
           ...result,
@@ -445,6 +552,12 @@ export function createApiServer(
         const namespace = url.searchParams.get("namespace") ?? undefined;
         const limit = url.searchParams.get("limit");
         const whenRaw = url.searchParams.get("when") ?? undefined;
+        // Retrieval visibility: ?explain=1 swaps the plain search for the
+        // explained twin and attaches a `breakdown` to each result, so the
+        // caller sees the exact base relevance / access boost / staleness
+        // factors that produced the ranking. Off by default to keep the
+        // common response small and byte-compatible.
+        const explain = url.searchParams.get("explain") === "1";
         // Like the MCP tool, an unrecognized time phrase is ignored rather
         // than an error -- the query still runs unscoped.
         const timePhrase = whenRaw ? parseTimePhrase(whenRaw, { timeZone: TIME_ZONE }) : null;
@@ -452,25 +565,36 @@ export function createApiServer(
           sendJson(res, 400, { error: "q is required" });
           return;
         }
-        if (nsActive) {
+        // Shape a hit for the wire: staleness annotation always, breakdown
+        // only when explain=1. Shared by all three namespace branches.
+        const shapeHit = (n: NoteRecord, breakdown?: unknown): Record<string, unknown> => ({
+          ...annotateStaleness(n),
+          ...(breakdown !== undefined ? { breakdown } : {}),
+        });
+        const toResults = (hits: ExplainedHit[]): Record<string, unknown>[] =>
+          hits.map((h) => shapeHit(h.note, h.breakdown));
+        if (nsCtx.active) {
           // Untrusted hint intersected with the readable set, like the MCP
           // state_search tool: fan out over every readable namespace when
           // the hint is missing or names something unreadable. The
           // per-namespace lists merge round-robin so a later namespace is
           // never starved by an earlier one's hits.
-          const hint = trustedHint(namespace);
+          const hint = trustedHint(nsCtx, namespace);
           const searchOpts = {
             limit: limit ? Number(limit) : undefined,
             mode: parseMode(url.searchParams.get("mode")),
             timeRange: timePhrase ? { start: timePhrase.start, end: timePhrase.end } : undefined,
           };
-          // timeRange surfaces how `when` was interpreted (null = unscoped).
-          // Hits carry their staleness fields (stale/ageDays, plus
-          // staleWarning when stale) like the MCP state_search tool.
-          // searchedNamespaces echoes which namespaces were actually
-          // searched (an unreadable hint silently falls back to the
-          // readable set -- the caller should know).
           if (hint) {
+            if (explain) {
+              const hits = await runSearchExplained(store, q, { ...searchOpts, namespace: hint });
+              sendJson(res, 200, {
+                results: toResults(hits),
+                timeRange: timePhrase ? timePhrase.label : null,
+                searchedNamespaces: [hint],
+              });
+              return;
+            }
             const results = await runSearch(store, q, { ...searchOpts, namespace: hint });
             sendJson(res, 200, {
               results: results.map((n) => annotateStaleness(n)),
@@ -479,24 +603,51 @@ export function createApiServer(
             });
             return;
           }
+          const lim = clampInt(searchOpts.limit, 20, 1, 200);
+          if (explain) {
+            const perNs: ExplainedHit[][] = [];
+            for (const ns of readable(nsCtx)) {
+              perNs.push(await runSearchExplained(store, q, { ...searchOpts, namespace: ns }));
+            }
+            // Interleave the explained lists by note id, preserving each
+            // list's internal order, then re-attach the breakdown by id.
+            const merged = roundRobin(perNs.map((l) => l.map((h) => h.note)), lim);
+            const byId = new Map<number, unknown>();
+            for (const l of perNs) for (const h of l) byId.set(h.note.id, h.breakdown);
+            sendJson(res, 200, {
+              results: merged.map((n) => shapeHit(n, byId.get(n.id))),
+              timeRange: timePhrase ? timePhrase.label : null,
+              searchedNamespaces: readable(nsCtx),
+            });
+            return;
+          }
           const lists: NoteRecord[][] = [];
-          for (const ns of readable()) {
+          for (const ns of readable(nsCtx)) {
             lists.push(await runSearch(store, q, { ...searchOpts, namespace: ns }));
           }
-          const lim = clampInt(searchOpts.limit, 20, 1, 200);
           sendJson(res, 200, {
             results: roundRobin(lists, lim).map((n) => annotateStaleness(n)),
             timeRange: timePhrase ? timePhrase.label : null,
-            searchedNamespaces: readable(),
+            searchedNamespaces: readable(nsCtx),
           });
           return;
         }
-        const results = await runSearch(store, q, {
+        const singleOpts = {
           namespace,
           limit: limit ? Number(limit) : undefined,
           mode: parseMode(url.searchParams.get("mode")),
           timeRange: timePhrase ? { start: timePhrase.start, end: timePhrase.end } : undefined,
-        });
+        };
+        if (explain) {
+          const hits = await runSearchExplained(store, q, singleOpts);
+          sendJson(res, 200, {
+            results: toResults(hits),
+            timeRange: timePhrase ? timePhrase.label : null,
+            searchedNamespaces: namespace ? [namespace] : [],
+          });
+          return;
+        }
+        const results = await runSearch(store, q, singleOpts);
         sendJson(res, 200, {
           results: results.map((n) => annotateStaleness(n)),
           timeRange: timePhrase ? timePhrase.label : null,
@@ -539,13 +690,13 @@ export function createApiServer(
           keywords: r.keywords,
           results: r.results.map((n) => annotateStaleness(n)),
         });
-        if (nsActive) {
+        if (nsCtx.active) {
           // Untrusted hint intersected with the readable set, like GET
           // /search: fan out over every readable namespace when the hint is
           // missing or names something unreadable. Round-robin merge so a
           // later namespace is never starved; searchedNamespaces echoes the
           // namespaces actually searched.
-          const hint = trustedHint(relNs);
+          const hint = trustedHint(nsCtx, relNs);
           if (hint) {
             const out = await runRelevantSearch(store, parsed.message, {
               namespace: hint,
@@ -559,7 +710,7 @@ export function createApiServer(
           }
           const lists: NoteRecord[][] = [];
           let keywords: string[] = [];
-          for (const ns of readable()) {
+          for (const ns of readable(nsCtx)) {
             const r = await runRelevantSearch(store, parsed.message, {
               namespace: ns,
               limit: relLimit,
@@ -571,7 +722,7 @@ export function createApiServer(
           sendJson(res, 200, {
             keywords,
             results: roundRobin(lists, lim).map((n) => annotateStaleness(n)),
-            searchedNamespaces: readable(),
+            searchedNamespaces: readable(nsCtx),
           });
           return;
         }
@@ -594,9 +745,9 @@ export function createApiServer(
         const namespace = url.searchParams.get("namespace") ?? undefined;
         let namespaces: string[] | undefined;
         let searchedNamespaces: string[];
-        if (nsActive) {
-          const hint = trustedHint(namespace);
-          namespaces = hint ? [hint] : readable();
+        if (nsCtx.active) {
+          const hint = trustedHint(nsCtx, namespace);
+          namespaces = hint ? [hint] : readable(nsCtx);
           searchedNamespaces = namespaces;
         } else {
           namespaces = namespace ? [namespace] : undefined;
@@ -638,7 +789,7 @@ export function createApiServer(
           // resolveEdgeThreshold throws ValidationError on out-of-range
           // input -> 400 via sendError, never a 500.
           resolveEdgeThreshold(threshold);
-          const scopeNs = nsActive ? ownNs : relNs;
+          const scopeNs = nsCtx.active ? nsCtx.ownNamespace : relNs;
           const plan = store.rebuildPlan(scopeNs ? { namespace: scopeNs } : {});
           const notes = plan.reduce((s, g) => s + g.notes, 0);
           const pairs = plan.reduce((s, g) => s + g.pairs, 0);
@@ -678,9 +829,9 @@ export function createApiServer(
       if (req.method === "GET" && path === "/changes") {
         const namespace = url.searchParams.get("namespace") ?? undefined;
         let namespaces: string[] | undefined;
-        if (nsActive) {
-          const hint = trustedHint(namespace);
-          namespaces = hint ? [hint] : readable();
+        if (nsCtx.active) {
+          const hint = trustedHint(nsCtx, namespace);
+          namespaces = hint ? [hint] : readable(nsCtx);
         } else {
           namespaces = namespace ? [namespace] : undefined;
         }
@@ -708,22 +859,65 @@ export function createApiServer(
       // GET /export -> all notes, for backup / migration. Exempt from the
       // response-size cap: a backup must dump the whole store, not a truncated
       // slice (there are no narrowing params on /export).
+      //
+      // STREAMED, not materialized: exportAll() would hold every row, every
+      // decoded record, AND the full JSON string in memory at once (~3x the
+      // backup size). With months of notes that is a real spike on a small
+      // box. Instead we page through the store with exportBatch (keyset
+      // pagination on the primary key) and write each page as it is built,
+      // so peak memory is one page regardless of store size. The response
+      // BODY is byte-identical to the old non-streaming form: {"notes":[...]}.
       if (req.method === "GET" && path === "/export") {
-        // When namespace resolution is active the dump is filtered to the
-        // namespaces this server may read (own + grants): an unrestricted
-        // export would let an admin-token holder exfiltrate every namespace,
-        // defeating one-directional grants.
-        const notes = nsActive
-          ? store.exportAll().filter((n) => canRead(grants, ownNs, n.namespace))
-          : store.exportAll();
-        sendJson(res, 200, { notes }, { cap: false });
+        if (res.writableEnded || res.headersSent) return;
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+          // No Content-Length: the length is not known up front when streaming.
+          // Node falls back to chunked transfer-encoding, which every HTTP/1.1
+          // client handles.
+        });
+        res.write('{"notes":[');
+        let afterId = 0;
+        let first = true;
+        let anyError = false;
+        for (;;) {
+          // When namespace resolution is active the dump is filtered to the
+          // namespaces this server may read (own + grants): an unrestricted
+          // export would let an admin-token holder exfiltrate every namespace,
+          // defeating one-directional grants. Filtering happens PER PAGE, so
+          // unreadable notes never reach the wire (and never sit in memory).
+          const page = store.exportBatch(afterId, EXPORT_PAGE_SIZE);
+          if (page.length === 0) break;
+          afterId = page[page.length - 1].id;
+          for (const note of page) {
+            if (nsCtx.active && !ctxCanRead(nsCtx, note.namespace)) continue;
+            const chunk = (first ? "" : ",") + JSON.stringify(note);
+            first = false;
+            // Backpressure: if the socket buffer is full, wait for drain
+            // rather than queueing the whole backup in the process.
+            if (!res.write(chunk)) {
+              await new Promise<void>((resolve) => res.once("drain", resolve));
+            }
+          }
+          // A short page means we reached the end of the table.
+          if (page.length < EXPORT_PAGE_SIZE) break;
+          // Yield to the event loop between pages so a very large export
+          // cannot starve concurrent API/MCP traffic on this process.
+          await new Promise<void>((r) => setImmediate(r));
+        }
+        res.end("]}");
         return;
       }
 
       // POST /import -> restore/seed from a backup: { notes: [...] }
       if (req.method === "POST" && path === "/import") {
-        const raw = await readBody(req);
-        let parsed: { notes?: NoteInput[] };
+        // Restore gets its OWN, much larger body cap: /export is exempt from
+        // the response cap so a backup can dump the whole store, so /import
+        // must be able to accept one back. The default 1MB request cap made a
+        // ~2000-note backup un-restorable (413). Still bounded + admin-only.
+        const raw = await readBody(req, IMPORT_BODY_BYTES);
+        // ImportNote (not NoteInput): a real backup carries updated_at AND rev
+        // per note -- both are restore-fidelity fields the store honors.
+        let parsed: { notes?: ImportNote[] };
         try {
           parsed = JSON.parse(raw || "{}");
         } catch {
@@ -739,11 +933,19 @@ export function createApiServer(
           // is untrusted: imported notes are forced into the server's own
           // namespace so a backup can't plant notes into another namespace
           // (memory poisoning).
-          const notes = nsActive
-            ? parsed.notes.map((n) => ({ ...n, namespace: ownNs }))
+          const notes = nsCtx.active
+            ? parsed.notes.map((n) => ({ ...n, namespace: nsCtx.ownNamespace }))
             : parsed.notes;
           const report: ImportReport = { quarantined: [], rejected: [] };
-          const created = await store.importNotes(notes, { report });
+          // Above the threshold, DEFER the similarity-graph rebuild: linking
+          // is O(n^2) and measured at 88-97% of a bulk restore's runtime
+          // (8000 notes: 3.6s of inserts vs 34.9s of linking). Landing the
+          // notes in seconds and rebuilding the graph afterwards with
+          // `onememory rebuild-edges` beats blocking the restore for minutes
+          // on an optional ranking aid. Below the threshold, link inline so
+          // the common small import behaves exactly as before.
+          const deferEdges = notes.length > IMPORT_EDGE_DEFER_THRESHOLD;
+          const created = await store.importNotes(notes, { report, deferEdges });
           // Best-effort: index the restored notes for semantic/hybrid search
           // (no-op when embeddings are off). Without this, re-imported notes
           // would be invisible to semantic search until a manual `reindex`.
@@ -752,6 +954,12 @@ export function createApiServer(
           // additive fields, present only when non-empty.
           sendJson(res, 200, {
             imported: created.length,
+            ...(deferEdges
+              ? {
+                  similarityGraph: "deferred",
+                  note: `similarity graph not rebuilt for ${created.length} notes; run \`onememory rebuild-edges\` to restore neighbor ranking (search is unaffected)`,
+                }
+              : {}),
             ...(report.quarantined.length ? { quarantined: report.quarantined } : {}),
             ...(report.rejected.length ? { rejected: report.rejected } : {}),
           });

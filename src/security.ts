@@ -308,24 +308,42 @@ export function scopeAllows(have: Scope, need: Scope): boolean {
 }
 
 /**
- * Authenticate a request against the accepted tokens and return the matched
- * token's scope, or null if the bearer header is missing/unknown. Shared by
- * both HTTP front doors so auth can't drift between them. Checks every token
- * with a constant-time compare.
+ * Authenticate a request against the accepted tokens and return the full
+ * matched TokenEntry, or null when the bearer header is missing/unknown.
+ *
+ * This is the per-request identity, not just a scope: callers need the
+ * token's optional `namespace` pin so a namespaced token is confined to its
+ * namespace on THIS request regardless of the server's own cwd resolution.
+ * Checks every token with a constant-time compare (no early return), so
+ * timing doesn't reveal which token -- if any -- matched.
  */
-export function authenticate(req: IncomingMessage, tokens: TokenEntry[]): Scope | null {
+export function authenticateEntry(
+  req: IncomingMessage,
+  tokens: TokenEntry[]
+): TokenEntry | null {
   const header = req.headers["authorization"];
   if (!header || Array.isArray(header)) return null;
   const match = /^Bearer\s+(.+)$/i.exec(header);
   if (!match) return null;
   const provided = match[1];
-  let found: Scope | null = null;
-  // Check all tokens (don't early-return) so timing doesn't reveal which
-  // token, if any, matched.
+  let found: TokenEntry | null = null;
   for (const t of tokens) {
-    if (constantTimeEqual(provided, t.token)) found = t.scope;
+    if (constantTimeEqual(provided, t.token)) found = t;
   }
   return found;
+}
+
+/**
+ * Authenticate a request against the accepted tokens and return the matched
+ * token's scope, or null if the bearer header is missing/unknown. Shared by
+ * both HTTP front doors so auth can't drift between them. Checks every token
+ * with a constant-time compare.
+ *
+ * Thin wrapper over authenticateEntry for callers that only need the scope
+ * and have no namespace pin to honor.
+ */
+export function authenticate(req: IncomingMessage, tokens: TokenEntry[]): Scope | null {
+  return authenticateEntry(req, tokens)?.scope ?? null;
 }
 
 // ---- Append-only audit log (no note content, no secrets) --------------------

@@ -36,6 +36,9 @@ import {
 // only as a type (erased at compile), so store -> staleness -> config is
 // acyclic.
 import { isStale, stalenessConfig, annotateStaleness } from "./staleness.js";
+// At-rest encryption for note bodies. No module cycle: crypto.ts imports
+// only node: builtins, never store.ts.
+import { encrypt, decryptIfEncrypted, loadKey } from "./crypto.js";
 
 /**
  * A caller-input error (bad/oversized/secret-bearing data, empty title, stale
@@ -154,10 +157,21 @@ export interface NoteInput {
    * are ignored (created_at falls back to now).
    */
   created_at?: string;
+  /**
+   * Retention: forget this note N days after this write (0 = no TTL).
+   * Stored as an absolute `expires_at`; archived, not hard-deleted, when it
+   * passes (see sweepExpired).
+   */
+  forget_after?: number;
 }
 
-/** One note of a backup being restored: a NoteInput plus its updated_at. */
-export type ImportNote = NoteInput & { updated_at?: string };
+/**
+ * One note of a backup being restored: a NoteInput plus its updated_at and
+ * rev. Both are restore-fidelity fields -- they exist so a backup taken
+ * after months of edits restores with its history intact (original dates,
+ * revision counter) instead of looking brand new.
+ */
+export type ImportNote = NoteInput & { updated_at?: string; rev?: number };
 
 /** Per-note outcome of importNotes() for writes that did not become notes. */
 export interface ImportReport {
@@ -223,10 +237,38 @@ export interface QuarantineEntry {
 export const CHANGE_LOG_RETENTION_DAYS = 90;
 
 /** Current schema version (PRAGMA user_version). See Store.migrate. */
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
+
+/**
+ * Notes fetched per page by exportBatch(), which both streaming export
+ * paths (HTTP /export and `onememory export --format json`) use so peak
+ * memory stays one page regardless of store size.
+ */
+export const EXPORT_PAGE_SIZE = 500;
 
 /** SQLite expression for "now" as an ISO-8601 string (same shape as Date#toISOString). */
 const SQL_NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
+
+/**
+ * Absolute TTL deadline for `days` from `from`, or null for "no TTL".
+ *
+ * Guarded to a sane ceiling (100 years) so a garbage value like 1e15 days
+ * cannot produce an Infinity/Invalid Date that SQLite would store as a
+ * non-comparable string and the sweep would never match.
+ */
+const RETENTION_MAX_DAYS = 36_500;
+export function retentionDeadline(
+  days: number | undefined,
+  from: string = new Date().toISOString()
+): string | null {
+  if (days === undefined || days === null) return null;
+  const n = Number(days);
+  if (!Number.isFinite(n) || n <= 0) return null; // 0 / negative / NaN = no TTL
+  const capped = Math.min(n, RETENTION_MAX_DAYS);
+  const base = Date.parse(from);
+  if (!Number.isFinite(base)) return null;
+  return new Date(base + capped * 86_400_000).toISOString();
+}
 
 /** Change-feed page size bounds. */
 export const CHANGES_DEFAULT_LIMIT = 100;
@@ -238,6 +280,8 @@ export interface NotePatch {
   body?: string;
   tags?: string[];
   source?: string;
+  /** Retention: reset/extend the TTL (days from now; 0 clears it). */
+  forget_after?: number;
 }
 
 export interface NoteRecord {
@@ -254,6 +298,24 @@ export interface NoteRecord {
   access_count: number;
   /** ISO-8601 timestamp of the most recent read; null = never read. */
   last_accessed: string | null;
+  /**
+   * Retention: when this note is due to be forgotten (ISO-8601), set from
+   * `forget_after` days at write time. Absent when the note has no TTL.
+   * Exposed only when non-null so existing deepEqual assertions keep their
+   * byte-identical shape (same convention as `neighbors`).
+   */
+  expires_at?: string;
+  /**
+   * Retention: when this note was archived (ISO-8601). Archived notes are
+   * excluded from list/search/recall by default and restorable. Absent when live.
+   */
+  archived_at?: string;
+  /**
+   * True when this note's body was stored encrypted at rest and decrypted on
+   * read (see crypto.ts). Title/tags/timestamps remain plaintext because
+   * search and namespace isolation need them -- documented, not hidden.
+   */
+  encrypted?: boolean;
 }
 
 interface NoteRow {
@@ -268,6 +330,10 @@ interface NoteRow {
   updated_at: string;
   access_count: number;
   last_accessed: string | null;
+  /** Ciphertext of the body when at-rest encryption is on; NULL otherwise. */
+  body_enc: string | null;
+  expires_at: string | null;
+  archived_at: string | null;
 }
 
 const DEFAULT_NAMESPACE = "default";
@@ -277,6 +343,9 @@ function rowToRecord(row: NoteRow): NoteRecord {
     id: row.id,
     namespace: row.namespace,
     title: row.title,
+    // body is the FTS-indexed plaintext column. For an encrypted note the
+    // row's body is '' (see crypto.ts) and Store.rec() swaps in the
+    // decrypted text, so callers always see real content.
     body: row.body,
     tags: parseTags(row.tags),
     rev: row.rev ?? 1,
@@ -286,6 +355,19 @@ function rowToRecord(row: NoteRow): NoteRecord {
     access_count: row.access_count ?? 0,
     last_accessed: row.last_accessed ?? null,
   };
+}
+
+/**
+ * Attach retention + encryption fields only when meaningful, so a note
+ * without a TTL, not archived, and unencrypted keeps exactly the old shape
+ * (existing deepEqual assertions stay green).
+ */
+function annotateRetention(row: NoteRow, rec: NoteRecord): NoteRecord {
+  const out: NoteRecord = rec;
+  if (row.expires_at) out.expires_at = row.expires_at;
+  if (row.archived_at) out.archived_at = row.archived_at;
+  if (row.body_enc) out.encrypted = true;
+  return out;
 }
 
 function tagsToStorage(tags: string[] | undefined): string {
@@ -400,6 +482,19 @@ const REBUILD_PROGRESS_KEY = "rebuild_edges_progress";
  * then the import yields to the event loop.
  */
 export const IMPORT_LINK_BATCH = 32;
+
+/**
+ * Notes per write transaction while RESTORING a backup (importNotes).
+ *
+ * Without a surrounding transaction, create() opens and commits its own
+ * BEGIN IMMEDIATE per note -- one WAL fsync each, measured at ~0.7ms apiece
+ * (8000-note restore: 3.6s of inserts, ~5s of which is per-note fsync).
+ * Batching amortizes that to one commit per chunk. Kept small enough that
+ * the synchronous insert loop blocks the event loop for well under a second
+ * and the write lock is held for only ~100ms at a time, so concurrent
+ * API/MCP requests and other processes only wait briefly.
+ */
+export const IMPORT_INSERT_BATCH = 500;
 
 /**
  * In-process edge-scoring index for one namespace: each note's cached
@@ -598,6 +693,19 @@ export interface RangeOpts {
   endISO?: string;
 }
 
+/**
+ * SQL fragment filtering by archive state.
+ *
+ * Default (neither flag): only live notes (`archived_at IS NULL`), so a
+ * forgotten note never leaks back into list/search/recall. includeArchived
+ * shows everything; archivedOnly shows just the archive (restore flow).
+ */
+function archivedClause(includeArchived?: boolean, archivedOnly?: boolean): string {
+  if (includeArchived) return "";
+  if (archivedOnly) return " AND archived_at IS NOT NULL";
+  return " AND archived_at IS NULL";
+}
+
 function rangeClause(opts: RangeOpts): { sql: string; params: string[] } {
   const clauses: string[] = [];
   const params: string[] = [];
@@ -646,6 +754,12 @@ export class Store {
   private edgeIndexes = new Map<string, NsEdgeIndex>();
   /** Single-flight guard: at most one rebuildEdgesCooperative per Store. */
   private rebuildRunning = false;
+  /**
+   * At-rest encryption key (32B), loaded once at open. Null when no key file
+   * exists, which means the store is plaintext and every code path below
+   * behaves exactly as before. See crypto.ts for the body_enc design.
+   */
+  private readonly bodyKey: Buffer | null;
 
   /**
    * How long a statement waits on a contended SQLite lock before giving up
@@ -666,6 +780,10 @@ export class Store {
     this.db.exec(`PRAGMA busy_timeout = ${Store.BUSY_TIMEOUT_MS};`);
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA foreign_keys = ON;");
+    // Load the at-rest key before migrations so a v10 upgrade on an encrypted
+    // store can read existing rows. loadKey throws on a corrupt key file
+    // rather than silently degrading -- see crypto.ts.
+    this.bodyKey = loadKey(dbPath === ":memory:" ? dirname(this.dbPath) : dirname(dbPath));
     this.init();
     // Notes are private: owner-only db + WAL/SHM (POSIX; no-op on Windows).
     if (dbPath !== ":memory:") for (const ext of ["", "-wal", "-shm"]) chmodQuiet(dbPath + ext, 0o600);
@@ -943,6 +1061,23 @@ export class Store {
       `);
       this.db.exec("UPDATE change_log SET title = '' WHERE kind = 'deleted' OR note_id NOT IN (SELECT id FROM notes)");
     }
+    if (v < 10) {
+      // v10 (a) at-rest encryption: body_enc holds the AES-256-GCM envelope.
+      //     When encryption is enabled the plaintext `body` column is left
+      //     EMPTY for encrypted notes so the external-content FTS5 index
+      //     never ingests ciphertext (it would match base64 noise). Search
+      //     therefore covers title+tags for encrypted notes; that tradeoff is
+      //     documented, not hidden. `body` stays the FTS source, unchanged.
+      // (b) retention: expires_at (TTL deadline) + archived_at (soft delete).
+      this.addColumn("notes", "body_enc", "TEXT");
+      this.addColumn("notes", "expires_at", "TEXT");
+      this.addColumn("notes", "archived_at", "TEXT");
+      // Archived notes drop out of the default list/search paths; this index
+      // keeps the archive view cheap without touching the live-note indexes.
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_notes_archived ON notes(archived_at, id)"
+      );
+    }
   }
 
   /**
@@ -950,10 +1085,17 @@ export class Store {
    * backup's updated_at; like created_at it is honored only when it parses
    * as a date. It is deliberately not a NoteInput field, so the REST create
    * route can't forge "last changed" times.
+   *
+   * `opts.startRev` is the restore path's way to keep a backup's rev, so a
+   * note edited 25 times before the backup still counts from 25 afterwards
+   * (CAS guards and the change feed stay meaningful across a restore).
+   * Same reasoning as updatedAt: opts, not NoteInput -- REST POST /notes
+   * cannot forge a revision counter. Garbage in a hand-edited backup
+   * (0, -3, "x") falls back to 1.
    */
   create(
     input: NoteInput,
-    opts: { skipEdges?: boolean; updatedAt?: string } & LintOpts = {}
+    opts: { skipEdges?: boolean; updatedAt?: string; startRev?: number } & LintOpts = {}
   ): NoteRecord {
     if (!input.title || !input.title.trim()) {
       throw new ValidationError("title is required");
@@ -978,10 +1120,21 @@ export class Store {
     // created_at when it parses, otherwise the note was just written.
     const createdAt = isoOrNull(input.created_at) ?? now;
     const updatedAt = isoOrNull(opts.updatedAt) ?? now;
+    const startRev =
+      Number.isInteger(opts.startRev) && (opts.startRev as number) >= 1
+        ? (opts.startRev as number)
+        : 1;
     const namespace = input.namespace?.trim() || DEFAULT_NAMESPACE;
     const body = input.body ?? "";
     const tags = tagsToStorage(input.tags);
     const source = (input.source ?? "").slice(0, 200);
+    // At-rest encryption: seal the body for storage. `body` (plaintext) stays
+    // the value used below for embedding/edge scoring and audit byte counts
+    // -- those need the real text. Only the SQL INSERT gets sealed values.
+    const sealed = this.sealBody(body);
+    // Retention: compute the TTL deadline from forget_after days, relative
+    // to this write. Null = no TTL (the default, byte-identical to 1.1.0).
+    const expiresAt = retentionDeadline(input.forget_after, updatedAt);
 
     // One write transaction for INSERT + edges (BLOCKER: a SAVEPOINT opened
     // outside a transaction is a DEFERRED txn -- its first read takes a
@@ -996,12 +1149,23 @@ export class Store {
     try {
       const result = this.db
         .prepare(
-          `INSERT INTO notes (namespace, title, body, tags, source, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO notes (namespace, title, body, tags, source, created_at, updated_at, rev, body_enc, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
-        .run(namespace, input.title, body, tags, source, createdAt, updatedAt);
+        .run(
+          namespace,
+          input.title,
+          sealed.body,
+          tags,
+          source,
+          createdAt,
+          updatedAt,
+          startRev,
+          sealed.bodyEnc,
+          expiresAt
+        );
       id = Number(result.lastInsertRowid);
-      this.noteWritten(namespace, id, { rev: 1, title: input.title, body });
+      this.noteWritten(namespace, id, { rev: startRev, title: input.title, body });
       // Link the new note into the similarity graph (same namespace only).
       // skipEdges lets a caller that pre-scored the edges apply them itself.
       if (!opts.skipEdges) {
@@ -1175,15 +1339,40 @@ export class Store {
     }
   }
 
-  /** A row as a record, with not-yet-flushed reads applied. */
+  /**
+   * A row as a record, with not-yet-flushed reads applied.
+   *
+   * This is the ONE decryption chokepoint: every read (read/list/search/
+   * export/neighbors) funnels through here, so callers never see ciphertext
+   * and never need to know encryption is on.
+   */
   private rec(row: NoteRow): NoteRecord {
     const r = rowToRecord(row);
+    if (row.body_enc) {
+      // DecryptIfEncrypted throws on auth failure (wrong/tampered key) --
+      // deliberately not swallowed: handing an agent corrupted memory is
+      // worse than erroring, and it is the tell that the key file was swapped.
+      r.body = decryptIfEncrypted(row.body_enc, this.bodyKey);
+    }
     const p = this.pendingAccess.get(r.id);
     if (p) {
       r.access_count += p.n;
       if (!r.last_accessed || p.at > r.last_accessed) r.last_accessed = p.at;
     }
-    return r;
+    return annotateRetention(row, r);
+  }
+
+  /**
+   * Split a caller-supplied body into the (plaintext) `body` column value and
+   * the optional `body_enc` ciphertext, per the current encryption state.
+   *
+   * When encryption is ON: body goes EMPTY into the FTS-indexed column (so no
+   * ciphertext is ever indexed) and the ciphertext lands in body_enc. When
+   * OFF: body is stored normally and body_enc is NULL, byte-identical to 1.1.0.
+   */
+  private sealBody(plain: string): { body: string; bodyEnc: string | null } {
+    if (!this.bodyKey) return { body: plain, bodyEnc: null };
+    return { body: "", bodyEnc: encrypt(plain, this.bodyKey) };
   }
 
   /**
@@ -1312,6 +1501,16 @@ export class Store {
     const rev = existing.rev + 1;
     validateSizes({ title, body, tags: patch.tags ?? existing.tags });
     const now = new Date().toISOString();
+    // Re-seal: existing.body is already decrypted plaintext, so an update
+    // that leaves the body alone still produces fresh ciphertext (new IV).
+    const sealed = this.sealBody(body);
+    // Retention: an explicit forget_after resets the deadline relative to
+    // THIS write; forget_after: 0 clears the TTL; omitting it preserves the
+    // note's existing deadline instead of silently dropping it.
+    const expiresAt =
+      patch.forget_after !== undefined
+        ? retentionDeadline(patch.forget_after, now)
+        : existing.expires_at ?? null;
 
     const touched = [...new Set([existing.namespace, namespace])];
     // Compare-and-swap as a single atomic statement. The `ifRev` guard lives in
@@ -1326,10 +1525,11 @@ export class Store {
     try {
       const res = this.db
         .prepare(
-          `UPDATE notes SET namespace = ?, title = ?, body = ?, tags = ?, source = ?, rev = ?, updated_at = ?
+          `UPDATE notes SET namespace = ?, title = ?, body = ?, tags = ?, source = ?, rev = ?, updated_at = ?,
+                            body_enc = ?, expires_at = ?
            WHERE id = ? AND (? IS NULL OR rev = ?)`
         )
-        .run(namespace, title, body, tags, source, rev, now, id, want, want);
+        .run(namespace, title, sealed.body, tags, source, rev, now, sealed.bodyEnc, expiresAt, id, want, want);
 
       if (Number(res.changes) === 0) {
         // The row either vanished or its rev moved since we read it.
@@ -1377,6 +1577,108 @@ export class Store {
 
   delete(id: number): boolean {
     return this.deleteWhere(id, null);
+  }
+
+  /**
+   * Soft-archive every note whose TTL has passed (retention).
+   *
+   * Sets archived_at (only when not already archived) so the note drops out
+   * of list/search/recall but stays on disk, restorable. Returns the number
+   * archived. Runs in one UPDATE -- the note count here is small and a sweep
+   * must not race itself into double-archiving.
+   */
+  sweepExpired(now: number = Date.now()): number {
+    const iso = new Date(now).toISOString();
+    const res = this.db
+      .prepare(
+        `UPDATE notes SET archived_at = ?
+         WHERE expires_at IS NOT NULL AND expires_at <= ? AND archived_at IS NULL`
+      )
+      .run(iso, iso);
+    return Number(res.changes ?? 0);
+  }
+
+  /** Soft-archive one note (retention action from an API/client). */
+  archive(id: number): NoteRecord | null {
+    const iso = new Date().toISOString();
+    this.db
+      .prepare("UPDATE notes SET archived_at = ? WHERE id = ? AND archived_at IS NULL")
+      .run(iso, id);
+    return this.read(id);
+  }
+
+  /** Restore an archived note to live (clears archived_at, keeps the TTL). */
+  restore(id: number): NoteRecord | null {
+    this.db
+      .prepare("UPDATE notes SET archived_at = NULL WHERE id = ? AND archived_at IS NOT NULL")
+      .run(id);
+    return this.read(id);
+  }
+
+  /**
+   * Encrypt every plaintext body in place (`onememory encrypt enable`).
+   *
+   * Moves body -> encrypted body_enc and empties body, so the FTS index
+   * (which reads the body column via triggers) is rebuilt over title+tags
+   * only. Idempotent: already-encrypted notes are skipped, so re-running is
+   * safe. Returns the number of notes newly encrypted.
+   */
+  encryptAll(key: Buffer): number {
+    const rows = this.db
+      .prepare("SELECT id, body FROM notes WHERE body_enc IS NULL AND body <> ''")
+      .all() as unknown as Array<{ id: number; body: string }>;
+    const upd = this.db.prepare("UPDATE notes SET body_enc = ?, body = '' WHERE id = ?");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const r of rows) upd.run(encrypt(r.body, key), r.id);
+      this.db.exec("COMMIT");
+    } catch (e) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* already rolled back */
+      }
+      throw e;
+    }
+    return rows.length;
+  }
+
+  /**
+   * Decrypt every encrypted body back to plaintext (`onememory encrypt disable`).
+   *
+   * The inverse of encryptAll: body_enc -> body, body_enc NULL. The caller
+   * removes the key file afterwards. Returns the number of notes decrypted.
+   * Throws if a body cannot be decrypted (wrong key) -- it must not leave a
+   * half-decrypted store.
+   */
+  decryptAll(key: Buffer): number {
+    const rows = this.db
+      .prepare("SELECT id, body_enc FROM notes WHERE body_enc IS NOT NULL")
+      .all() as unknown as Array<{ id: number; body_enc: string }>;
+    // Decrypt ALL rows first so a bad key throws before any write happens.
+    const decrypted = rows.map((r) => ({ id: r.id, body: decryptIfEncrypted(r.body_enc, key) }));
+    const upd = this.db.prepare("UPDATE notes SET body = ?, body_enc = NULL WHERE id = ?");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const r of decrypted) upd.run(r.body, r.id);
+      this.db.exec("COMMIT");
+    } catch (e) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* already rolled back */
+      }
+      throw e;
+    }
+    return decrypted.length;
+  }
+
+  /** Count of notes whose body is stored encrypted at rest. */
+  encryptedCount(): number {
+    const r = this.db.prepare("SELECT COUNT(*) AS c FROM notes WHERE body_enc IS NOT NULL").get() as {
+      c: number;
+    };
+    return Number(r.c);
   }
 
   /** DELETE one note (optionally rev-guarded), keeping the edge index in step. */
@@ -1488,7 +1790,16 @@ export class Store {
    * deep offsets are exact. An empty `namespaces` set matches nothing.
    */
   list(
-    opts: { namespace?: string; namespaces?: string[]; limit?: number; offset?: number } & RangeOpts = {}
+    opts: {
+      namespace?: string;
+      namespaces?: string[];
+      limit?: number;
+      offset?: number;
+      /** Include soft-archived notes (default false: only live notes). */
+      includeArchived?: boolean;
+      /** Only archived notes -- backs the archive view / restore flow. */
+      archivedOnly?: boolean;
+    } & RangeOpts = {}
   ): {
     notes: NoteRecord[];
     total: number;
@@ -1496,6 +1807,8 @@ export class Store {
     const limit = clampInt(opts.limit, 50, 1, 500);
     const offset = clampInt(opts.offset, 0, 0, Number.MAX_SAFE_INTEGER);
     const range = rangeClause(opts);
+    // Archived filter: default hides archived; archivedOnly inverts it.
+    const archSql = archivedClause(opts.includeArchived, opts.archivedOnly);
 
     let rows: NoteRow[];
     let total: number;
@@ -1505,33 +1818,33 @@ export class Store {
       const inList = `namespace IN (${opts.namespaces.map(() => "?").join(",")})`;
       rows = this.db
         .prepare(
-          `SELECT * FROM notes WHERE ${inList}${range.sql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
+          `SELECT * FROM notes WHERE ${inList}${archSql}${range.sql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
         )
         .all(...opts.namespaces, ...range.params, limit, offset) as unknown as NoteRow[];
       total = (
         this.db
-          .prepare(`SELECT COUNT(*) as c FROM notes WHERE ${inList}${range.sql}`)
+          .prepare(`SELECT COUNT(*) as c FROM notes WHERE ${inList}${archSql}${range.sql}`)
           .get(...opts.namespaces, ...range.params) as { c: number }
       ).c;
     } else if (opts.namespace) {
       rows = this.db
         .prepare(
-          `SELECT * FROM notes WHERE namespace = ?${range.sql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
+          `SELECT * FROM notes WHERE namespace = ?${archSql}${range.sql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
         )
         .all(opts.namespace, ...range.params, limit, offset) as unknown as NoteRow[];
       total = (
         this.db
-          .prepare(`SELECT COUNT(*) as c FROM notes WHERE namespace = ?${range.sql}`)
+          .prepare(`SELECT COUNT(*) as c FROM notes WHERE namespace = ?${archSql}${range.sql}`)
           .get(opts.namespace, ...range.params) as { c: number }
       ).c;
     } else {
       rows = this.db
         .prepare(
-          `SELECT * FROM notes WHERE 1 = 1${range.sql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
+          `SELECT * FROM notes WHERE 1 = 1${archSql}${range.sql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
         )
         .all(...range.params, limit, offset) as unknown as NoteRow[];
       total = (
-        this.db.prepare(`SELECT COUNT(*) as c FROM notes WHERE 1 = 1${range.sql}`).get(...range.params) as { c: number }
+        this.db.prepare(`SELECT COUNT(*) as c FROM notes WHERE 1 = 1${archSql}${range.sql}`).get(...range.params) as { c: number }
       ).c;
     }
 
@@ -1569,7 +1882,7 @@ export class Store {
           .prepare(
             `SELECT notes.*, -rank AS score FROM notes_fts
              JOIN notes ON notes.id = notes_fts.rowid
-             WHERE notes_fts MATCH ? AND notes.namespace = ?${range.sql}
+             WHERE notes_fts MATCH ? AND notes.namespace = ? AND notes.archived_at IS NULL${range.sql}
              ORDER BY rank
              LIMIT ?`
           )
@@ -1581,7 +1894,7 @@ export class Store {
           .prepare(
             `SELECT notes.*, -rank AS score FROM notes_fts
              JOIN notes ON notes.id = notes_fts.rowid
-             WHERE notes_fts MATCH ?${range.sql}
+             WHERE notes_fts MATCH ? AND notes.archived_at IS NULL${range.sql}
              ORDER BY rank
              LIMIT ?`
           )
@@ -1607,13 +1920,43 @@ export class Store {
   }
 
   /**
+   * One page of the export, for STREAMING a large backup.
+   *
+   * exportAll() materializes every row, then every record, then (in the
+   * caller) the whole JSON string — roughly 3x the backup's size in memory
+   * at once. That is fine for hundreds of notes and unpleasant for tens of
+   * thousands. This is the bounded-memory alternative: keyset pagination on
+   * the primary key (`id > afterId`), which is O(page) per call on the PK
+   * index rather than the O(offset) scan OFFSET would do at depth.
+   *
+   * A short page (< limit) means the export is done. `afterId` is the last
+   * id returned; callers must pass it back verbatim.
+   */
+  exportBatch(afterId: number, limit: number): NoteRecord[] {
+    const lim = clampInt(limit, 500, 1, 5_000);
+    const rows = this.db
+      .prepare("SELECT * FROM notes WHERE id > ? ORDER BY id ASC LIMIT ?")
+      .all(afterId, lim) as unknown as NoteRow[];
+    return rows.map((r) => this.rec(r));
+  }
+
+  /** Total notes in the store (drives the export progress/size estimate). */
+  countAll(): number {
+    const r = this.db.prepare("SELECT COUNT(*) AS c FROM notes").get() as { c: number };
+    return Number(r.c);
+  }
+
+  /**
    * Insert notes from a backup/export. Each is validated like a normal write.
    * Returns the created records so the caller can (best-effort) embed them --
    * without this, re-imported notes would be invisible to semantic/hybrid
    * search until a manual `reindex`.
    *
    * created_at / updated_at are restored when they parse as dates, so a
-   * restored backup keeps its history instead of looking brand new.
+   * restored backup keeps its history instead of looking brand new. The rev
+   * counter is restored too (when sane), so a note with 25 revisions behind
+   * it doesn't restart at 1 -- CAS guards and the change feed stay accurate
+   * across a restore.
    *
    * Edges: creates skip per-note scoring; once every note is in, only the
    * IMPORTED notes are scored against their (final) namespace -- never a
@@ -1624,45 +1967,72 @@ export class Store {
    */
   async importNotes(
     notes: ImportNote[],
-    opts: { report?: ImportReport } = {}
+    opts: { report?: ImportReport; deferEdges?: boolean } = {}
   ): Promise<NoteRecord[]> {
     const created: NoteRecord[] = [];
-    for (const note of notes) {
-      if (!note || !note.title || !note.title.trim()) continue;
-      try {
-        created.push(
-          this.create(
-            {
-              namespace: note.namespace,
-              title: note.title,
-              body: note.body,
-              tags: note.tags,
-              source: note.source, // preserve provenance across export -> import
-              created_at: note.created_at,
-            },
-            {
-              skipEdges: true,
-              updatedAt: note.updated_at,
+    // Batched inserts: one write transaction per IMPORT_INSERT_BATCH notes
+    // instead of one per note. Inside the batch create() nests as a
+    // SAVEPOINT (see create), so each note stays individually all-or-nothing
+    // and a rejected/quarantined note -- thrown BEFORE any of its SQL --
+    // leaves the batch transaction healthy; only an unexpected fault rolls
+    // its batch back and propagates (batches committed earlier stay, same
+    // partial-restore-on-hard-failure behavior as the old per-note path).
+    // We yield to the event loop BETWEEN batches (never inside one), so a
+    // big restore can't stall concurrent API/MCP traffic.
+    for (let start = 0; start < notes.length; start += IMPORT_INSERT_BATCH) {
+      const batch = notes.slice(start, start + IMPORT_INSERT_BATCH);
+      const insertBatch = (): void => {
+        for (const note of batch) {
+          if (!note || !note.title || !note.title.trim()) continue;
+          try {
+            created.push(
+              this.create(
+                {
+                  namespace: note.namespace,
+                  title: note.title,
+                  body: note.body,
+                  tags: note.tags,
+                  source: note.source, // preserve provenance across export -> import
+                  created_at: note.created_at,
+                },
+                {
+                  skipEdges: true,
+                  updatedAt: note.updated_at,
+                  startRev: note.rev,
+                }
+              )
+            );
+          } catch (e) {
+            // Skip a note that fails validation (oversized / looks like a secret)
+            // rather than aborting the whole restore and leaving earlier notes
+            // committed-but-unembedded. Unexpected faults (e.g. DB errors) still
+            // propagate so a real failure isn't silently swallowed.
+            if (e instanceof QuarantinedError) {
+              opts.report?.quarantined.push({ title: note.title, quarantineId: e.quarantineId });
+              continue;
             }
-          )
-        );
-      } catch (e) {
-        // Skip a note that fails validation (oversized / looks like a secret)
-        // rather than aborting the whole restore and leaving earlier notes
-        // committed-but-unembedded. Unexpected faults (e.g. DB errors) still
-        // propagate so a real failure isn't silently swallowed.
-        if (e instanceof QuarantinedError) {
-          opts.report?.quarantined.push({ title: note.title, quarantineId: e.quarantineId });
-          continue;
+            if (e instanceof ValidationError) {
+              opts.report?.rejected.push({ title: note.title, error: e.message });
+              continue;
+            }
+            throw e;
+          }
         }
-        if (e instanceof ValidationError) {
-          opts.report?.rejected.push({ title: note.title, error: e.message });
-          continue;
-        }
-        throw e;
+      };
+      if (this.db.isTransaction) insertBatch();
+      else this.transaction(insertBatch);
+      if (start + IMPORT_INSERT_BATCH < notes.length) {
+        await new Promise<void>((r) => setImmediate(r));
       }
     }
-    await this.linkNotes(created);
+    // Similarity-graph linking is O(n^2): every imported note is scored
+    // against the whole namespace. On a bulk restore that is 88-97% of the
+    // total time (measured: 8000 notes = 3.6s of inserts, 34.9s of linking).
+    // `deferEdges` skips it so a restore lands in seconds; the caller is
+    // responsible for telling the operator to run `onememory rebuild-edges`
+    // afterwards. Small/one-at-a-time imports keep inline linking so the
+    // graph is never silently missing for the common case.
+    if (!opts.deferEdges) await this.linkNotes(created);
     return created;
   }
 
@@ -1756,14 +2126,14 @@ export class Store {
             .prepare(
               `SELECT v.note_id, v.dim, v.model, v.vec FROM note_vectors v
                JOIN notes ON notes.id = v.note_id
-               WHERE notes.namespace = ?${range.sql}`
+               WHERE notes.namespace = ? AND notes.archived_at IS NULL${range.sql}`
             )
             .all(opts.namespace, ...range.params)
         : this.db
             .prepare(
               `SELECT v.note_id, v.dim, v.model, v.vec FROM note_vectors v
                JOIN notes ON notes.id = v.note_id
-               WHERE 1 = 1${range.sql}`
+               WHERE notes.archived_at IS NULL${range.sql}`
             )
             .all(...range.params)
     ) as unknown as VectorRow[];
