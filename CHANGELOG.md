@@ -88,6 +88,19 @@ Answering u/pastoral_theology's question on r/ClaudeAI.
   in the `change_log` (metadata only, pruned after 90 days, not part of a
   JSON backup). See the README "Backups & restore" section.
 
+### Tests & CI
+
+- **Two CI flakes fixed at the root.** The change-feed tests captured a
+  `since` boundary from the caller's clock while SQLite stamps `changed_at`
+  from its own — a boundary could land on either side of the very write it
+  was meant to include or exclude (~1-in-10 standalone, and it failed the
+  Windows runner). Every boundary now has settle time on both sides:
+  0/300 stress runs after the fix. And the `npm pack` guard read only the
+  npm 11 array shape, so it broke as soon as a runner drifted onto npm 12
+  (`npm pack --json` now returns an object keyed by package name, which the
+  publish workflow installs on purpose); it now accepts both shapes, verified
+  against npm 11.16.0 and 12.2.1.
+
 ## [1.1.0] - 2026-10-16
 
 ### Upgrade notes

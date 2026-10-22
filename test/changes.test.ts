@@ -19,6 +19,22 @@ function parseTool(r: any): any {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// A `since` boundary is a timestamp from the CALLER'S clock; `changed_at` is
+// stamped by SQLite inside the write's trigger. Two clocks, one rounding to
+// milliseconds: measured on the same row, notes.updated_at read .566 while
+// the trigger stamped .567. So a boundary captured within a millisecond of a
+// write can land on either side of that write's stamp:
+//   - too late  -> a note written AFTER the boundary is missing from its window
+//   - too early -> a note written BEFORE the boundary drags into the next one
+//                  (how `mid` admitted "pre-existing" and counted 4, not 3)
+// Sleeps cannot make the clocks agree, but they can put the boundary a whole
+// margin of real time on the side it must be, on both sides. So every boundary
+// below is captured with SETTLE of quiet before and after it. Real consumers
+// are covered anyway: `since` overlaps by FEED_SINCE_GRACE_MS, so a poller may
+// repeat a change but never miss one -- these tests pass `graceMs: 0` to assert
+// exact grouping, so they have to own the margin themselves.
+const SETTLE = 50;
+
 describe("resolveSince", () => {
   const now = Date.parse("2026-10-16T12:00:00.000Z");
   test("durations count back from now", () => {
@@ -55,21 +71,21 @@ describe("Store.changes", () => {
   before(async () => {
     store = new Store(":memory:");
     store.create({ title: "old note", source: "desktop" });
-    // SQLite's trigger stamps changed_at in whole milliseconds. Sleep so the
-    // seed note is stamped strictly BEFORE t0 -- otherwise a same-millisecond
-    // capture makes `changed_at >= t0` include it and the sanity check below
-    // fails intermittently (seen ~1-in-10 standalone).
-    await sleep(5);
+    // Quiet after the seed, so t0 lands after its stamp on both clocks and no
+    // window opened at t0 can contain it.
+    await sleep(SETTLE);
     t0 = new Date().toISOString();
   });
   after(() => store.close());
 
   test("reports created, updated and deleted notes grouped by source", async () => {
-    await sleep(5);
+    await sleep(SETTLE); // quiet after the seed: `since` must exclude it
     const since = new Date().toISOString();
+    await sleep(SETTLE); // quiet before the write: `since` must include it
     const pre = store.create({ title: "pre-existing", source: "desktop" });
-    await sleep(5);
+    await sleep(SETTLE); // quiet after the write: `mid` must exclude its create
     const mid = new Date().toISOString();
+    await sleep(SETTLE); // quiet before the writes: `mid` must include them all
     const a = store.create({ title: "made on phone", source: "phone" });
     store.update(pre.id, { body: "edited on phone", source: "phone" });
     const gone = store.create({ title: "doomed", source: "desktop" });
@@ -146,7 +162,12 @@ describe("Store.changes", () => {
   });
 
   test("t0 sanity: the seed note is older than every window above", () => {
-    assert.ok(store.changes({ since: t0, graceMs: 0 }).changes.every((c) => c.title !== "old note"));
+    assert.ok(
+      store
+        .changes({ since: t0, graceMs: 0 })
+        .changes.every((c) => c.title !== "old note"),
+      "t0 was captured after the seed note, so no window opened at t0 contains it"
+    );
   });
 });
 

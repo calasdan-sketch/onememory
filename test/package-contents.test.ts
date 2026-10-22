@@ -18,7 +18,17 @@ test("npm pack ships no runner file", () => {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
   });
-  const files = (JSON.parse(out) as { files: { path: string }[] }[])[0].files.map((f) => f.path);
+  // `npm pack --json` changed shape in npm 12 (bundled with Node 24.22.1+,
+  // and installed explicitly by `npm install -g npm@latest` in the publish
+  // workflow): an array of package objects became an object keyed by package
+  // name. Runners drift onto new npm between workflow runs, so read both
+  // shapes instead of pinning whichever one the runner happened to ship.
+  const parsed = JSON.parse(out) as
+    | { files: { path: string }[] }[]
+    | Record<string, { files: { path: string }[] }>;
+  const entry = Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0];
+  const files = entry?.files?.map((f) => f.path);
+  assert.ok(files, `unexpected npm pack --json shape: ${out.slice(0, 300)}`);
   assert.ok(files.includes("dist/src/store.js"), "sanity: the memory package itself is packed");
   const leaked = files.filter((f) => RUNNER_FILE.test(f));
   assert.deepEqual(leaked, [], `runner files in the tarball: ${leaked.join(", ")}`);
