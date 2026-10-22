@@ -25,8 +25,14 @@ jobs:
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
-      # Trusted publishing needs npm 11.5.1 or newer.
-      - run: npm install -g npm@latest
+      # Trusted publishing needs npm 11.5.1 or newer. Pin the v11 major:
+      # npm@latest became npm 12 in Oct 2026 and breaks the trusted-publishing
+      # handshake with a misleading E404 "Not Found - PUT", which looks like a
+      # missing package or bad login instead (npm/cli#9088; multiple reports
+      # of "npm@latest is now npm 12 ... broke the publish"). Verified locally:
+      # npm 11.16.0 and 12.2.1 both build/test fine, only the OIDC handshake
+      # differs, so the publish job is the one pinned.
+      - run: npm install -g npm@11
       - run: npm ci --ignore-scripts
       - run: npm run build
       - run: npm test
