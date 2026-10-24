@@ -383,7 +383,7 @@ interface NoteRow {
   archived_at: string | null;
 }
 
-const DEFAULT_NAMESPACE = "default";
+export const DEFAULT_NAMESPACE = "default";
 
 /** AAD binding a sealed quarantine column to its column name and namespace. */
 function quarantineAad(col: string, namespace: string): string {
@@ -758,18 +758,23 @@ function archivedClause(includeArchived?: boolean, archivedOnly?: boolean): stri
   return " AND archived_at IS NULL";
 }
 
-/** SQL prefilter for exact-tag filters over the JSON-array tags column. */
+/**
+ * SQL filter for exact-tag filters over the JSON-array tags column.
+ * instr() is CASE-SENSITIVE (LIKE is not), so "Task" never matches "task" and
+ * LIMIT/total are computed over the right rows. The needle is the tag's JSON
+ * encoding including its quotes, so a tag never matches inside another value;
+ * tagsMatch() re-checks exactly as a belt-and-braces guard.
+ */
 function tagClause(withTags?: string[], withoutTags?: string[]): { sql: string; params: string[] } {
-  const esc = (t: string): string => "%" + JSON.stringify(t).replace(/[\\%_]/g, "\\$&") + "%";
   let sql = "";
   const params: string[] = [];
   for (const t of withTags ?? []) {
-    sql += " AND tags LIKE ? ESCAPE '\\'";
-    params.push(esc(t));
+    sql += " AND instr(tags, ?) > 0";
+    params.push(JSON.stringify(t));
   }
   for (const t of withoutTags ?? []) {
-    sql += " AND tags NOT LIKE ? ESCAPE '\\'";
-    params.push(esc(t));
+    sql += " AND instr(tags, ?) = 0";
+    params.push(JSON.stringify(t));
   }
   return { sql, params };
 }
@@ -3377,6 +3382,67 @@ export class Store {
     return this.feedKeyCache;
   }
 
+  /**
+   * Mint / open a short signed token (change-feed ack tokens). HMAC with the
+   * per-store feed key, domain-separated from cursors, so a token for one
+   * purpose can never be replayed as another. Opaque to callers.
+   */
+  mintToken(domain: string, payload: Record<string, unknown>): string {
+    const body = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+    const mac = createHmac("sha256", this.feedKey()).update(`${domain}.${body}`).digest().subarray(0, 16);
+    return `${body}.${mac.toString("base64url")}`;
+  }
+
+  openToken(domain: string, token: string): Record<string, unknown> | null {
+    const [body, mac, extra] = String(token).split(".");
+    if (!body || !mac || extra !== undefined) return null;
+    const want = createHmac("sha256", this.feedKey()).update(`${domain}.${body}`).digest().subarray(0, 16);
+    const got = Buffer.from(mac, "base64url");
+    if (got.length !== want.length || !timingSafeEqual(got, want)) return null;
+    try {
+      const v = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+      return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private approvalKeyCache: Buffer | null = null;
+
+  /**
+   * MAC for command-task approvals. Keyed by a random per-store secret that
+   * lives only in _meta (never in a note, never exposed through any API), so
+   * an approval can be produced only by code that holds this Store: the
+   * admin-scope approve path. Callers bind namespace, note id, nonce and the
+   * command hash into `parts`.
+   */
+  approvalMac(parts: string[]): string {
+    if (!this.approvalKeyCache) {
+      let hex = this.getMeta("approval_key");
+      if (!hex) {
+        this.db
+          .prepare("INSERT OR IGNORE INTO _meta (key, value) VALUES ('approval_key', ?)")
+          .run(randomBytes(32).toString("hex"));
+        hex = this.getMeta("approval_key")!;
+      }
+      this.approvalKeyCache = Buffer.from(hex, "hex");
+    }
+    return createHmac("sha256", this.approvalKeyCache)
+      .update("onememory-task-approval-v1\n" + JSON.stringify(parts))
+      .digest("hex")
+      .slice(0, 32);
+  }
+
+  /**
+   * Consistent hot backup of the database into a NEW file (VACUUM INTO):
+   * safe while the server is running and writing; includes everything
+   * committed up to the call. Refuses to overwrite. The at-rest key file
+   * (.key) is NOT part of the database -- the CLI copies it separately.
+   */
+  backupTo(dest: string): void {
+    this.db.prepare("VACUUM INTO ?").run(dest);
+  }
+
   private encodeCursor(c: FeedCursor): string {
     const body = Buffer.from(JSON.stringify(c), "utf8").toString("base64url");
     const mac = createHmac("sha256", this.feedKey()).update(body).digest().subarray(0, 16);
@@ -3424,6 +3490,10 @@ export class Store {
     limit?: number;
     /** "last"-marker consumer, carried (signed) through the cursor. */
     consumer?: string;
+    /** Hide changes whose provenance `source` equals this label (exclude_self). */
+    excludeSource?: string;
+    /** Newest N changes of the window only, oldest first, no paging (see changes.ts). */
+    tail?: number;
     /** Clock-skew overlap for a time-based `since` (default FEED_SINCE_GRACE_MS). */
     graceMs?: number;
   }): ChangesPage {
@@ -3460,6 +3530,7 @@ export class Store {
       }
       c = { s, u: new Date().toISOString(), f: from, t: to, a: from, k: scope };
       if (opts.consumer) c.c = opts.consumer;
+      if (opts.excludeSource) c.x = opts.excludeSource;
     }
     const empty = (): ChangesPage => ({
       since: c.s,
@@ -3478,23 +3549,30 @@ export class Store {
     const nsParams = opts.namespaces ?? [];
     const srcSql = opts.source !== undefined ? " AND source = ?" : "";
     const srcParams = opts.source !== undefined ? [opts.source] : [];
+    const exSql = c.x ? " AND source <> ?" : "";
+    const exParams = c.x ? [c.x] : [];
     // One entry per note: its LAST event in the window, kind "deleted" if
     // that event is the delete, else "created" if the note was born in the
     // window, else "updated".
     const eventsSql = `
       WITH ev AS (SELECT seq, note_id, kind FROM change_log
-                   WHERE seq > ? AND seq <= ?${nsSql}${srcSql}),
+                   WHERE seq > ? AND seq <= ?${nsSql}${srcSql}${exSql}),
            g AS (SELECT note_id, MAX(seq) AS last, MAX(kind = 'created') AS born FROM ev GROUP BY note_id)
       SELECT e.seq AS seq,
              CASE WHEN e.kind = 'deleted' THEN 'deleted' WHEN g.born THEN 'created' ELSE 'updated' END AS kind,
              e.note_id AS id, e.namespace AS namespace, e.title AS title, e.source AS source,
              e.changed_at AS at, e.rev AS rev
         FROM g JOIN change_log e ON e.seq = g.last`;
-    const eventParams = [c.f, c.t, ...nsParams, ...srcParams];
+    const eventParams = [c.f, c.t, ...nsParams, ...srcParams, ...exParams];
 
-    const rows = this.db
-      .prepare(`SELECT * FROM (${eventsSql}) WHERE seq > ? ORDER BY seq ASC LIMIT ?`)
-      .all(...eventParams, c.a, limit + 1) as Array<{
+    const tail = opts.tail !== undefined ? clampInt(opts.tail, 30, 1, CHANGES_MAX_LIMIT) : 0;
+    const rowsRaw = this.db
+      .prepare(
+        tail
+          ? `SELECT * FROM (${eventsSql}) WHERE seq > ? ORDER BY seq DESC LIMIT ?`
+          : `SELECT * FROM (${eventsSql}) WHERE seq > ? ORDER BY seq ASC LIMIT ?`
+      )
+      .all(...eventParams, c.a, (tail || limit) + 1) as Array<{
       seq: number;
       kind: ChangeEntry["kind"];
       id: number;
@@ -3504,8 +3582,9 @@ export class Store {
       at: string;
       rev: number | null;
     }>;
-    const more = rows.length > limit;
-    const pageRows = rows.slice(0, limit);
+    const rows = tail ? rowsRaw.slice(0, tail).reverse() : rowsRaw;
+    const more = tail ? false : rows.length > limit;
+    const pageRows = rows.slice(0, tail || limit);
     const page = pageRows.map((r): ChangeEntry => ({
       kind: r.kind,
       id: Number(r.id),
@@ -3948,6 +4027,8 @@ interface FeedCursor {
   k: string;
   /** "last"-marker consumer, if any */
   c?: string;
+  /** exclude_self: hide changes whose source equals this label */
+  x?: string;
 }
 
 /** Most "last" markers a store keeps (see Store.setFeedMarker). */

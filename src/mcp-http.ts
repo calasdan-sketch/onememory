@@ -120,6 +120,7 @@ export function createMcpHttpServer(
       const gone = new AbortController();
       const server = createMcpServer(store, scope, resolveNsForRequest(principal.namespace), {
         waitKey: tokenKey(principal.token),
+        label: principal.label,
         signal: gone.signal,
       });
       const transport = new StreamableHTTPServerTransport({

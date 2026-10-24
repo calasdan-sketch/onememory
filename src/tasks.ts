@@ -4,27 +4,55 @@
 // on everything notes already have: the change feed, namespaces and token
 // scopes, at-rest encryption, retention, search, backup/restore and sync.
 //
-//   task     tags: "task", "status:<idea|planned|running|blocked|done>",
-//            optionally "owner:<surface>". Body: "Next step: <one line>",
-//            a blank line, then free-form notes.
+//   task     tags: "task", "status:<idea|planned|running|blocked|done|queued|failed>",
+//            optionally "owner:<surface>" and the reserved "task.*" tags
+//            (priority, due, parent, blocked_by, client key, lease, approval).
+//            Body: "Next step: <one line>", optional single-line "Command:" /
+//            "Result:" headers, a blank line, then free-form notes.
 //   handoff  tags: "handoff", "surface:<who wrote it>". Body: labelled
 //            sections (Done / Pending / Decisions), see buildHandoffBody.
+//
+// The tags `task`, `handoff` and `task.*` are reserved (reserved-tags.ts):
+// only this module writes them, so an ordinary note write cannot forge a task,
+// a handoff, a lease or an approval.
 //
 // Fields are validated here (clear ValidationErrors -> 400 / tool errors) so a
 // hand-rolled client can't store a task the board can't read back. Callers
 // (REST, MCP, the recall hook) do the token / scope / namespace gating and
 // pass the resulting namespaces in; nothing here widens access.
-import { Store, ValidationError, type NoteRecord } from "./store.js";
+import { createHash, randomBytes } from "node:crypto";
+import { Store, ValidationError, QuarantinedError, DEFAULT_NAMESPACE, type NoteRecord } from "./store.js";
 import { runChanges, type ChangesResponse } from "./changes.js";
+import { RESERVED_TAG_PREFIX } from "./reserved-tags.js";
 
 /** Update of a task that doesn't exist / isn't yours to touch (REST: 404). */
 export class TaskNotFoundError extends ValidationError {}
 
-export const TASK_STATUSES = ["idea", "planned", "running", "blocked", "done"] as const;
+/** task_claim: someone else holds an unexpired lease (REST: 409). */
+export class ClaimConflictError extends ValidationError {
+  constructor(
+    message: string,
+    readonly holder: string,
+    readonly until: string
+  ) {
+    super(message);
+  }
+}
+
+export const TASK_STATUSES = ["idea", "planned", "running", "blocked", "done", "queued", "failed"] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
 export const TASK_TAG = "task";
 export const HANDOFF_TAG = "handoff";
+
+const T = RESERVED_TAG_PREFIX; // "task."
+const TAG_PRIORITY = `${T}priority:`;
+const TAG_DUE = `${T}due:`;
+const TAG_PARENT = `${T}parent:`;
+const TAG_BLOCKED = `${T}blocked_by:`;
+const TAG_CKEY = `${T}ckey:`;
+const TAG_LEASE = `${T}lease:`;
+const TAG_APPROVAL = `${T}approval:`;
 
 export const TASK_LIMITS = {
   title: 200,
@@ -35,9 +63,34 @@ export const TASK_LIMITS = {
   listItems: 25,
   listItem: 500,
   maxList: 200,
+  clientKey: 128,
+  blockedBy: 20,
+  priorityMax: 9,
+  ttlMin: 5,
+  ttlMax: 86_400,
+  ttlDefault: 300,
+  commandParams: 20,
+  commandValue: 500,
+  resultOutput: 4_000,
 };
 
 const LABEL = /^[A-Za-z0-9._@:+ -]{1,64}$/;
+const CLIENT_KEY = /^[A-Za-z0-9._:@/+=-]{1,128}$/;
+// C0/C1 controls (incl. ESC, tab, newline), DEL, line/paragraph separators
+// and bidi/zero-width formatting characters.
+// eslint-disable-next-line no-control-regex
+const CONTROLS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/;
+// eslint-disable-next-line no-control-regex
+const CONTROLS_G = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
+
+export interface TaskCommand {
+  action: string;
+  params: Record<string, string>;
+  /** Runner (machine) name this command is for. Required. */
+  target: string;
+}
+
+export type ApprovalState = "none" | "approved" | "stale";
 
 export interface Task {
   id: number;
@@ -47,9 +100,42 @@ export interface Task {
   owner: string;
   next_step: string;
   notes: string;
+  priority: number | null;
+  due: string;
+  parent_id: number | null;
+  blocked_by: number[];
+  /** Active lease (expired leases read as null). */
+  lease: { owner: string; expires_at: string } | null;
+  /** Command tasks only (see docs/tasks.md "Command tasks"). */
+  command: TaskCommand | null;
+  approval: ApprovalState;
+  result: Record<string, unknown> | null;
   rev: number;
   created_at: string;
   updated_at: string;
+}
+
+/** The compact shape catch_up and the board use: no notes, no command params. */
+export type TaskSummary = Pick<
+  Task,
+  "id" | "namespace" | "title" | "status" | "owner" | "next_step" | "priority" | "due" | "parent_id" | "blocked_by" | "rev" | "updated_at"
+>;
+
+export function compactTask(t: Task): TaskSummary {
+  return {
+    id: t.id,
+    namespace: t.namespace,
+    title: t.title,
+    status: t.status,
+    owner: t.owner,
+    next_step: t.next_step,
+    priority: t.priority,
+    due: t.due,
+    parent_id: t.parent_id,
+    blocked_by: t.blocked_by,
+    rev: t.rev,
+    updated_at: t.updated_at,
+  };
 }
 
 export interface TaskInput {
@@ -61,6 +147,20 @@ export interface TaskInput {
   owner?: string;
   notes?: string;
   if_rev?: number;
+  /** null clears. */
+  priority?: number | null;
+  /** YYYY-MM-DD or an ISO time; "" / null clears. */
+  due?: string | null;
+  /** Parent task id; null clears. */
+  parent_id?: number | null;
+  /** Task ids that must finish first; [] clears. */
+  blocked_by?: number[];
+  /** Idempotency key for create: same key + namespace returns the existing task. */
+  client_key?: string;
+  /** Command task: {action, params}; null removes the command. Needs `target`. */
+  command?: { action?: unknown; params?: unknown } | null;
+  /** Runner name the command is for (must equal the runner's own id). */
+  target?: string;
 }
 
 /** Where a write may land: set when the caller is pinned to one namespace. */
@@ -75,7 +175,12 @@ function str(v: unknown, name: string): string | undefined {
 }
 
 function oneLine(v: string): string {
-  return v.replace(/\s+/g, " ").trim();
+  return v.replace(CONTROLS_G, " ").replace(/\s+/g, " ").trim();
+}
+
+/** Collapse whitespace and drop control characters: safe to print on one line. */
+export function safeLine(v: unknown): string {
+  return oneLine(String(v ?? ""));
 }
 
 function label(v: unknown, name: string): string | undefined {
@@ -98,37 +203,287 @@ function status(v: unknown): TaskStatus | undefined {
   return s as TaskStatus;
 }
 
+function intOrNull(v: unknown, name: string): number | null | undefined {
+  if (v === undefined) return undefined;
+  if (v === null) return null;
+  if (typeof v !== "number" || !Number.isInteger(v) || v < 1) throw new ValidationError(`${name} must be a positive integer`);
+  return v;
+}
+
+function normDue(v: unknown): string | null | undefined {
+  if (v === undefined) return undefined;
+  if (v === null || v === "") return null;
+  if (typeof v !== "string") throw new ValidationError("due must be a string (YYYY-MM-DD or an ISO time)");
+  const t = v.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) {
+    if (Number.isNaN(Date.parse(t + "T00:00:00Z"))) throw new ValidationError("due is not a valid date");
+    return t;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(t) || Number.isNaN(Date.parse(t))) {
+    throw new ValidationError("due must be YYYY-MM-DD or an ISO-8601 time");
+  }
+  return new Date(t).toISOString();
+}
+
 export function isTaskNote(n: NoteRecord): boolean {
   return n.tags.includes(TASK_TAG);
 }
 
-function taskBody(nextStep: string, notes: string): string {
-  return `Next step: ${nextStep}\n\n${notes}`;
+// ---- Task <-> note ------------------------------------------------------------
+
+interface TaskState {
+  status: TaskStatus;
+  owner: string;
+  priority: number | null;
+  due: string;
+  parent: number | null;
+  blockedBy: number[];
+  lease: { owner: string; expMs: number } | null;
+  ckey: string | null;
+  approval: string | null; // "<nonce>.<mac>"
+}
+
+function parseLease(tag: string): { owner: string; expMs: number } | null {
+  const m = /^(\d{1,16}):(.+)$/.exec(tag);
+  return m ? { expMs: Number(m[1]), owner: m[2] } : null;
+}
+
+function stateOf(n: NoteRecord): TaskState {
+  const tag = (prefix: string): string | undefined => n.tags.find((t) => t.startsWith(prefix))?.slice(prefix.length);
+  const st = tag("status:") ?? "";
+  const pr = tag(TAG_PRIORITY);
+  const par = tag(TAG_PARENT);
+  const lease = tag(TAG_LEASE);
+  return {
+    status: (TASK_STATUSES as readonly string[]).includes(st) ? (st as TaskStatus) : "idea",
+    owner: tag("owner:") ?? "",
+    priority: pr !== undefined && /^\d$/.test(pr) ? Number(pr) : null,
+    due: tag(TAG_DUE) ?? "",
+    parent: par !== undefined && /^\d+$/.test(par) ? Number(par) : null,
+    blockedBy: n.tags
+      .filter((t) => t.startsWith(TAG_BLOCKED))
+      .map((t) => t.slice(TAG_BLOCKED.length))
+      .filter((x) => /^\d+$/.test(x))
+      .map(Number),
+    lease: lease ? parseLease(lease) : null,
+    ckey: tag(TAG_CKEY) ?? null,
+    approval: tag(TAG_APPROVAL) ?? null,
+  };
+}
+
+function tagsFromState(base: readonly string[], s: TaskState): string[] {
+  const keep = base.filter(
+    (t) => t !== TASK_TAG && !t.startsWith("status:") && !t.startsWith("owner:") && !t.startsWith(T)
+  );
+  return [
+    ...keep,
+    TASK_TAG,
+    `status:${s.status}`,
+    ...(s.owner ? [`owner:${s.owner}`] : []),
+    ...(s.priority !== null ? [`${TAG_PRIORITY}${s.priority}`] : []),
+    ...(s.due ? [`${TAG_DUE}${s.due}`] : []),
+    ...(s.parent !== null ? [`${TAG_PARENT}${s.parent}`] : []),
+    ...[...new Set(s.blockedBy)].sort((a, b) => a - b).map((id) => `${TAG_BLOCKED}${id}`),
+    ...(s.lease ? [`${TAG_LEASE}${s.lease.expMs}:${s.lease.owner}`] : []),
+    ...(s.ckey ? [`${TAG_CKEY}${s.ckey}`] : []),
+    ...(s.approval ? [`${TAG_APPROVAL}${s.approval}`] : []),
+  ];
+}
+
+interface BodyParts {
+  nextStep: string;
+  command: { action: string; params: Record<string, string>; target: string } | null;
+  result: Record<string, unknown> | null;
+  notes: string;
+}
+
+function taskBody(p: BodyParts): string {
+  const head = [`Next step: ${p.nextStep}`];
+  if (p.command) head.push(`Command: ${JSON.stringify({ action: p.command.action, params: p.command.params, target: p.command.target })}`);
+  if (p.result) head.push(`Result: ${JSON.stringify(p.result)}`);
+  return `${head.join("\n")}\n\n${p.notes}`;
+}
+
+function parseBody(body: string): BodyParts {
+  const lines = body.split("\n");
+  const first = /^Next step:[ \t]*(.*)$/.exec(lines[0] ?? "");
+  if (!first) return { nextStep: "", command: null, result: null, notes: body };
+  let command: BodyParts["command"] = null;
+  let result: BodyParts["result"] = null;
+  let i = 1;
+  for (; i < lines.length; i++) {
+    const m = /^(Command|Result): (.*)$/.exec(lines[i]);
+    if (!m) break;
+    try {
+      const v = JSON.parse(m[2]) as unknown;
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        if (m[1] === "Command") {
+          const c = v as { action?: unknown; params?: unknown; target?: unknown };
+          if (typeof c.action === "string" && typeof c.target === "string") {
+            const params: Record<string, string> = {};
+            if (c.params && typeof c.params === "object" && !Array.isArray(c.params)) {
+              for (const [k, x] of Object.entries(c.params)) if (typeof x === "string") params[k] = x;
+            }
+            command = { action: c.action, params, target: c.target };
+          }
+        } else {
+          result = v as Record<string, unknown>;
+        }
+      }
+    } catch {
+      /* a mangled header is just ignored */
+    }
+  }
+  if (lines[i] === "") i++;
+  return { nextStep: first[1].trim(), command, result, notes: lines.slice(i).join("\n") };
+}
+
+/** Canonical text of a command, bound into the approval MAC. */
+export function commandHash(namespace: string, id: number, c: TaskCommand): string {
+  return createHash("sha256")
+    .update(JSON.stringify(["onememory-task-cmd-v1", namespace, id, c.action, Object.entries(c.params).sort(), c.target]))
+    .digest("hex");
+}
+
+/**
+ * Is this note's approval tag a valid, current approval of the command it
+ * carries? (store-keyed MAC over namespace, id, nonce and the command hash)
+ */
+export function verifyApproval(store: Store, n: NoteRecord): ApprovalState {
+  const st = stateOf(n);
+  if (!st.approval) return "none";
+  const cmd = parseBody(n.body).command;
+  const m = /^([0-9a-f]{16})\.([0-9a-f]{32})$/.exec(st.approval);
+  if (!cmd || !m) return "stale";
+  const want = store.approvalMac([n.namespace, String(n.id), m[1], commandHash(n.namespace, n.id, cmd)]);
+  return want === m[2] ? "approved" : "stale";
 }
 
 /** Note -> Task. Tolerates a hand-edited note (missing tags / header). */
-export function taskFromNote(n: NoteRecord): Task {
-  const st = n.tags.find((t) => t.startsWith("status:"))?.slice(7) ?? "";
-  const owner = n.tags.find((t) => t.startsWith("owner:"))?.slice(6) ?? "";
-  let nextStep = "";
-  let notes = n.body;
-  const m = /^Next step:[ \t]*([^\n]*)(?:\n\n?([\s\S]*))?$/.exec(n.body);
-  if (m) {
-    nextStep = m[1].trim();
-    notes = m[2] ?? "";
-  }
+export function taskFromNote(n: NoteRecord, store?: Store, now = Date.now()): Task {
+  const st = stateOf(n);
+  const body = parseBody(n.body);
+  const lease = st.lease && st.lease.expMs > now ? { owner: st.lease.owner, expires_at: new Date(st.lease.expMs).toISOString() } : null;
   return {
     id: n.id,
     namespace: n.namespace,
     title: n.title,
-    status: (TASK_STATUSES as readonly string[]).includes(st) ? (st as TaskStatus) : "idea",
-    owner,
-    next_step: nextStep,
-    notes,
+    status: st.status,
+    owner: st.owner,
+    next_step: body.nextStep,
+    notes: body.notes,
+    priority: st.priority,
+    due: st.due,
+    parent_id: st.parent,
+    blocked_by: st.blockedBy,
+    lease,
+    command: body.command,
+    approval: store ? verifyApproval(store, n) : st.approval ? "stale" : "none",
+    result: body.result,
     rev: n.rev,
     created_at: n.created_at,
     updated_at: n.updated_at,
   };
+}
+
+// ---- Create / update ------------------------------------------------------------
+
+function validateTitle(v: string): string {
+  if (CONTROLS.test(v)) throw new ValidationError("title cannot contain line breaks or control characters");
+  const t = v.trim();
+  if (t.length > TASK_LIMITS.title) throw new ValidationError(`title exceeds ${TASK_LIMITS.title} chars`);
+  return t;
+}
+
+function validateCommand(raw: TaskInput["command"]): { action: string; params: Record<string, string> } | null | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null) return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) throw new ValidationError("command must be an object {action, params}");
+  const action = raw.action;
+  if (typeof action !== "string" || !/^[A-Za-z0-9_.:-]{1,64}$/.test(action)) {
+    throw new ValidationError("command.action must be 1-64 characters of letters, digits and . _ : -");
+  }
+  const params: Record<string, string> = {};
+  if (raw.params !== undefined && raw.params !== null) {
+    if (typeof raw.params !== "object" || Array.isArray(raw.params)) throw new ValidationError("command.params must be an object of strings");
+    const entries = Object.entries(raw.params as Record<string, unknown>);
+    if (entries.length > TASK_LIMITS.commandParams) throw new ValidationError(`command.params has too many entries (max ${TASK_LIMITS.commandParams})`);
+    for (const [k, v] of entries) {
+      if (!/^\w{1,64}$/.test(k)) throw new ValidationError("command.params names must be 1-64 word characters");
+      if (typeof v !== "string") throw new ValidationError(`command.params.${k} must be a string`);
+      if (v.length > TASK_LIMITS.commandValue || CONTROLS.test(v)) {
+        throw new ValidationError(`command.params.${k} is too long or contains control characters`);
+      }
+      params[k] = v;
+    }
+  }
+  return { action, params };
+}
+
+function validateTarget(v: unknown): string | undefined {
+  const s = str(v, "target");
+  if (s === undefined) return undefined;
+  const t = s.trim();
+  if (!/^[A-Za-z0-9._@-]{1,64}$/.test(t)) throw new ValidationError("target must be 1-64 characters of letters, digits, . _ @ -");
+  return t;
+}
+
+/** Turn a caller's idempotency key into the stored tag value (never stored raw). */
+function ckeyTag(namespace: string, key: string): string {
+  return createHash("sha256").update(`onememory-ckey-v1\0${namespace}\0${key}`).digest("hex").slice(0, 24);
+}
+
+function clientKey(v: unknown): string | undefined {
+  const s = str(v, "client_key");
+  if (s === undefined) return undefined;
+  if (!CLIENT_KEY.test(s)) {
+    throw new ValidationError(`client_key must be 1-${TASK_LIMITS.clientKey} characters of letters, digits and . _ : @ / + = -`);
+  }
+  return s;
+}
+
+/** A task other than `selfId`, alive, in `ns`: a valid parent / blocker. */
+function requireTaskRef(store: Store, id: number, ns: string, selfId: number | null, what: string): NoteRecord {
+  if (selfId !== null && id === selfId) throw new ValidationError(`${what}: a task cannot reference itself`);
+  const n = store.read(id);
+  if (!n || n.archived_at || !isTaskNote(n) || n.namespace !== ns) {
+    throw new ValidationError(`${what}: no task with id ${id} in this namespace`);
+  }
+  return n;
+}
+
+function assertNoCycle(store: Store, selfId: number, parentId: number): void {
+  let cur: number | null = parentId;
+  for (let i = 0; cur !== null && i < 64; i++) {
+    if (cur === selfId) throw new ValidationError("parent_id would create a cycle");
+    const n = store.read(cur);
+    cur = n ? stateOf(n).parent : null;
+  }
+}
+
+/** Run fn in one write transaction, but let a quarantine (which is a stored result) commit. */
+function inTransaction<T>(store: Store, fn: () => T): T {
+  let quarantined: QuarantinedError | null = null;
+  const out = store.transaction(() => {
+    try {
+      return fn();
+    } catch (e) {
+      if (e instanceof QuarantinedError) {
+        quarantined = e;
+        return undefined as unknown as T;
+      }
+      throw e;
+    }
+  });
+  if (quarantined) throw quarantined;
+  return out;
+}
+
+export interface PutTaskResult {
+  task: Task;
+  note: NoteRecord;
+  /** client_key matched an existing task: nothing was written. */
+  replayed?: true;
 }
 
 /**
@@ -142,16 +497,14 @@ export function putTask(
   input: TaskInput,
   scope: WriteScope = {},
   lintWarnings?: import("./lint.js").LintFinding[]
-): { task: Task; note: NoteRecord } {
-  const title = str(input.title, "title");
+): PutTaskResult {
+  const titleRaw = str(input.title, "title");
+  const title = titleRaw === undefined ? undefined : validateTitle(titleRaw);
   const st = status(input.status);
   const nextStepRaw = str(input.next_step, "next_step");
   const nextStep = nextStepRaw === undefined ? undefined : oneLine(nextStepRaw);
   const owner = label(input.owner, "owner");
   const notes = str(input.notes, "notes");
-  if (title !== undefined && title.trim().length > TASK_LIMITS.title) {
-    throw new ValidationError(`title exceeds ${TASK_LIMITS.title} chars`);
-  }
   if (nextStep !== undefined && nextStep.length > TASK_LIMITS.nextStep) {
     throw new ValidationError(`next_step exceeds ${TASK_LIMITS.nextStep} chars`);
   }
@@ -166,20 +519,41 @@ export function putTask(
     ifRev = input.if_rev;
   }
   const ns = str(input.namespace, "namespace");
-
-  const tagsFor = (base: string[], s: TaskStatus, o: string): string[] => [
-    ...base.filter((t) => t !== TASK_TAG && !t.startsWith("status:") && !t.startsWith("owner:")),
-    TASK_TAG,
-    `status:${s}`,
-    ...(o ? [`owner:${o}`] : []),
-  ];
+  const priority = (() => {
+    if (input.priority === undefined) return undefined;
+    if (input.priority === null) return null;
+    if (typeof input.priority !== "number" || !Number.isInteger(input.priority) || input.priority < 0 || input.priority > TASK_LIMITS.priorityMax) {
+      throw new ValidationError(`priority must be a whole number 0-${TASK_LIMITS.priorityMax} (or null to clear)`);
+    }
+    return input.priority;
+  })();
+  const due = normDue(input.due);
+  const parentId = intOrNull(input.parent_id, "parent_id");
+  let blockedBy: number[] | undefined;
+  if (input.blocked_by !== undefined) {
+    if (!Array.isArray(input.blocked_by) || input.blocked_by.length > TASK_LIMITS.blockedBy) {
+      throw new ValidationError(`blocked_by must be a list of at most ${TASK_LIMITS.blockedBy} task ids`);
+    }
+    blockedBy = input.blocked_by.map((x) => {
+      if (typeof x !== "number" || !Number.isInteger(x) || x < 1) throw new ValidationError("blocked_by must be a list of positive integers");
+      return x;
+    });
+  }
+  const key = clientKey(input.client_key);
+  const target = validateTarget(input.target);
+  const cmd = validateCommand(input.command);
 
   if (input.id !== undefined && input.id !== null) {
     if (!Number.isInteger(input.id) || input.id < 1) throw new ValidationError("id must be a positive integer");
-    if (title === undefined && st === undefined && nextStep === undefined && owner === undefined && notes === undefined) {
-      throw new ValidationError("nothing to update: pass at least one of title, status, next_step, owner, notes");
+    if (key !== undefined) throw new ValidationError("client_key applies to creating a task; use if_rev to guard an update");
+    if (
+      title === undefined && st === undefined && nextStep === undefined && owner === undefined && notes === undefined &&
+      priority === undefined && due === undefined && parentId === undefined && blockedBy === undefined &&
+      cmd === undefined && target === undefined
+    ) {
+      throw new ValidationError("nothing to update: pass at least one of title, status, next_step, owner, notes, priority, due, parent_id, blocked_by, command");
     }
-    if (title !== undefined && !title.trim()) throw new ValidationError("title cannot be empty");
+    if (title !== undefined && !title) throw new ValidationError("title cannot be empty");
     const existing = store.read(input.id);
     if (
       !existing ||
@@ -189,37 +563,129 @@ export function putTask(
     ) {
       throw new TaskNotFoundError(`no task with id ${input.id}`);
     }
-    const cur = taskFromNote(existing);
-    const nextOwner = owner === undefined ? cur.owner : owner;
-    const nextStatus = st ?? cur.status;
+    const cur = stateOf(existing);
+    const curBody = parseBody(existing.body);
+    const next: TaskState = { ...cur };
+    if (owner !== undefined) {
+      const lease = cur.lease && cur.lease.expMs > Date.now() ? cur.lease : null;
+      if (lease && owner !== lease.owner) {
+        throw new ClaimConflictError(
+          `task #${existing.id} is claimed by "${lease.owner}" until ${new Date(lease.expMs).toISOString()}; ask them to release it`,
+          lease.owner,
+          new Date(lease.expMs).toISOString()
+        );
+      }
+      next.owner = owner;
+    }
+    if (st !== undefined) next.status = st;
+    if (priority !== undefined) next.priority = priority;
+    if (due !== undefined) next.due = due ?? "";
+    if (parentId !== undefined) {
+      if (parentId !== null) {
+        requireTaskRef(store, parentId, existing.namespace, existing.id, "parent_id");
+        assertNoCycle(store, existing.id, parentId);
+      }
+      next.parent = parentId;
+    }
+    if (blockedBy !== undefined) {
+      for (const b of blockedBy) requireTaskRef(store, b, existing.namespace, existing.id, "blocked_by");
+      next.blockedBy = blockedBy;
+    }
+    if (next.lease && next.lease.expMs <= Date.now()) next.lease = null; // expired leases are dropped on write
+    // Command / target edits. Any change to the command, its target, or a
+    // re-queue voids the approval (it is also bound to a hash of the command,
+    // so a text edit that bypassed this still fails at the runner).
+    let command = curBody.command;
+    let commandTouched = false;
+    if (cmd === null) {
+      if (command) commandTouched = true;
+      command = null;
+    } else if (cmd) {
+      const tgt = target ?? command?.target;
+      if (!tgt) throw new ValidationError("a command needs a `target`: the runner name that may execute it");
+      command = { action: cmd.action, params: cmd.params, target: tgt };
+      commandTouched = true;
+    } else if (target !== undefined && command) {
+      if (target !== command.target) commandTouched = true;
+      command = { ...command, target };
+    }
+    if (commandTouched && command) next.status = "queued";
+    if (commandTouched && !command && next.status === "queued") next.status = "idea";
+    if (commandTouched || (next.status === "queued" && cur.status !== "queued") || !command) next.approval = null;
     const note = store.update(
       input.id,
       {
-        title: title === undefined ? undefined : title.trim(),
-        body: taskBody(nextStep ?? cur.next_step, notes ?? cur.notes),
-        tags: tagsFor(existing.tags, nextStatus, nextOwner),
-        source: nextOwner || existing.source || "task",
+        title,
+        body: taskBody({
+          nextStep: nextStep ?? curBody.nextStep,
+          command,
+          result: commandTouched ? null : curBody.result,
+          notes: notes ?? curBody.notes,
+        }),
+        tags: tagsFromState(existing.tags, next),
+        source: next.owner || "task",
       },
       { ifRev, lintWarnings }
     );
     if (!note) throw new TaskNotFoundError(`no task with id ${input.id}`);
-    return { task: taskFromNote(note), note };
+    return { task: taskFromNote(note, store), note };
   }
 
-  if (!title || !title.trim()) throw new ValidationError("title is required when creating a task");
-  const s = st ?? "idea";
-  const o = owner ?? "";
-  const note = store.create(
-    {
-      namespace: scope.namespace ?? ns,
-      title: title.trim(),
-      body: taskBody(nextStep ?? "", notes ?? ""),
-      tags: tagsFor([], s, o),
-      source: o || "task",
-    },
-    { lintWarnings }
-  );
-  return { task: taskFromNote(note), note };
+  // ---- create ----
+  if (!title) throw new ValidationError("title is required when creating a task");
+  const namespace = (scope.namespace ?? ns)?.trim() || DEFAULT_NAMESPACE;
+  const s0: TaskState = {
+    status: cmd ? "queued" : st ?? "idea",
+    owner: owner ?? "",
+    priority: priority ?? null,
+    due: due ?? "",
+    parent: null,
+    blockedBy: [],
+    lease: null,
+    ckey: key ? ckeyTag(namespace, key) : null,
+    approval: null,
+  };
+  if (cmd && !target) throw new ValidationError("a command needs a `target`: the runner name that may execute it");
+  if (cmd && st !== undefined && st !== "queued") {
+    throw new ValidationError("a command task is always created with status queued");
+  }
+  if (cmd === undefined && target !== undefined) throw new ValidationError("target only applies to a command task");
+  if (parentId !== undefined && parentId !== null) {
+    requireTaskRef(store, parentId, namespace, null, "parent_id");
+    s0.parent = parentId;
+  }
+  if (blockedBy !== undefined) {
+    for (const b of blockedBy) requireTaskRef(store, b, namespace, null, "blocked_by");
+    s0.blockedBy = blockedBy;
+  }
+  const command: BodyParts["command"] = cmd ? { action: cmd.action, params: cmd.params, target: target! } : null;
+  const doCreate = (): NoteRecord =>
+    store.create(
+      {
+        namespace,
+        title,
+        body: taskBody({ nextStep: nextStep ?? "", command, result: null, notes: notes ?? "" }),
+        tags: tagsFromState([], s0),
+        source: s0.owner || "task",
+      },
+      { lintWarnings }
+    );
+  if (!key) {
+    const note = doCreate();
+    return { task: taskFromNote(note, store), note };
+  }
+  // Idempotent create: look up and create under ONE write lock, so two
+  // retries (even from two processes) cannot both create.
+  let replay = false;
+  const note = inTransaction(store, () => {
+    const hit = store.list({ namespace, limit: 1, withTags: [TASK_TAG, `${TAG_CKEY}${s0.ckey}`] }).notes[0];
+    if (hit) {
+      replay = true;
+      return hit;
+    }
+    return doCreate();
+  });
+  return { task: taskFromNote(note, store), note, ...(replay ? { replayed: true as const } : {}) };
 }
 
 export interface TaskListOpts {
@@ -228,6 +694,7 @@ export interface TaskListOpts {
   /** One status, or "all"; default = open (everything except done). */
   status?: string;
   owner?: string;
+  parent_id?: number;
   limit?: number;
 }
 
@@ -239,9 +706,198 @@ export function listTasks(store: Store, opts: TaskListOpts = {}): { tasks: Task[
   else if (st !== "all") withTags.push(`status:${status(st)}`);
   const owner = label(opts.owner, "owner");
   if (owner) withTags.push(`owner:${owner}`);
+  if (opts.parent_id !== undefined) withTags.push(`${TAG_PARENT}${intOrNull(opts.parent_id, "parent_id")}`);
   const limit = Math.min(TASK_LIMITS.maxList, Math.max(1, Math.floor(opts.limit ?? 50) || 50));
   const { notes, total } = store.list({ namespaces: opts.namespaces, limit, withTags, withoutTags });
-  return { tasks: notes.map(taskFromNote), total };
+  return { tasks: notes.map((n) => taskFromNote(n, store)), total };
+}
+
+/** One task, in full (notes, command, result). Same visibility rules as listTasks. */
+export function getTask(store: Store, id: number, namespaces?: string[]): Task {
+  if (!Number.isInteger(id) || id < 1) throw new ValidationError("id must be a positive integer");
+  const n = store.read(id);
+  if (!n || n.archived_at || !isTaskNote(n) || (namespaces !== undefined && !namespaces.includes(n.namespace))) {
+    throw new TaskNotFoundError(`no task with id ${id}`);
+  }
+  return taskFromNote(n, store);
+}
+
+// ---- Claim / lease --------------------------------------------------------------
+
+export interface ClaimInput {
+  id: number;
+  owner: string;
+  ttl_seconds?: number;
+  /** Give the lease up (only the holder can). */
+  release?: boolean;
+}
+
+/**
+ * Cooperative lease on a task, with compare-and-swap semantics: the check and
+ * the write are one rev-guarded UPDATE, so two sessions racing for the same
+ * task cannot both win. Claiming a task you already hold extends it
+ * (heartbeat). An expired lease can be taken by anyone. Release is by the holder.
+ */
+export function claimTask(
+  store: Store,
+  input: ClaimInput,
+  scope: WriteScope = {},
+  now = Date.now()
+): { task: Task; heartbeat: boolean; released: boolean } {
+  if (!Number.isInteger(input.id) || input.id < 1) throw new ValidationError("id must be a positive integer");
+  const owner = label(input.owner, "owner");
+  if (!owner) throw new ValidationError("owner is required: who is taking the task");
+  let ttl = TASK_LIMITS.ttlDefault;
+  if (input.ttl_seconds !== undefined && input.ttl_seconds !== null) {
+    if (!Number.isInteger(input.ttl_seconds) || input.ttl_seconds < TASK_LIMITS.ttlMin || input.ttl_seconds > TASK_LIMITS.ttlMax) {
+      throw new ValidationError(`ttl_seconds must be a whole number from ${TASK_LIMITS.ttlMin} to ${TASK_LIMITS.ttlMax}`);
+    }
+    ttl = input.ttl_seconds;
+  }
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const existing = store.read(input.id);
+    if (
+      !existing ||
+      existing.archived_at ||
+      !isTaskNote(existing) ||
+      (scope.namespace !== undefined && existing.namespace !== scope.namespace)
+    ) {
+      throw new TaskNotFoundError(`no task with id ${input.id}`);
+    }
+    const cur = stateOf(existing);
+    const live = cur.lease && cur.lease.expMs > now ? cur.lease : null;
+    const next: TaskState = { ...cur, lease: null };
+    let heartbeat = false;
+    let released = false;
+    if (input.release) {
+      if (live && live.owner !== owner) {
+        throw new ClaimConflictError(
+          `task #${existing.id} is claimed by "${live.owner}" until ${new Date(live.expMs).toISOString()}; only the holder can release it`,
+          live.owner,
+          new Date(live.expMs).toISOString()
+        );
+      }
+      released = true;
+      if (live && cur.owner === owner) next.owner = "";
+    } else {
+      if (live && live.owner !== owner) {
+        throw new ClaimConflictError(
+          `task #${existing.id} is already claimed by "${live.owner}" until ${new Date(live.expMs).toISOString()}`,
+          live.owner,
+          new Date(live.expMs).toISOString()
+        );
+      }
+      heartbeat = Boolean(live);
+      next.lease = { owner, expMs: now + ttl * 1000 };
+      next.owner = owner;
+      if (next.status === "idea" || next.status === "planned") next.status = "running";
+    }
+    try {
+      const note = store.update(
+        existing.id,
+        { tags: tagsFromState(existing.tags, next), source: next.owner || "task" },
+        { ifRev: existing.rev }
+      );
+      if (!note) throw new TaskNotFoundError(`no task with id ${input.id}`);
+      return { task: taskFromNote(note, store, now), heartbeat, released };
+    } catch (e) {
+      if (e instanceof ValidationError && e.message.startsWith("stale write:")) continue; // lost a race: re-read and re-decide
+      throw e;
+    }
+  }
+  throw new ValidationError(`task #${input.id} is being changed too quickly; retry`);
+}
+
+// ---- Command tasks: approval and results ------------------------------------------
+
+/**
+ * Approve (or revoke approval of) a command task. The caller MUST have
+ * checked admin scope: this is the explicit human gate in front of the
+ * runner. The approval is a MAC, keyed by a secret only this store holds, over
+ * the namespace, task id, a fresh single-use nonce and a hash of the command
+ * -- so it cannot be copied to another task, survives no edit to the command,
+ * and cannot be forged by anyone who can only write notes.
+ */
+export function approveTask(
+  store: Store,
+  input: { id: number; revoke?: boolean },
+  scope: WriteScope = {}
+): Task {
+  if (!Number.isInteger(input.id) || input.id < 1) throw new ValidationError("id must be a positive integer");
+  const existing = store.read(input.id);
+  if (
+    !existing ||
+    existing.archived_at ||
+    !isTaskNote(existing) ||
+    (scope.namespace !== undefined && existing.namespace !== scope.namespace)
+  ) {
+    throw new TaskNotFoundError(`no task with id ${input.id}`);
+  }
+  const cur = stateOf(existing);
+  const cmd = parseBody(existing.body).command;
+  if (!input.revoke) {
+    if (!cmd) throw new ValidationError("this task has no command to approve");
+    if (cur.status !== "queued") throw new ValidationError(`only a queued command task can be approved (this one is ${cur.status})`);
+  }
+  const next: TaskState = { ...cur };
+  if (input.revoke) next.approval = null;
+  else {
+    const nonce = randomBytes(8).toString("hex");
+    next.approval = `${nonce}.${store.approvalMac([existing.namespace, String(existing.id), nonce, commandHash(existing.namespace, existing.id, cmd!)])}`;
+  }
+  const note = store.update(
+    existing.id,
+    { tags: tagsFromState(existing.tags, next) },
+    { ifRev: existing.rev }
+  );
+  if (!note) throw new TaskNotFoundError(`no task with id ${input.id}`);
+  return taskFromNote(note, store);
+}
+
+/** Runner side: queued, approved command tasks in one namespace (verified fresh). */
+export function queuedCommandTasks(store: Store, namespace: string, limit = 50): NoteRecord[] {
+  return store.list({ namespace, limit, withTags: [TASK_TAG, "status:queued"] }).notes.filter((n) => parseBody(n.body).command !== null);
+}
+
+/** Runner side: queued -> running, only if the task is still at `rev` (CAS). */
+export function markCommandRunning(store: Store, n: NoteRecord): NoteRecord | null {
+  try {
+    return store.update(n.id, { tags: tagsFromState(n.tags, { ...stateOf(n), status: "running" }) }, { ifRev: n.rev });
+  } catch (e) {
+    if (e instanceof ValidationError) return null; // edited meanwhile: not ours to run
+    throw e;
+  }
+}
+
+/** Runner side: record how a command task ended. */
+export function finishCommandTask(
+  store: Store,
+  id: number,
+  outcome: { ok: boolean; status: string; exit_code?: number | null; output?: string; reason?: string }
+): void {
+  const n = store.read(id);
+  if (!n || !isTaskNote(n)) return;
+  const body = parseBody(n.body);
+  const result: Record<string, unknown> = {
+    status: outcome.status,
+    finished_at: new Date().toISOString(),
+    ...(outcome.exit_code !== undefined ? { exit_code: outcome.exit_code } : {}),
+    ...(outcome.reason ? { reason: safeLine(outcome.reason).slice(0, 500) } : {}),
+    ...(outcome.output ? { output: outcome.output.slice(0, TASK_LIMITS.resultOutput) } : {}),
+  };
+  const write = (r: Record<string, unknown>): void => {
+    store.update(id, {
+      body: taskBody({ ...body, result: r }),
+      tags: tagsFromState(n.tags, { ...stateOf(n), status: outcome.ok ? "done" : "failed" }),
+    });
+  };
+  try {
+    write(result);
+  } catch (e) {
+    // e.g. the output tripped the secret scanner: keep the outcome, drop the text.
+    const { output: _drop, ...rest } = result;
+    write({ ...rest, output_withheld: e instanceof Error ? safeLine(e.message).slice(0, 200) : "not storable" });
+  }
 }
 
 // ---- Handoffs ---------------------------------------------------------------
@@ -254,6 +910,8 @@ export interface HandoffInput {
   pending?: string[];
   decisions?: string[];
   next_step?: string;
+  /** Idempotency key: same key + namespace returns the existing handoff. */
+  client_key?: string;
 }
 
 export interface Handoff {
@@ -325,7 +983,7 @@ export function writeHandoff(
   input: HandoffInput,
   scope: WriteScope = {},
   lintWarnings?: import("./lint.js").LintFinding[]
-): { handoff: Handoff; note: NoteRecord } {
+): { handoff: Handoff; note: NoteRecord; replayed?: true } {
   const surface = label(input.surface, "surface");
   if (!surface) throw new ValidationError("surface is required: which device, chat or model is handing off");
   const summaryRaw = str(input.summary, "summary");
@@ -340,19 +998,36 @@ export function writeHandoff(
   if (!summary && !nextStep && !done.length && !pending.length && !decisions.length) {
     throw new ValidationError("a handoff needs something in it: summary, next_step, done, pending or decisions");
   }
+  const key = clientKey(input.client_key);
   const ns = str(input.namespace, "namespace");
+  const namespace = (scope.namespace ?? ns)?.trim() || DEFAULT_NAMESPACE;
   const stamp = new Date().toISOString().slice(0, 16).replace("T", " ") + "Z";
-  const note = store.create(
-    {
-      namespace: scope.namespace ?? ns,
-      title: `Handoff from ${surface} (${stamp})`,
-      body: buildHandoffBody({ summary, nextStep, done, pending, decisions }),
-      tags: [HANDOFF_TAG, `surface:${surface}`],
-      source: surface,
-    },
-    { lintWarnings }
-  );
-  return { handoff: handoffFromNote(note), note };
+  const ck = key ? ckeyTag(namespace, key) : null;
+  const doCreate = (): NoteRecord =>
+    store.create(
+      {
+        namespace,
+        title: `Handoff from ${surface} (${stamp})`,
+        body: buildHandoffBody({ summary, nextStep, done, pending, decisions }),
+        tags: [HANDOFF_TAG, `surface:${surface}`, ...(ck ? [`${TAG_CKEY}${ck}`] : [])],
+        source: surface,
+      },
+      { lintWarnings }
+    );
+  if (!ck) {
+    const note = doCreate();
+    return { handoff: handoffFromNote(note), note };
+  }
+  let replay = false;
+  const note = inTransaction(store, () => {
+    const hit = store.list({ namespace, limit: 1, withTags: [HANDOFF_TAG, `${TAG_CKEY}${ck}`] }).notes[0];
+    if (hit) {
+      replay = true;
+      return hit;
+    }
+    return doCreate();
+  });
+  return { handoff: handoffFromNote(note), note, ...(replay ? { replayed: true as const } : {}) };
 }
 
 export function listHandoffs(
@@ -376,10 +1051,13 @@ export interface CatchUpOpts {
   changes?: boolean;
   tasks?: number;
   handoffs?: number;
+  /** "manual": the marker moves only when `ack_token` comes back (see changes.ts). */
+  ackMode?: "auto" | "manual";
+  ackToken?: string;
+  excludeSelf?: boolean;
 }
 
 export const CATCH_UP_SHOWN_CHANGES = 30;
-const CATCH_UP_MAX_PAGES = 20;
 
 export interface CatchUp {
   changes?: {
@@ -392,69 +1070,106 @@ export interface CatchUp {
     /** Newest changes (titles only); `counts` covers the whole window. */
     recent: ChangesResponse["changes"];
     omitted: number;
+    ack_token?: string;
+    acked?: true;
   };
-  tasks: { open: Task[]; total: number };
+  /** Compact tasks: title / status / owner / next step -- fetch one with task_get. */
+  tasks: { open: TaskSummary[]; total: number };
   handoffs: Handoff[];
 }
 
 /**
  * Everything a fresh session needs, in one read: what changed since THIS
- * consumer last looked (the "last" marker advances, so the next call shows
- * only newer changes), the open tasks, and the latest handoffs.
+ * consumer last looked, the open tasks (compact), and the latest handoffs.
+ * The changes part is ONE tail query over the whole gap -- however many
+ * thousand changes piled up, `recent` is the true newest and `counts` the
+ * true totals -- and the marker moves to the end of that window (or, in
+ * manual ack mode, when the returned ack_token comes back).
  */
 export function catchUp(store: Store, opts: CatchUpOpts = {}): CatchUp {
   const out: CatchUp = { tasks: { open: [], total: 0 }, handoffs: [] };
   if (opts.changes !== false) {
-    let page = runChanges(store, { since: "last", consumer: opts.consumer, namespaces: opts.namespaces, limit: 500 });
-    const first = page;
-    const all = [...page.changes];
-    // Page to the end so the marker advances past everything reported.
-    for (let i = 0; page.nextCursor && i < CATCH_UP_MAX_PAGES; i++) {
-      page = runChanges(store, { cursor: page.nextCursor, namespaces: opts.namespaces });
-      all.push(...page.changes);
-    }
-    const recent = all.slice(-CATCH_UP_SHOWN_CHANGES);
+    const r = runChanges(store, {
+      since: "last",
+      consumer: opts.consumer,
+      namespaces: opts.namespaces,
+      tail: CATCH_UP_SHOWN_CHANGES,
+      ackMode: opts.ackMode,
+      ackToken: opts.ackToken,
+      excludeSelf: opts.excludeSelf,
+    });
     out.changes = {
-      consumer: first.consumer ?? "default",
-      since: first.since,
-      until: first.until,
-      counts: first.counts,
-      bySource: first.bySource,
-      ...(first.markerReset ? { markerReset: true as const } : {}),
-      recent,
-      omitted: Math.max(0, first.counts.total - recent.length),
+      consumer: r.consumer ?? "default",
+      since: r.since,
+      until: r.until,
+      counts: r.counts,
+      bySource: r.bySource,
+      ...(r.markerReset ? { markerReset: true as const } : {}),
+      recent: r.changes,
+      omitted: Math.max(0, r.counts.total - r.changes.length),
+      ...(r.ack_token ? { ack_token: r.ack_token } : {}),
+      ...(r.acked ? { acked: true as const } : {}),
     };
+  } else if (opts.ackToken) {
+    throw new ValidationError("ack_token needs the changes part (include_changes) so the consumer's marker can be read");
   }
   const t = listTasks(store, { namespaces: opts.namespaces, limit: opts.tasks ?? 20 });
-  out.tasks = { open: t.tasks, total: t.total };
+  out.tasks = { open: t.tasks.map(compactTask), total: t.total };
   out.handoffs = listHandoffs(store, { namespaces: opts.namespaces, limit: opts.handoffs ?? 3 });
   return out;
 }
 
-/** Compact text for the SessionStart hook: open tasks + the latest handoff. */
-export function buildBoardSummary(tasks: Task[], handoff: Handoff | null, maxChars = 2500): string {
+/**
+ * Compact text for the SessionStart hook: open tasks + the latest handoff.
+ * Every field is untrusted (anyone with a write token wrote it), so each is
+ * reduced to one printable line first: no line breaks, no control or ESC
+ * characters, so a title can't forge extra lines or terminal escapes. Each
+ * section has its OWN budget, so a long task list can never cut the handoff.
+ */
+export function buildBoardSummary(
+  tasks: Array<Pick<Task, "id" | "status" | "title" | "owner" | "next_step">>,
+  handoff: Handoff | null,
+  maxChars = 2500,
+  totalTasks?: number
+): string {
   if (tasks.length === 0 && !handoff) return "";
-  const clip = (s: string, n: number): string => (s.length > n ? s.slice(0, n - 1) + "…" : s);
-  const lines: string[] = [];
+  const clip = (s: unknown, n: number): string => {
+    const v = safeLine(s);
+    return v.length > n ? v.slice(0, n - 1) + "…" : v;
+  };
+  const taskBudget = Math.floor(maxChars * 0.6);
+  const handoffBudget = maxChars - taskBudget - 1;
+  const sections: string[] = [];
   if (tasks.length) {
-    lines.push(`Open tasks (${tasks.length}):`);
+    const total = Math.max(totalTasks ?? tasks.length, tasks.length);
+    const lines: string[] = [];
+    let used = 0;
+    let shown = 0;
     for (const t of tasks) {
-      lines.push(
-        `- #${t.id} [${t.status}] ${clip(t.title, 120)}` +
-          (t.owner ? ` (${t.owner})` : "") +
-          (t.next_step ? ` -> next: ${clip(t.next_step, 160)}` : "")
-      );
+      const line =
+        `- #${t.id} [${clip(t.status, 12)}] ${clip(t.title, 100)}` +
+        (t.owner ? ` (${clip(t.owner, 40)})` : "") +
+        (t.next_step ? ` -> next: ${clip(t.next_step, 120)}` : "");
+      if (used + line.length + 1 > taskBudget - 60) break;
+      lines.push(line);
+      used += line.length + 1;
+      shown++;
     }
+    const more = total - shown;
+    sections.push(
+      [`Open tasks (${total}${more > 0 ? `, showing ${shown}` : ""}):`, ...lines, ...(more > 0 ? [`- … and ${more} more (task_list)`] : [])].join("\n")
+    );
   }
   if (handoff) {
-    lines.push(`Latest handoff from ${handoff.surface} (${handoff.at.slice(0, 16).replace("T", " ")}Z):`);
+    const lines = [`Latest handoff from ${clip(handoff.surface, 40)} (${clip(handoff.at.slice(0, 16).replace("T", " "), 20)}Z):`];
     if (handoff.summary) lines.push(`- summary: ${clip(handoff.summary, 240)}`);
     if (handoff.next_step) lines.push(`- next: ${clip(handoff.next_step, 240)}`);
     for (const [k, list] of [["pending", handoff.pending], ["decisions", handoff.decisions]] as const) {
       if (list.length) lines.push(`- ${k}: ${clip(list.join("; "), 300)}`);
     }
+    let text = lines.join("\n");
+    if (text.length > handoffBudget) text = text.slice(0, handoffBudget - 1) + "…";
+    sections.push(text);
   }
-  let text = lines.join("\n");
-  if (text.length > maxChars) text = text.slice(0, maxChars - 1) + "…";
-  return text;
+  return sections.join("\n");
 }

@@ -411,6 +411,12 @@ export function audit(entry: {
   id?: number;
   namespace?: string;
   bytes?: number;
+  /** Token label of the caller (never the token itself). */
+  label?: string;
+  /** What kind of thing: task, command-task, handoff, changes. */
+  kind?: string;
+  /** Short free text (a consumer label, "replay", ...); never note content. */
+  detail?: string;
 }): void {
   try {
     const path = auditPath();

@@ -76,6 +76,51 @@ export interface ChangesRequest {
   source?: string;
   limit?: number;
   consumer?: string;
+  /**
+   * "auto" (default, the 1.2/1.3 behaviour): the "last" marker advances as
+   * soon as the final page is served. "manual": it does not; the final page
+   * carries an `ack_token` and the marker moves only when that token is
+   * returned (see ackChanges / `ack_token` below). Survives a client that
+   * dies between receiving a page and processing it.
+   */
+  ackMode?: "auto" | "manual";
+  /** Apply the `ack_token` from an earlier manual-mode page before reading. */
+  ackToken?: string;
+  /** Hide changes whose source label equals this consumer's own label. */
+  excludeSelf?: boolean;
+  /**
+   * Return only the NEWEST `tail` changes of the window (oldest first), with
+   * counts for the whole window and no paging; the "last" marker still moves
+   * to the end of the window. What catch_up uses, so a huge backlog is one
+   * query and `recent` is the true newest.
+   */
+  tail?: number;
+}
+
+const ACK_DOMAIN = "onememory-ack-v1";
+
+/**
+ * Advance a consumer's "last" marker to the position an `ack_token` names.
+ * The token is signed by this store, bound to the consumer and the
+ * namespace/source scope it was issued for, and monotonic: acking an older
+ * token never moves a marker backwards. Returns the marker seq.
+ */
+export function ackChanges(
+  store: Store,
+  req: { ackToken: string; consumer?: string; namespaces?: string[]; source?: string }
+): { consumer: string; seq: number } {
+  const consumer = consumerKey(req.consumer);
+  const t = store.openToken(ACK_DOMAIN, req.ackToken);
+  if (!t || typeof t.c !== "string" || typeof t.k !== "string" || !Number.isInteger(t.s) || typeof t.a !== "string") {
+    throw new ValidationError("invalid ack_token");
+  }
+  if (t.c !== consumer) throw new ValidationError("ack_token was issued for a different consumer");
+  const scope = feedScopeKey(req.namespaces, req.source);
+  if (t.k !== scope) throw new ValidationError("ack_token was issued for a different namespace/source scope");
+  const cur = store.getFeedMarker(consumer, scope);
+  const seq = t.s as number;
+  if (!cur || cur.seq < seq) store.setFeedMarker(consumer, scope, { seq, at: t.a });
+  return { consumer, seq: Math.max(seq, cur?.seq ?? 0) };
 }
 
 export type ChangesResponse = Omit<ChangesPage, "consumer" | "seq"> & {
@@ -89,6 +134,10 @@ export type ChangesResponse = Omit<ChangesPage, "consumer" | "seq"> & {
   markerReset?: true;
   /** Only with `wait`: the wait ran out with nothing new for this caller. */
   timedOut?: true;
+  /** ackMode "manual", final page: pass back as `ack_token` to move the marker. */
+  ack_token?: string;
+  /** An `ack_token` sent with this request was applied (the marker moved to it before this read). */
+  acked?: true;
 };
 
 /**
@@ -96,7 +145,18 @@ export type ChangesResponse = Omit<ChangesPage, "consumer" | "seq"> & {
  * of a since="last" window is served.
  */
 export function runChanges(store: Store, req: ChangesRequest): ChangesResponse {
-  const filter = { namespaces: req.namespaces, source: req.source, limit: req.limit };
+  let acked = false;
+  if (req.ackToken) {
+    ackChanges(store, { ackToken: req.ackToken, consumer: req.consumer, namespaces: req.namespaces, source: req.source });
+    acked = true;
+  }
+  const out = runChangesInner(store, req);
+  return acked ? { ...out, acked: true as const } : out;
+}
+
+function runChangesInner(store: Store, req: ChangesRequest): ChangesResponse {
+  const excludeSource = req.excludeSelf ? consumerKey(req.consumer) : undefined;
+  const filter = { namespaces: req.namespaces, source: req.source, limit: req.limit, excludeSource, tail: req.tail };
   let page: ChangesPage;
   let markerReset = false;
   if (req.cursor) {
@@ -119,8 +179,19 @@ export function runChanges(store: Store, req: ChangesRequest): ChangesResponse {
   }
   const { consumer, seq, ...out } = page;
   if (consumer === null) return out;
+  const scope = feedScopeKey(req.namespaces, req.source);
+  let ack_token: string | undefined;
   if (page.nextCursor === null) {
-    store.setFeedMarker(consumer, feedScopeKey(req.namespaces, req.source), { seq, at: page.until });
+    if (req.ackMode === "manual") {
+      ack_token = store.mintToken(ACK_DOMAIN, { c: consumer, k: scope, s: seq, a: page.until });
+    } else {
+      store.setFeedMarker(consumer, scope, { seq, at: page.until });
+    }
   }
-  return { ...out, consumer, ...(markerReset ? { markerReset: true as const } : {}) };
+  return {
+    ...out,
+    consumer,
+    ...(markerReset ? { markerReset: true as const } : {}),
+    ...(ack_token ? { ack_token } : {}),
+  };
 }

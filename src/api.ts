@@ -26,7 +26,7 @@ import {
   validateForgetAfter,
   coerceNumeric,
 } from "./store.js";
-import { originAllowed, RateLimiter, AuthTarpit, clientKey, tokenKey, authenticateEntry, scopeAllows, LIMITS } from "./security.js";
+import { originAllowed, RateLimiter, AuthTarpit, clientKey, tokenKey, authenticateEntry, scopeAllows, LIMITS, audit } from "./security.js";
 import { type Scope, type TokenEntry, TIME_ZONE, PROJECT_ROOT } from "./config.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -80,11 +80,17 @@ import { annotateStaleness } from "./staleness.js";
 import {
   putTask,
   listTasks,
+  getTask,
   writeHandoff,
   listHandoffs,
   catchUp,
+  claimTask,
+  approveTask,
   TaskNotFoundError,
+  ClaimConflictError,
 } from "./tasks.js";
+import { ackChanges } from "./changes.js";
+import { assertPlainWriteTags } from "./reserved-tags.js";
 import { waitForChanges, parseWait, WaitBusyError } from "./change-wait.js";
 import type { LintFinding } from "./lint.js";
 
@@ -98,6 +104,10 @@ function requiredScope(method: string | undefined, path: string): Scope {
   // /relevant is a read despite the POST method (the message is a JSON body,
   // not a query string, because it can be long) -- same class as /search.
   if (method === "POST" && path === "/relevant") return "read";
+  // Acking a change-feed position moves only the caller's own consumer marker.
+  if (method === "POST" && path === "/ack") return "read";
+  // Approving a command task is the human gate in front of the runner.
+  if (method === "POST" && /^\/tasks\/\d+\/approve$/.test(path)) return "admin";
   // /rebuild-edges rewrites the similarity graph: admin-only, like delete.
   if (method === "POST" && path === "/rebuild-edges") return "admin";
   // Retention: archiving hides a note from every read surface (a soft
@@ -156,6 +166,23 @@ function sendJson(
 }
 
 /** Strict non-negative integer query param; absent = undefined. */
+/** ?ack_mode=manual|auto (default auto). */
+function ackModeParam(url: URL): "auto" | "manual" | undefined {
+  const v = url.searchParams.get("ack_mode");
+  if (v === null || v === "") return undefined;
+  if (v !== "auto" && v !== "manual") throw new ValidationError('ack_mode must be "auto" or "manual"');
+  return v;
+}
+
+function flagParam(url: URL, name: string): boolean {
+  return ["1", "true", "yes"].includes((url.searchParams.get(name) ?? "").toLowerCase());
+}
+
+/** Waiters are capped per namespace scope; a short stable key for it. */
+function waitScopeKey(namespaces: string[] | undefined): string {
+  return namespaces ? [...namespaces].sort().join(",") : "*";
+}
+
 function intParam(url: URL, name: string, min: number): number | undefined {
   const raw = url.searchParams.get(name);
   if (raw === null || raw === "") return undefined;
@@ -392,6 +419,7 @@ export function createApiServer(
           // When namespace resolution is active the client-supplied namespace
           // is untrusted: writes always land in the server-resolved namespace.
           if (nsCtx.active) parsed.namespace = nsCtx.ownNamespace;
+          assertPlainWriteTags(parsed.tags);
           const warnings: LintFinding[] = [];
           const note = store.create(parsed, { lintWarnings: warnings });
           await maybeEmbed(store, note);
@@ -472,6 +500,7 @@ export function createApiServer(
             if (!denyUnwritable(nsCtx, res, existing)) return;
             delete parsed.namespace;
           }
+          if (parsed && parsed.tags !== undefined) assertPlainWriteTags(parsed.tags, store.read(id)?.tags);
           const warnings: LintFinding[] = [];
           const note = store.update(id, parsed, { lintWarnings: warnings });
           if (!note) {
@@ -944,13 +973,19 @@ export function createApiServer(
               source: url.searchParams.get("source") ?? undefined,
               limit: limitRaw !== null ? Number(limitRaw) : undefined,
               consumer: url.searchParams.get("consumer") ?? undefined,
+              ackMode: ackModeParam(url),
+              ackToken: url.searchParams.get("ack_token") ?? undefined,
+              excludeSelf: flagParam(url, "exclude_self"),
             },
             {
-              waitSeconds: parseWait(url.searchParams.get("wait")),
+              // `wait` and `wait_seconds` are the same thing (MCP spells it wait_seconds).
+              waitSeconds: parseWait(url.searchParams.get("wait") ?? url.searchParams.get("wait_seconds")),
               signal: abort.signal,
               key: tokenKey(principal.token),
+              scopeKey: waitScopeKey(namespaces),
             }
           );
+          if (url.searchParams.get("ack_token")) audit({ op: "changes.ack", label: principal.label, kind: "changes", detail: `consumer=${out.consumer ?? ""}` });
           sendJson(res, 200, { ...out, searchedNamespaces: namespaces ?? [] });
         } catch (e) {
           if (e instanceof WaitBusyError) sendJson(res, 429, { error: e.message });
@@ -966,7 +1001,13 @@ export function createApiServer(
       // requiredScope); writes land in the request's own namespace when
       // namespace resolution / a token pin is active; reads cover the
       // readable set, with ?namespace= as an untrusted hint.
-      if (path === "/tasks" || path === "/handoffs" || path === "/catch-up" || /^\/tasks\/\d+$/.test(path)) {
+      if (
+        path === "/tasks" ||
+        path === "/handoffs" ||
+        path === "/catch-up" ||
+        path === "/ack" ||
+        /^\/tasks\/\d+(\/(claim|approve))?$/.test(path)
+      ) {
         const readNs = (): string[] | undefined => {
           const hint = url.searchParams.get("namespace") ?? undefined;
           if (nsCtx.active) {
@@ -995,9 +1036,56 @@ export function createApiServer(
               namespaces,
               status: url.searchParams.get("status") ?? undefined,
               owner: url.searchParams.get("owner") ?? undefined,
+              parent_id: intParam(url, "parent_id", 1),
               limit,
             });
             sendJson(res, 200, { tasks, total, searchedNamespaces: namespaces ?? [] });
+            return;
+          }
+          const getId = /^\/tasks\/(\d+)$/.exec(path);
+          if (req.method === "GET" && getId) {
+            const namespaces = readNs();
+            try {
+              sendJson(res, 200, { task: getTask(store, Number(getId[1]), namespaces) });
+            } catch (e) {
+              if (e instanceof TaskNotFoundError) sendJson(res, 404, { error: "not found" });
+              else throw e;
+            }
+            return;
+          }
+          const sub = /^\/tasks\/(\d+)\/(claim|approve)$/.exec(path);
+          if (req.method === "POST" && sub) {
+            const body = await jsonBody();
+            if (!body) return;
+            try {
+              if (sub[2] === "claim") {
+                const r = claimTask(store, { ...(body as object), id: Number(sub[1]) } as never, writeNs);
+                audit({ op: "task.claim", id: r.task.id, namespace: r.task.namespace, label: principal.label, kind: "task", detail: r.released ? "release" : r.heartbeat ? "heartbeat" : "claim" });
+                sendJson(res, 200, r);
+              } else {
+                const task = approveTask(store, { id: Number(sub[1]), revoke: body.revoke === true }, writeNs);
+                audit({ op: body.revoke === true ? "task.revoke" : "task.approve", id: task.id, namespace: task.namespace, label: principal.label, kind: "task" });
+                sendJson(res, 200, { task });
+              }
+            } catch (e) {
+              if (e instanceof TaskNotFoundError) sendJson(res, 404, { error: "not found" });
+              else if (e instanceof ClaimConflictError) sendJson(res, 409, { error: e.message, holder: e.holder, until: e.until });
+              else throw e;
+            }
+            return;
+          }
+          if (req.method === "POST" && path === "/ack") {
+            const body = await jsonBody();
+            if (!body) return;
+            const namespaces = readNs();
+            const r = ackChanges(store, {
+              ackToken: typeof body.ack_token === "string" ? body.ack_token : "",
+              consumer: typeof body.consumer === "string" ? body.consumer : undefined,
+              namespaces,
+              source: typeof body.source === "string" ? body.source : undefined,
+            });
+            audit({ op: "changes.ack", label: principal.label, kind: "changes", detail: `consumer=${r.consumer} seq=${r.seq}` });
+            sendJson(res, 200, { acked: true, ...r });
             return;
           }
           if (req.method === "POST" && path === "/tasks") {
@@ -1008,9 +1096,25 @@ export function createApiServer(
               return;
             }
             const warnings: LintFinding[] = [];
-            const { task, note } = putTask(store, body as never, writeNs, warnings);
-            await maybeEmbed(store, note);
-            sendJson(res, 201, warnings.length ? { task, warnings } : { task });
+            const wantApprove = body.approve === true;
+            if (wantApprove && !scopeAllows(scope, "admin")) {
+              sendJson(res, 403, { error: "approve:true needs an admin token; approve with POST /tasks/:id/approve" });
+              return;
+            }
+            if (wantApprove && !body.command) {
+              sendJson(res, 400, { error: "approve:true only applies to a command task (pass `command` and `target`)" });
+              return;
+            }
+            const put = putTask(store, body as never, writeNs, warnings);
+            await maybeEmbed(store, put.note);
+            let task = put.task;
+            if (wantApprove && !put.replayed) task = approveTask(store, { id: task.id }, writeNs);
+            audit({ op: "task.put", id: task.id, namespace: task.namespace, label: principal.label, kind: task.command ? "command-task" : "task", detail: put.replayed ? "replay" : "create" });
+            sendJson(res, put.replayed ? 200 : 201, {
+              task,
+              ...(put.replayed ? { replayed: true } : {}),
+              ...(warnings.length ? { warnings } : {}),
+            });
             return;
           }
           const tid = /^\/tasks\/(\d+)$/.exec(path);
@@ -1019,11 +1123,17 @@ export function createApiServer(
             if (!body) return;
             const warnings: LintFinding[] = [];
             try {
+              if (body.approve !== undefined) {
+                sendJson(res, 400, { error: "approve applies when creating; approve an existing task with POST /tasks/:id/approve (admin)" });
+                return;
+              }
               const { task, note } = putTask(store, { ...(body as object), id: Number(tid[1]) } as never, writeNs, warnings);
               await maybeEmbed(store, note);
+              audit({ op: "task.put", id: task.id, namespace: task.namespace, label: principal.label, kind: task.command ? "command-task" : "task", detail: "update" });
               sendJson(res, 200, warnings.length ? { task, warnings } : { task });
             } catch (e) {
               if (e instanceof TaskNotFoundError) sendJson(res, 404, { error: "not found" });
+              else if (e instanceof ClaimConflictError) sendJson(res, 409, { error: e.message, holder: e.holder, until: e.until });
               else if (e instanceof ValidationError && e.message.startsWith("stale write:")) sendJson(res, 409, { error: e.message });
               else throw e;
             }
@@ -1033,9 +1143,14 @@ export function createApiServer(
             const body = await jsonBody();
             if (!body) return;
             const warnings: LintFinding[] = [];
-            const { handoff, note } = writeHandoff(store, body as never, writeNs, warnings);
-            await maybeEmbed(store, note);
-            sendJson(res, 201, warnings.length ? { handoff, warnings } : { handoff });
+            const w = writeHandoff(store, body as never, writeNs, warnings);
+            await maybeEmbed(store, w.note);
+            audit({ op: "handoff.write", id: w.handoff.id, namespace: w.handoff.namespace, label: principal.label, kind: "handoff", detail: w.replayed ? "replay" : "create" });
+            sendJson(res, w.replayed ? 200 : 201, {
+              handoff: w.handoff,
+              ...(w.replayed ? { replayed: true } : {}),
+              ...(warnings.length ? { warnings } : {}),
+            });
             return;
           }
           if (req.method === "GET" && path === "/handoffs") {
@@ -1056,7 +1171,18 @@ export function createApiServer(
               changes: !["0", "false"].includes((url.searchParams.get("changes") ?? "").toLowerCase()),
               tasks: intParam(url, "tasks", 1),
               handoffs: intParam(url, "handoffs", 1),
+              ackMode: ackModeParam(url),
+              ackToken: url.searchParams.get("ack_token") ?? undefined,
+              excludeSelf: flagParam(url, "exclude_self"),
             });
+            if (out.changes) {
+              audit({
+                op: "catch_up",
+                label: principal.label,
+                kind: "changes",
+                detail: `consumer=${out.changes.consumer} total=${out.changes.counts.total}${out.changes.ack_token ? " manual-ack" : " marker-advanced"}${out.changes.acked ? " acked" : ""}`,
+              });
+            }
             sendJson(res, 200, { ...out, searchedNamespaces: namespaces ?? [] });
             return;
           }

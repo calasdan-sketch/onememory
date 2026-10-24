@@ -166,9 +166,9 @@ async function fetchRecentNotes(opts: RecallOptions): Promise<RecallData> {
     let board = "";
     try {
       const ns = namespace ? [namespace] : undefined;
-      const tasks = listTasks(store, { namespaces: ns, limit: 10 }).tasks;
+      const open = listTasks(store, { namespaces: ns, limit: 10 });
       const handoff = listHandoffs(store, { namespaces: ns, limit: 1 })[0] ?? null;
-      board = buildBoardSummary(tasks, handoff);
+      board = buildBoardSummary(open.tasks, handoff, undefined, open.total);
     } catch (e) {
       // The board is a bonus: never let it cost the recent-notes recall.
       console.error("onememory recall: task board skipped: " + (e as Error).message);

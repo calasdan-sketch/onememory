@@ -567,7 +567,8 @@ describe("recall: task board in the SessionStart hook", () => {
       const ctx = ctxOf(await runRecall({ dbPath: db }));
       assert.ok(ctx.length <= RECALL_MAX_CHARS + 600, `context too large: ${ctx.length}`); // + banner
       assert.ok(Date.now() - t0 < 2000);
-      assert.match(ctx, /Open tasks \(10\):/);
+      assert.match(ctx, /Open tasks \(40, showing \d+\):/, "header counts the total, not the shown rows");
+      assert.match(ctx, /Latest handoff from pc/, "the handoff is never cut by a long task list");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -79,6 +79,7 @@ import {
   type NoteRecord,
 } from "./store.js";
 import { maybeEmbed } from "./search-service.js";
+import { assertPlainWriteTags } from "./reserved-tags.js";
 
 /** Front-matter keys, in the order export writes them. */
 const KEYS = [
@@ -614,6 +615,7 @@ export async function importMarkdown(
       }
     };
     const createFrom = (): NoteRecord => {
+      assertPlainWriteTags(content.tags); // task / handoff notes don't enter via files
       const n = store.create(
         {
           namespace,
@@ -661,8 +663,10 @@ export async function importMarkdown(
       continue;
     }
     const localChanged = baseHash === null || localHash !== baseHash;
-    const applyFile = (): NoteRecord | null =>
-      store.update(local.id, { namespace, title, body, tags: content.tags }, { ifRev: local.rev });
+    const applyFile = (): NoteRecord | null => {
+      assertPlainWriteTags(content.tags, local.tags);
+      return store.update(local.id, { namespace, title, body, tags: content.tags }, { ifRev: local.rev });
+    };
 
     if (!fileChanged) {
       push("skipped", { id: local.id, detail: "store has a newer version" });
