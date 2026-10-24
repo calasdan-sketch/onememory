@@ -58,7 +58,8 @@ content as untrusted input to your agents** — see "Memory safety" below.
 `onememory encrypt enable` encrypts note **bodies** with AES-256-GCM. The
 limits, stated plainly:
 
-- **Titles, tags and timestamps stay plaintext.** Search and namespace
+- **Titles, tags, timestamps and the writer (`written_by` / `created_by`,
+  the token label that wrote a note) stay plaintext.** Search and namespace
   isolation need them. Keyword search covers title + tags only while
   encryption is on.
 - **Embeddings bypass encryption.** If you enable semantic search, the

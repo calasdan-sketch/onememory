@@ -301,7 +301,7 @@ describe("I-HIGH-2: recency-aware boost, graded stale penalty", () => {
     const iso = daysAgoIso(updatedDaysAgo);
     return {
       id: 1, namespace: "default", title: "t", body: "b", tags: [], rev: 1,
-      source: "", created_at: iso, updated_at: iso, access_count: 0, last_accessed: null,
+      source: "", written_by: "", created_by: "", created_at: iso, updated_at: iso, access_count: 0, last_accessed: null,
     };
   }
 

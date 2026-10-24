@@ -26,6 +26,7 @@ This is the part most tools omit, so read it before enabling:
 |---|---|---|
 | Note **body** | **Yes** — AES-256-GCM at rest | The sensitive part (pasted secrets, private context) |
 | Note **title** | No | Keyword search and namespace isolation both need it in plaintext |
+| **`written_by` / `created_by`** (who wrote it) | No | Server-stamped token label or `stdio`/`cli`/`server`; filtering needs it in plaintext, and it is never note content |
 | **Tags**, timestamps, namespace | No | Same: filtering, search and isolation read them directly |
 | Access counters | No | Ranking input; not sensitive |
 | **Embeddings** (`note_vectors`) | No | Vectors are stored unencrypted, and with `ONEMEMORY_EMBEDDINGS=on` the **decrypted body is sent to your embeddings endpoint** when a note is embedded. Leave semantic search off if that matters |

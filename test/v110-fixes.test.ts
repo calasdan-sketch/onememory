@@ -63,6 +63,8 @@ function record(id: number, over: Partial<NoteRecord> = {}): NoteRecord {
     tags: [],
     rev: 1,
     source: "",
+    written_by: "",
+    created_by: "",
     created_at: "2026-01-01T00:00:00.000Z",
     updated_at: "2026-01-01T00:00:00.000Z",
     access_count: 0,

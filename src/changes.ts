@@ -74,6 +74,10 @@ export interface ChangesRequest {
   /** undefined = whole store; [] = nothing readable. */
   namespaces?: string[];
   source?: string;
+  /** Only changes made by this server-stamped writer (token label / stdio / cli / server). */
+  writtenBy?: string;
+  /** Only changes NOT made by this server-stamped writer. */
+  notWrittenBy?: string;
   limit?: number;
   consumer?: string;
   /**
@@ -107,7 +111,7 @@ const ACK_DOMAIN = "onememory-ack-v1";
  */
 export function ackChanges(
   store: Store,
-  req: { ackToken: string; consumer?: string; namespaces?: string[]; source?: string }
+  req: { ackToken: string; consumer?: string; namespaces?: string[]; source?: string; writtenBy?: string; notWrittenBy?: string }
 ): { consumer: string; seq: number } {
   const consumer = consumerKey(req.consumer);
   const t = store.openToken(ACK_DOMAIN, req.ackToken);
@@ -115,7 +119,7 @@ export function ackChanges(
     throw new ValidationError("invalid ack_token");
   }
   if (t.c !== consumer) throw new ValidationError("ack_token was issued for a different consumer");
-  const scope = feedScopeKey(req.namespaces, req.source);
+  const scope = feedScopeKey(req.namespaces, req.source, req);
   if (t.k !== scope) throw new ValidationError("ack_token was issued for a different namespace/source scope");
   const cur = store.getFeedMarker(consumer, scope);
   const seq = t.s as number;
@@ -147,7 +151,7 @@ export type ChangesResponse = Omit<ChangesPage, "consumer" | "seq"> & {
 export function runChanges(store: Store, req: ChangesRequest): ChangesResponse {
   let acked = false;
   if (req.ackToken) {
-    ackChanges(store, { ackToken: req.ackToken, consumer: req.consumer, namespaces: req.namespaces, source: req.source });
+    ackChanges(store, { ackToken: req.ackToken, consumer: req.consumer, namespaces: req.namespaces, source: req.source, writtenBy: req.writtenBy, notWrittenBy: req.notWrittenBy });
     acked = true;
   }
   const out = runChangesInner(store, req);
@@ -156,7 +160,7 @@ export function runChanges(store: Store, req: ChangesRequest): ChangesResponse {
 
 function runChangesInner(store: Store, req: ChangesRequest): ChangesResponse {
   const excludeSource = req.excludeSelf ? consumerKey(req.consumer) : undefined;
-  const filter = { namespaces: req.namespaces, source: req.source, limit: req.limit, excludeSource, tail: req.tail };
+  const filter = { namespaces: req.namespaces, source: req.source, writtenBy: req.writtenBy, notWrittenBy: req.notWrittenBy, limit: req.limit, excludeSource, tail: req.tail };
   let page: ChangesPage;
   let markerReset = false;
   if (req.cursor) {
@@ -167,7 +171,7 @@ function runChangesInner(store: Store, req: ChangesRequest): ChangesResponse {
       page = store.changes({ since: start, ...filter });
     } else {
       const consumer = consumerKey(req.consumer);
-      const seen = store.getFeedMarker(consumer, feedScopeKey(req.namespaces, req.source));
+      const seen = store.getFeedMarker(consumer, feedScopeKey(req.namespaces, req.source, req));
       // A marker older than what retention purged has missed events: say so.
       markerReset = seen === null || seen.seq < store.changeLogPurgedTo();
       page = store.changes({
@@ -180,7 +184,7 @@ function runChangesInner(store: Store, req: ChangesRequest): ChangesResponse {
   }
   const { consumer, seq, ...out } = page;
   if (consumer === null) return out;
-  const scope = feedScopeKey(req.namespaces, req.source);
+  const scope = feedScopeKey(req.namespaces, req.source, req);
   let ack_token: string | undefined;
   if (page.nextCursor === null) {
     if (req.ackMode === "manual") {

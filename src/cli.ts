@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import "./quiet-sqlite.js"; // first: hide the node:sqlite ExperimentalWarning
 import readline from "node:readline";
+import { setProcessWriter } from "./actor.js";
 // onememory CLI: one command to run, check, or wire up the bridge.
 //   onememory [start]   start the API + dashboard AND MCP-over-HTTP (default)
 //   onememory mcp       start the MCP server over stdio (for Claude Code/Cursor/...)
@@ -1150,6 +1151,12 @@ async function main(): Promise<void> {
   }
   // Move 1.0.x state out of the package before anything opens the DB.
   if (!["help", "--help", "-h", "init"].includes(cmd)) (await import("./config.js")).prepareDataDir();
+  // Fixed writer marker for notes this process writes with no token behind
+  // them (written_by): the long-running server's own jobs, the stdio MCP
+  // server, or an `onememory ...` command run by the machine owner.
+  setProcessWriter(
+    cmd === "start" || cmd === "serve" ? "server" : cmd === "mcp" || cmd === "mcp:stdio" ? "stdio" : "cli"
+  );
   switch (cmd) {
     case "start":
     case "serve":

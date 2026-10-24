@@ -170,7 +170,8 @@ function loadChanges(){
       var mark = e.kind === "created" ? "+" : (e.kind === "updated" ? "~" : "-");
       return "<div class='card'><h3>"+mark+" "+esc(e.title)+"</h3><div class='meta'>"+esc(e.kind)+" &middot; #"+e.id+
         " &middot; "+esc(e.namespace)+" &middot; "+esc((e.at||"").slice(0,16).replace("T"," "))+
-        (e.source ? " &middot; "+esc(e.source) : "")+"</div></div>";
+        (e.written_by ? " &middot; by "+esc(e.written_by) : "")+
+        (e.source ? " &middot; claims "+esc(e.source) : "")+"</div></div>";
     }).join("");
     document.getElementById("list").innerHTML = "<div class='row'>"+srcs+"</div>" +
       (rows || "<p class='muted'>Nothing changed in the last 24 hours.</p>");

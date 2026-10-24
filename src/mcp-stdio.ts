@@ -8,8 +8,11 @@ import { Store } from "./store.js";
 import { createMcpServer } from "./mcp-server-core.js";
 import { DB_PATH, prepareDataDir } from "./config.js";
 import { resolveStartupNamespace } from "./namespace.js";
+import { setProcessWriter } from "./actor.js";
 
 prepareDataDir();
+// No token on stdio: writes are stamped with the fixed marker "stdio" (written_by).
+setProcessWriter("stdio");
 const store = new Store(DB_PATH);
 // Server-side namespace resolution: resolved ONCE at startup from the
 // process working directory. Null when unconfigured (legacy behavior).

@@ -37,7 +37,7 @@ import { assertPlainWriteTags } from "./reserved-tags.js";
 import { waitForChanges, parseWait, WAIT_MAX_SECONDS, WAIT_RECOMMENDED_SECONDS } from "./change-wait.js";
 import { type Scope, PACKAGE_VERSION } from "./config.js";
 export { PACKAGE_VERSION };
-import { scopeAllows, UNTRUSTED_BANNER, audit } from "./security.js";
+import { scopeAllows, UNTRUSTED_BANNER, provenanceBanner, audit } from "./security.js";
 import { runSearch, runSearchExplained, parseMode, maybeEmbed, runRelevantSearch, roundRobin, SEARCH_MODES, type SearchOpts, type ExplainedHit } from "./search-service.js";
 import {
   type ServerNamespaceOpts,
@@ -67,15 +67,43 @@ function textResult(payload: unknown) {
 }
 
 // Injection-on-read guard: the banner lives in security.ts as the single
-// source of truth.
+// source of truth. Since 1.3.3 a "who wrote this" block follows it whenever
+// the payload carries notes, as a second content block: the server-stamped writer
+// first, the writer's own `source` claim second and labelled as a claim.
 function untrustedResult(payload: unknown) {
+  const who = provenanceBanner(payload);
   return {
     content: [
       {
         type: "text" as const,
         text: UNTRUSTED_BANNER + JSON.stringify(payload, null, 2),
       },
+      // A second block, so the first stays "banner + JSON" for every client.
+      ...(who ? [{ type: "text" as const, text: who }] : []),
     ],
+  };
+}
+
+/** Shared zod shape for the writer filters on state_list / state_search. */
+const WRITER_FILTER_SHAPE = {
+  written_by: z
+    .string()
+    .optional()
+    .describe(
+      "Only notes whose server-stamped last writer (`written_by`: a token label, or stdio / cli / server) is exactly this."
+    ),
+  not_written_by: z
+    .string()
+    .optional()
+    .describe(
+      "Skip notes whose server-stamped last writer is this (e.g. your own label to ignore your own writes, or a client you do not trust). Rows from before schema v13 have an unknown writer ('') and are not excluded."
+    ),
+};
+type WriterFilterArgs = { writtenBy?: string; notWrittenBy?: string };
+function writerFilterArgs(written_by?: string, not_written_by?: string): WriterFilterArgs {
+  return {
+    ...(written_by ? { writtenBy: written_by } : {}),
+    ...(not_written_by ? { notWrittenBy: not_written_by } : {}),
   };
 }
 
@@ -130,6 +158,8 @@ export interface ConnectionCtx {
   signal?: AbortSignal;
   /** The caller's token label (for the audit log); never the token. */
   label?: string;
+  /** True when `label` came from an authenticated token: it then becomes the verified `written_by`. */
+  authed?: boolean;
 }
 
 /**
@@ -160,7 +190,7 @@ export function createMcpServer(
   const registerRaw = server.registerTool.bind(server) as (...a: unknown[]) => unknown;
   (server as unknown as { registerTool: (...a: unknown[]) => unknown }).registerTool = (name: unknown, cfg: unknown, handler: unknown) =>
     registerRaw(name, cfg, (...args: unknown[]) =>
-      actorStore.run({ label: conn.label ?? "" }, () => (handler as (...x: unknown[]) => unknown)(...args))
+      actorStore.run({ label: conn.label ?? "", authed: conn.authed === true }, () => (handler as (...x: unknown[]) => unknown)(...args))
     );
 
   const denyIfUnder = (need: Scope): string | null =>
@@ -215,8 +245,8 @@ export function createMcpServer(
   // List across every readable namespace, newest-first like store.list
   // (updated_at DESC, id DESC), paged in SQL so total and deep offsets are
   // exact (the old merge-in-memory capped each namespace at 500 notes).
-  function listReadable(limit?: number, offset?: number): { notes: NoteRecord[]; total: number } {
-    return store.list({ namespaces: readable(), limit, offset });
+  function listReadable(limit?: number, offset?: number, wf: WriterFilterArgs = {}): { notes: NoteRecord[]; total: number } {
+    return store.list({ namespaces: readable(), limit, offset, ...wf });
   }
 
   server.registerTool(
@@ -256,7 +286,9 @@ export function createMcpServer(
         source: z
           .string()
           .optional()
-          .describe("Provenance: who/what wrote this note (an agent or user label)."),
+          .describe(
+            "Provenance CLAIM: who/what you say wrote this note (an agent or user label). Advisory only -- anyone can claim anything here. The server separately stamps the authenticated writer as `written_by` (cannot be set by you)."
+          ),
         if_rev: z
           .number()
           .int()
@@ -424,9 +456,10 @@ export function createMcpServer(
           .describe(
             "Attach a `breakdown` to each result: the base relevance, access boost and staleness factors that produced its rank. Default false."
           ),
+        ...WRITER_FILTER_SHAPE,
       },
     },
-    async ({ query, namespace, limit, mode, when, explain }) => {
+    async ({ query, namespace, limit, mode, when, explain, written_by, not_written_by }) => {
       try {
         const denied = denyIfUnder("read");
         if (denied) return errorResult(denied);
@@ -443,6 +476,7 @@ export function createMcpServer(
           ? { start: timePhrase.start, end: timePhrase.end }
           : undefined;
         const resolvedMode = mode ?? parseMode(undefined);
+        const wf = writerFilterArgs(written_by, not_written_by);
         if (explain === true) {
           // Explained twin of the branches below: same namespace gating, the
           // per-namespace lists merge round-robin, each hit keeps its breakdown.
@@ -450,7 +484,7 @@ export function createMcpServer(
           const spaces: Array<string | undefined> = nsActive ? (hint ? [hint] : readable()) : [namespace];
           const perNs: ExplainedHit[][] = [];
           for (const ns of spaces) {
-            perNs.push(await runSearchExplained(store, query, { namespace: ns, limit, mode: resolvedMode, timeRange }));
+            perNs.push(await runSearchExplained(store, query, { namespace: ns, limit, mode: resolvedMode, timeRange, ...wf }));
           }
           const byId = new Map<number, unknown>();
           for (const l of perNs) for (const h of l) byId.set(h.note.id, h.breakdown);
@@ -483,6 +517,7 @@ export function createMcpServer(
               limit,
               mode: resolvedMode,
               timeRange,
+              ...wf,
             });
             return untrustedResult({
               results: results.map((n) => annotateStaleness(n)),
@@ -494,6 +529,7 @@ export function createMcpServer(
             limit,
             mode: resolvedMode,
             timeRange,
+            ...wf,
           });
           return untrustedResult({
             results: results.map((n) => annotateStaleness(n)),
@@ -506,6 +542,7 @@ export function createMcpServer(
           limit,
           mode: resolvedMode,
           timeRange,
+          ...wf,
         });
         return untrustedResult({
           results: results.map((n) => annotateStaleness(n)),
@@ -612,27 +649,29 @@ export function createMcpServer(
           ),
         limit: z.number().int().optional().describe("Max results (default 50, max 500)."),
         offset: z.number().int().optional().describe("Pagination offset."),
+        ...WRITER_FILTER_SHAPE,
       },
     },
-    async ({ namespace, limit, offset }) => {
+    async ({ namespace, limit, offset, written_by, not_written_by }) => {
       try {
         const denied = denyIfUnder("read");
         if (denied) return errorResult(denied);
+        const wf = writerFilterArgs(written_by, not_written_by);
         if (nsActive) {
           // Untrusted hint intersected with the readable set, like search.
           const hint = trustedHint(namespace);
           if (hint) {
             return untrustedResult({
-              ...store.list({ namespace: hint, limit, offset }),
+              ...store.list({ namespace: hint, limit, offset, ...wf }),
               searchedNamespaces: [hint],
             });
           }
           return untrustedResult({
-            ...listReadable(limit, offset),
+            ...listReadable(limit, offset, wf),
             searchedNamespaces: readable(),
           });
         }
-        const result = store.list({ namespace, limit, offset });
+        const result = store.list({ namespace, limit, offset, ...wf });
         return untrustedResult({
           ...result,
           searchedNamespaces: namespace ? [namespace] : [],
@@ -978,7 +1017,8 @@ export function createMcpServer(
               ? "Untrusted hint: restrict to this namespace. Ignored unless this server may read it."
               : "Restrict to this namespace."
           ),
-        source: z.string().optional().describe("Only changes to notes with this provenance source."),
+        source: z.string().optional().describe("Only changes to notes with this provenance source (the writer's own CLAIM; see written_by)."),
+        ...WRITER_FILTER_SHAPE,
         limit: z
           .number()
           .int()
@@ -1009,7 +1049,7 @@ export function createMcpServer(
           .describe("Hide changes WRITTEN BY the token/connection whose label equals your `consumer` label (the writer is recorded by the server; writes with no recorded writer fall back to the note's `source`). Only works if each device has its own token label."),
       },
     },
-    async ({ since, cursor, namespace, source, limit, consumer, wait_seconds, wait, ack_mode, ack_token, exclude_self }, extra) => {
+    async ({ since, cursor, namespace, source, written_by, not_written_by, limit, consumer, wait_seconds, wait, ack_mode, ack_token, exclude_self }, extra) => {
       try {
         const denied = denyIfUnder("read");
         if (denied) return errorResult(denied);
@@ -1023,7 +1063,7 @@ export function createMcpServer(
         const signals = [extra?.signal, conn.signal].filter((x): x is AbortSignal => Boolean(x));
         const out = await waitForChanges(
           store,
-          { since, cursor, namespaces, source, limit, consumer, ackMode: ack_mode, ackToken: ack_token, excludeSelf: exclude_self },
+          { since, cursor, namespaces, source, ...writerFilterArgs(written_by, not_written_by), limit, consumer, ackMode: ack_mode, ackToken: ack_token, excludeSelf: exclude_self },
           {
             waitSeconds: parseWait(wait_seconds ?? wait),
             signal: signals.length ? AbortSignal.any(signals) : undefined,
@@ -1355,14 +1395,15 @@ export function createMcpServer(
         consumer: z.string().optional().describe("Same consumer label you read with (default \"default\")."),
         namespace: z.string().optional().describe(nsActive ? "Untrusted hint: same scope you read with." : "Same namespace you read with."),
         source: z.string().optional().describe("Same source filter you read with."),
+        ...WRITER_FILTER_SHAPE,
       },
     },
-    async ({ ack_token, consumer, namespace, source }) => {
+    async ({ ack_token, consumer, namespace, source, written_by, not_written_by }) => {
       try {
         const denied = denyIfUnder("read");
         if (denied) return errorResult(denied);
         const namespaces = readScope(namespace);
-        const r = ackChanges(store, { ackToken: ack_token, consumer, namespaces, source });
+        const r = ackChanges(store, { ackToken: ack_token, consumer, namespaces, source, ...writerFilterArgs(written_by, not_written_by) });
         audit({ op: "changes.ack", label: conn.label, kind: "changes", detail: `consumer=${r.consumer} seq=${r.seq}` });
         return textResult({ acked: true, ...r });
       } catch (e) {

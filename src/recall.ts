@@ -7,7 +7,7 @@
 //
 // Recency is the recall signal for session start; no embeddings involved.
 import type { NoteRecord } from "./store.js";
-import { UNTRUSTED_BANNER } from "./security.js";
+import { UNTRUSTED_BANNER, describeWriter } from "./security.js";
 import {
   namespaceConfigSource,
   resolveStartupNamespace,
@@ -45,7 +45,10 @@ export function buildSummary(notes: NoteRecord[]): string {
   const lines = notes.map((n) => {
     const title = collapse(n.title);
     const snippet = collapse(n.body).slice(0, BODY_SNIPPET_CHARS);
-    return `- [${title}]${snippet ? ": " + snippet : ""}`;
+    // Server-stamped writer (never the client's `source`); shown only when
+    // recorded, so notes from before schema v13 look exactly as before.
+    const by = n.written_by ? ` (written by ${describeWriter(n.written_by)}${claim(n.source)})` : "";
+    return `- [${title}]${by}${snippet ? ": " + snippet : ""}`;
   });
   let text =
     `Recent memory (${notes.length} note${notes.length === 1 ? "" : "s"}):\n` +
@@ -54,6 +57,11 @@ export function buildSummary(notes: NoteRecord[]): string {
     text = text.slice(0, RECALL_MAX_CHARS - 1) + "…";
   }
   return text;
+}
+
+function claim(source: string): string {
+  const v = collapse(source).slice(0, 60);
+  return v ? `, claims source=${JSON.stringify(v)}` : "";
 }
 
 function collapse(s: string): string {

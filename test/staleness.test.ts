@@ -29,6 +29,8 @@ function fakeNote(updated_at: string, tags: string[] = []): NoteRecord {
     tags,
     rev: 1,
     source: "",
+    written_by: "",
+    created_by: "",
     created_at: updated_at,
     updated_at,
     access_count: 0,

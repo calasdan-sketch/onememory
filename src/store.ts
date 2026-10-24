@@ -39,7 +39,7 @@ import { isStale, stalenessConfig, annotateStaleness } from "./staleness.js";
 // At-rest encryption for note bodies. No module cycle: crypto.ts imports
 // only node: builtins, never store.ts.
 import { encrypt, decryptIfEncrypted, loadKey, keyPath, noteAad } from "./crypto.js";
-import { currentActor } from "./actor.js";
+import { currentActor, currentWriter, cleanWriter } from "./actor.js";
 
 /**
  * A caller-input error (bad/oversized/secret-bearing data, empty title, stale
@@ -215,6 +215,14 @@ export type ImportNote = NoteInput & {
   /** Retention state carried by an export; kept on restore (ISO-8601). */
   expires_at?: string | null;
   archived_at?: string | null;
+  /**
+   * Provenance fields an export carries. On import they are NEVER trusted:
+   * the importing caller becomes written_by / created_by, and the payload's
+   * claim is kept only as `imported_written_by`.
+   */
+  written_by?: string;
+  created_by?: string;
+  imported_written_by?: string;
 };
 
 /** Per-note outcome of importNotes() for writes that did not become notes. */
@@ -236,6 +244,12 @@ export interface ChangeEntry {
   at: string;
   /** Current revision (absent for deletes). */
   rev?: number;
+  /**
+   * Server-stamped identity of whoever made this change (token label, or
+   * stdio / cli / server); "" = unknown (old rows, foreign writers).
+   * `source` above is only what the writer claimed.
+   */
+  written_by: string;
 }
 
 export interface ChangeCounts {
@@ -283,7 +297,7 @@ export interface QuarantineEntry {
 export const CHANGE_LOG_RETENTION_DAYS = 90;
 
 /** Current schema version (PRAGMA user_version). See Store.migrate. */
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 /**
  * Notes fetched per page by exportBatch(), which both streaming export
@@ -339,7 +353,26 @@ export interface NoteRecord {
   body: string;
   tags: string[];
   rev: number;
+  /**
+   * Client-asserted provenance: whatever string the writer sent. ADVISORY ONLY
+   * (any writer can claim any value); use `written_by` for who actually wrote.
+   */
   source: string;
+  /**
+   * Server-stamped identity of the LAST writer (create or update): the
+   * authenticated token's label, or `stdio` / `cli` / `server` for writers
+   * with no token. Set by the server from the connection, never from the
+   * request body, so a client cannot forge it. "" = unknown (rows written
+   * before schema v13, or a library caller with no identity).
+   */
+  written_by: string;
+  /** Server-stamped identity of the FIRST writer; never changes on update. "" = unknown. */
+  created_by: string;
+  /**
+   * Set only on a note restored via import: the writer the import payload
+   * CLAIMED (unverified). written_by / created_by are the importing admin.
+   */
+  imported_written_by?: string;
   created_at: string;
   updated_at: string;
   /** Read-importance tracking: total user-facing reads of this note. */
@@ -374,6 +407,9 @@ interface NoteRow {
   tags: string;
   rev: number;
   source: string;
+  written_by: string | null;
+  created_by: string | null;
+  imported_written_by: string | null;
   created_at: string;
   updated_at: string;
   access_count: number;
@@ -403,6 +439,9 @@ function rowToRecord(row: NoteRow): NoteRecord {
     tags: parseTags(row.tags),
     rev: row.rev ?? 1,
     source: row.source ?? "",
+    written_by: row.written_by ?? "",
+    created_by: row.created_by ?? "",
+    ...(row.imported_written_by ? { imported_written_by: row.imported_written_by } : {}),
     created_at: row.created_at,
     updated_at: row.updated_at,
     access_count: row.access_count ?? 0,
@@ -744,6 +783,10 @@ export interface RangeOpts {
    */
   startISO?: string;
   endISO?: string;
+  /** Only notes whose LAST writer (server-stamped written_by) is exactly this. */
+  writtenBy?: string;
+  /** Only notes whose last writer is NOT this (e.g. skip my own writes, or distrust a client). */
+  notWrittenBy?: string;
 }
 
 /**
@@ -802,6 +845,14 @@ function rangeClause(opts: RangeOpts): { sql: string; params: string[] } {
   if (opts.endISO) {
     clauses.push("notes.created_at < ?");
     params.push(opts.endISO);
+  }
+  if (opts.writtenBy !== undefined) {
+    clauses.push("notes.written_by = ?");
+    params.push(opts.writtenBy);
+  }
+  if (opts.notWrittenBy !== undefined) {
+    clauses.push("notes.written_by <> ?");
+    params.push(opts.notWrittenBy);
   }
   return { sql: clauses.length ? " AND " + clauses.join(" AND ") : "", params };
 }
@@ -1232,6 +1283,21 @@ export class Store {
       //     the stored triggers are unchanged and foreign writers still work.
       this.addColumn("change_log", "actor", "TEXT NOT NULL DEFAULT ''");
     }
+    if (v < 13) {
+      // v13: server-stamped writer identity ("Who wrote this?"). written_by =
+      //     the last writer (token label, or the stdio / cli / server marker),
+      //     created_by = the first writer, imported_written_by = what an import
+      //     payload CLAIMED. Old rows get '' = unknown (never guessed from the
+      //     client-asserted `source`). Plaintext like title/tags. change_log and
+      //     quarantine carry the writer too, so the feed can filter on it and an
+      //     approved quarantined write keeps its real author.
+      this.addColumn("notes", "written_by", "TEXT NOT NULL DEFAULT ''");
+      this.addColumn("notes", "created_by", "TEXT NOT NULL DEFAULT ''");
+      this.addColumn("notes", "imported_written_by", "TEXT NOT NULL DEFAULT ''");
+      this.addColumn("change_log", "written_by", "TEXT NOT NULL DEFAULT ''");
+      this.addColumn("quarantine", "written_by", "TEXT NOT NULL DEFAULT ''");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_notes_written_by ON notes(written_by)");
+    }
   }
 
   /**
@@ -1243,12 +1309,13 @@ export class Store {
    */
   private installActorStamp(): void {
     this.db.function("om_actor", { deterministic: false }, () => currentActor());
+    this.db.function("om_writer", { deterministic: false }, () => currentWriter());
     this.db.exec(`
       DROP TRIGGER IF EXISTS temp.om_actor_stamp;
       CREATE TEMP TRIGGER om_actor_stamp AFTER INSERT ON main.change_log
-      WHEN om_actor() <> ''
+      WHEN om_actor() <> '' OR om_writer() <> ''
       BEGIN
-        UPDATE change_log SET actor = om_actor() WHERE seq = new.seq;
+        UPDATE change_log SET actor = om_actor(), written_by = om_writer() WHERE seq = new.seq;
       END;
     `);
   }
@@ -1276,6 +1343,14 @@ export class Store {
       expiresAt?: string;
       /** Restore path: keep the note archived (ISO-8601 archive time). */
       archivedAt?: string;
+      /**
+       * Internal override of the stamped writer (approving a quarantined write
+       * keeps its real author). Like updatedAt it is an opt, never a NoteInput
+       * field, so no request body can reach it.
+       */
+      writtenBy?: string;
+      /** Restore path: the writer an import payload CLAIMED (unverified). */
+      importedWrittenBy?: string;
     } & LintOpts = {}
   ): NoteRecord {
     if (!input.title || !input.title.trim()) {
@@ -1294,6 +1369,7 @@ export class Store {
         source: input.source,
         createdAt: input.created_at,
         findings,
+        writtenBy: opts.writtenBy,
       });
       throw new QuarantinedError(qid, findings);
     }
@@ -1310,6 +1386,9 @@ export class Store {
     const body = input.body ?? "";
     const tags = tagsToStorage(input.tags);
     const source = (input.source ?? "").slice(0, 200);
+    // Server-stamped, never from the request: who is writing right now.
+    const writer = opts.writtenBy !== undefined ? cleanWriter(opts.writtenBy) : currentWriter();
+    const claim = cleanWriter(opts.importedWrittenBy);
     // At-rest encryption: seal the body for storage. `body` (plaintext) stays
     // the value used below for embedding/edge scoring and audit byte counts
     // -- those need the real text. Only the SQL INSERT gets sealed values.
@@ -1343,8 +1422,9 @@ export class Store {
       const encrypting = this.writeKey() !== null;
       const result = this.db
         .prepare(
-          `INSERT INTO notes (namespace, title, body, tags, source, created_at, updated_at, rev, body_enc, expires_at, archived_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
+          `INSERT INTO notes (namespace, title, body, tags, source, written_by, created_by, imported_written_by,
+                              created_at, updated_at, rev, body_enc, expires_at, archived_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
         )
         .run(
           namespace,
@@ -1352,6 +1432,9 @@ export class Store {
           encrypting ? "" : body,
           tags,
           source,
+          writer,
+          writer,
+          claim,
           createdAt,
           updatedAt,
           startRev,
@@ -1797,6 +1880,8 @@ export class Store {
         tags: parseTags(r.tags),
         rev: 1,
         source: "",
+        written_by: "",
+        created_by: "",
         created_at: r.updated_at,
         updated_at: r.updated_at,
         access_count: 0,
@@ -1810,7 +1895,7 @@ export class Store {
   update(
     id: number,
     patch: NotePatch,
-    opts: { ifRev?: number } & LintOpts = {}
+    opts: { ifRev?: number; /** internal: quarantine approval keeps the real author */ writtenBy?: string } & LintOpts = {}
   ): NoteRecord | null {
     validateForgetAfter(patch.forget_after);
     const existing = this.read(id);
@@ -1845,6 +1930,7 @@ export class Store {
         tags: patch.tags,
         source: patch.source,
         findings,
+        writtenBy: opts.writtenBy,
       });
       throw new QuarantinedError(qid, findings);
     }
@@ -1856,6 +1942,9 @@ export class Store {
     const tags = patch.tags !== undefined ? tagsToStorage(patch.tags) : tagsToStorage(existing.tags);
     const source = patch.source !== undefined ? patch.source.slice(0, 200) : existing.source;
     const rev = existing.rev + 1;
+    // Last writer = whoever makes THIS update (server-stamped). created_by is
+    // not touched, and a client-sent written_by/created_by never reaches here.
+    const writer = opts.writtenBy !== undefined ? cleanWriter(opts.writtenBy) : currentWriter();
     validateSizes({ title, body, tags: patch.tags ?? existing.tags });
     const now = new Date().toISOString();
     // Re-seal: existing.body is already decrypted plaintext, so an update
@@ -1885,10 +1974,10 @@ export class Store {
       const res = this.db
         .prepare(
           `UPDATE notes SET namespace = ?, title = ?, body = ?, tags = ?, source = ?, rev = ?, updated_at = ?,
-                            body_enc = ?, expires_at = ?
+                            body_enc = ?, expires_at = ?, written_by = ?
            WHERE id = ? AND (? IS NULL OR rev = ?)`
         )
-        .run(namespace, title, sealed.body, tags, source, rev, now, sealed.bodyEnc, expiresAt, id, want, want);
+        .run(namespace, title, sealed.body, tags, source, rev, now, sealed.bodyEnc, expiresAt, writer, id, want, want);
 
       if (Number(res.changes) === 0) {
         // The row either vanished or its rev moved since we read it.
@@ -2547,6 +2636,11 @@ export class Store {
                   created_at: note.created_at,
                 },
                 {
+                  // written_by / created_by are the IMPORTING caller (a payload
+                  // cannot forge them). What the payload said stays visible, in
+                  // its own clearly-labelled field, as an unverified claim.
+                  importedWrittenBy:
+                    cleanWriter(note.imported_written_by) || cleanWriter(note.written_by) || undefined,
                   skipEdges: true,
                   updatedAt: note.updated_at,
                   startRev: note.rev,
@@ -3555,6 +3649,10 @@ export class Store {
     cursor?: string;
     namespaces?: string[];
     source?: string;
+    /** Only changes made by this server-stamped writer. */
+    writtenBy?: string;
+    /** Only changes NOT made by this server-stamped writer. */
+    notWrittenBy?: string;
     limit?: number;
     /** "last"-marker consumer, carried (signed) through the cursor. */
     consumer?: string;
@@ -3567,7 +3665,7 @@ export class Store {
   }): ChangesPage {
     if (Date.now() - this.lastChangeLogPurge > 3_600_000) this.purgeChangeLog();
     const limit = clampInt(opts.limit, CHANGES_DEFAULT_LIMIT, 1, CHANGES_MAX_LIMIT);
-    const scope = feedScopeKey(opts.namespaces, opts.source);
+    const scope = feedScopeKey(opts.namespaces, opts.source, opts);
     let c: FeedCursor;
     if (opts.cursor) {
       c = this.decodeCursor(opts.cursor);
@@ -3617,6 +3715,13 @@ export class Store {
     const nsParams = opts.namespaces ?? [];
     const srcSql = opts.source !== undefined ? " AND source = ?" : "";
     const srcParams = opts.source !== undefined ? [opts.source] : [];
+    const wbSql =
+      (opts.writtenBy !== undefined ? " AND written_by = ?" : "") +
+      (opts.notWrittenBy !== undefined ? " AND written_by <> ?" : "");
+    const wbParams = [
+      ...(opts.writtenBy !== undefined ? [opts.writtenBy] : []),
+      ...(opts.notWrittenBy !== undefined ? [opts.notWrittenBy] : []),
+    ];
     const exSql = c.x ? " AND (CASE WHEN actor <> '' THEN actor ELSE source END) <> ?" : "";
     const exParams = c.x ? [c.x] : [];
     // One entry per note: its LAST event in the window, kind "deleted" if
@@ -3624,14 +3729,14 @@ export class Store {
     // window, else "updated".
     const eventsSql = `
       WITH ev AS (SELECT seq, note_id, kind FROM change_log
-                   WHERE seq > ? AND seq <= ?${nsSql}${srcSql}${exSql}),
+                   WHERE seq > ? AND seq <= ?${nsSql}${srcSql}${wbSql}${exSql}),
            g AS (SELECT note_id, MAX(seq) AS last, MAX(kind = 'created') AS born FROM ev GROUP BY note_id)
       SELECT e.seq AS seq,
              CASE WHEN e.kind = 'deleted' THEN 'deleted' WHEN g.born THEN 'created' ELSE 'updated' END AS kind,
              e.note_id AS id, e.namespace AS namespace, e.title AS title, e.source AS source,
-             e.changed_at AS at, e.rev AS rev
+             e.changed_at AS at, e.rev AS rev, e.written_by AS written_by
         FROM g JOIN change_log e ON e.seq = g.last`;
-    const eventParams = [c.f, c.t, ...nsParams, ...srcParams, ...exParams];
+    const eventParams = [c.f, c.t, ...nsParams, ...srcParams, ...wbParams, ...exParams];
 
     const tail = opts.tail !== undefined ? clampInt(opts.tail, 30, 1, CHANGES_MAX_LIMIT) : 0;
     const rowsRaw = this.db
@@ -3649,6 +3754,7 @@ export class Store {
       source: string;
       at: string;
       rev: number | null;
+      written_by: string | null;
     }>;
     const rows = tail ? rowsRaw.slice(0, tail).reverse() : rowsRaw;
     const more = tail ? false : rows.length > limit;
@@ -3659,6 +3765,7 @@ export class Store {
       namespace: r.namespace,
       title: r.title,
       source: r.source ?? "",
+      written_by: r.written_by ?? "",
       at: r.at,
       ...(r.rev === null || r.rev === undefined || r.kind === "deleted" ? {} : { rev: Number(r.rev) }),
     }));
@@ -3802,6 +3909,8 @@ export class Store {
     /** op=update: the original patch moved the note to `namespace`. */
     setNamespace?: boolean;
     findings: LintFinding[];
+    /** Internal override of the stamped writer (default: the current writer). */
+    writtenBy?: string;
   }): number {
     // Held writes are the flagged ones (secrets, injections): when at-rest
     // encryption is on they are sealed too. The key state is read under the
@@ -3817,8 +3926,8 @@ export class Store {
       const res = this.db
         .prepare(
           `INSERT INTO quarantine (op, target_id, if_rev, namespace, title, body, tags, source,
-                                   created_at_override, reasons, created_at, set_namespace, sealed)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                                   created_at_override, reasons, created_at, set_namespace, sealed, written_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           q.op,
@@ -3833,7 +3942,8 @@ export class Store {
           JSON.stringify(q.findings),
           new Date().toISOString(),
           q.setNamespace ? 1 : 0,
-          key ? 1 : 0
+          key ? 1 : 0,
+          q.writtenBy !== undefined ? cleanWriter(q.writtenBy) : currentWriter()
         );
       id = Number(res.lastInsertRowid);
       if (!nested) this.db.exec("COMMIT");
@@ -3916,8 +4026,8 @@ export class Store {
     let note: NoteRecord;
     if (q.op === "create") {
       const row = this.db
-        .prepare("SELECT created_at_override FROM quarantine WHERE id = ?")
-        .get(id) as { created_at_override: string | null };
+        .prepare("SELECT created_at_override, written_by FROM quarantine WHERE id = ?")
+        .get(id) as { created_at_override: string | null; written_by: string | null };
       note = this.transaction(() => {
         const n = this.create(
           {
@@ -3928,15 +4038,15 @@ export class Store {
             source: q.source ?? undefined,
             created_at: row.created_at_override ?? undefined,
           },
-          { lint: "none" }
+          { lint: "none", writtenBy: row.written_by ?? "" }
         );
         drop.run(id);
         return n;
       });
     } else {
       const held = this.db
-        .prepare("SELECT if_rev, set_namespace FROM quarantine WHERE id = ?")
-        .get(id) as { if_rev: number | null; set_namespace: number };
+        .prepare("SELECT if_rev, set_namespace, written_by FROM quarantine WHERE id = ?")
+        .get(id) as { if_rev: number | null; set_namespace: number; written_by: string | null };
       const ifRev = held.if_rev;
       // Rows from before 1.1.0 may lack the rev the update was based on;
       // applying them unguarded could overwrite later edits.
@@ -3956,7 +4066,7 @@ export class Store {
           ...(q.tags !== null ? { tags: q.tags } : {}),
           ...(q.source !== null ? { source: q.source } : {}),
         },
-        { ifRev, lint: "none" }
+        { ifRev, lint: "none", writtenBy: held.written_by ?? "" }
       );
       if (!updated) {
         throw new ValidationError(
@@ -4109,9 +4219,19 @@ export const FEED_MARKER_MIN_AGE_MS = 7 * 86_400_000;
 const CONSUMER_RE = /^[A-Za-z0-9._@-]{1,64}$/;
 
 /** Stable short key for a change-feed filter (namespace set + source). */
-export function feedScopeKey(namespaces: string[] | undefined, source: string | undefined): string {
+export function feedScopeKey(
+  namespaces: string[] | undefined,
+  source: string | undefined,
+  writer?: { writtenBy?: string; notWrittenBy?: string }
+): string {
+  // The writer filter extends the key only when set, so every pre-1.3.3
+  // marker / cursor / ack_token (no writer filter) keeps its exact scope key.
+  const base: unknown[] = [namespaces ? [...namespaces].sort() : null, source ?? null];
+  if (writer?.writtenBy !== undefined || writer?.notWrittenBy !== undefined) {
+    base.push([writer.writtenBy ?? null, writer.notWrittenBy ?? null]);
+  }
   return createHash("sha256")
-    .update(JSON.stringify([namespaces ? [...namespaces].sort() : null, source ?? null]))
+    .update(JSON.stringify(base))
     .digest("hex")
     .slice(0, 16);
 }

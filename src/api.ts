@@ -175,6 +175,17 @@ function ackModeParam(url: URL): "auto" | "manual" | undefined {
   return v;
 }
 
+/** `?written_by=` / `?not_written_by=`: filter on the server-stamped last writer. */
+type WriterFilter = { writtenBy?: string; notWrittenBy?: string };
+function writerFilter(url: URL): WriterFilter {
+  const is = url.searchParams.get("written_by");
+  const not = url.searchParams.get("not_written_by");
+  return {
+    ...(is !== null && is !== "" ? { writtenBy: is } : {}),
+    ...(not !== null && not !== "" ? { notWrittenBy: not } : {}),
+  };
+}
+
 function flagParam(url: URL, name: string): boolean {
   return ["1", "true", "yes"].includes((url.searchParams.get(name) ?? "").toLowerCase());
 }
@@ -275,9 +286,10 @@ export function createApiServer(
     limit?: number,
     offset?: number,
     includeArchived?: boolean,
-    archivedOnly?: boolean
+    archivedOnly?: boolean,
+    wf: WriterFilter = {}
   ): { notes: NoteRecord[]; total: number } =>
-    store.list({ namespaces: readable(ctx), limit, offset, includeArchived, archivedOnly });
+    store.list({ namespaces: readable(ctx), limit, offset, includeArchived, archivedOnly, ...wf });
 
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     // Per-request namespace context. A LOCAL, not a factory-scoped mutable:
@@ -391,7 +403,10 @@ export function createApiServer(
       }
       const scope = principal.scope;
       const actorRef = actorStore.getStore();
-      if (actorRef) actorRef.label = principal.label;
+      if (actorRef) {
+        actorRef.label = principal.label;
+        actorRef.authed = true; // written_by is the verified token label
+      }
       // Per-request namespace: a token's own pin WINS over the server's
       // cwd-resolved namespace. This is the isolation boundary for this
       // request -- resolved here, once, so every gate below reads `ns`.
@@ -610,6 +625,7 @@ export function createApiServer(
         // not privileged, and the namespace filter still applies.
         const includeArchived = url.searchParams.get("includeArchived") === "1";
         const archivedOnly = url.searchParams.get("archived") === "1";
+        const wf = writerFilter(url);
         if (nsCtx.active) {
           // Untrusted hint intersected with the readable set, like the MCP
           // state_list tool.
@@ -621,6 +637,7 @@ export function createApiServer(
               offset,
               includeArchived,
               archivedOnly,
+              ...wf,
             });
             sendJson(res, 200, { ...result, searchedNamespaces: [hint] });
             return;
@@ -631,7 +648,8 @@ export function createApiServer(
               limit,
               offset,
               includeArchived,
-              archivedOnly
+              archivedOnly,
+              wf
             ),
             searchedNamespaces: readable(nsCtx),
           });
@@ -643,6 +661,7 @@ export function createApiServer(
           offset,
           includeArchived,
           archivedOnly,
+          ...wf,
         });
         sendJson(res, 200, {
           ...result,
@@ -705,6 +724,7 @@ export function createApiServer(
             limit,
             mode: parseMode(url.searchParams.get("mode")),
             timeRange: timePhrase ? { start: timePhrase.start, end: timePhrase.end } : undefined,
+            ...writerFilter(url),
           };
           if (hint) {
             if (explain) {
@@ -758,6 +778,7 @@ export function createApiServer(
           limit,
           mode: parseMode(url.searchParams.get("mode")),
           timeRange: timePhrase ? { start: timePhrase.start, end: timePhrase.end } : undefined,
+          ...writerFilter(url),
         };
         if (explain) {
           const hits = await runSearchExplained(store, q, singleOpts);
@@ -974,6 +995,7 @@ export function createApiServer(
               cursor: url.searchParams.get("cursor") ?? undefined,
               namespaces,
               source: url.searchParams.get("source") ?? undefined,
+              ...writerFilter(url),
               limit: limitRaw !== null ? Number(limitRaw) : undefined,
               consumer: url.searchParams.get("consumer") ?? undefined,
               ackMode: ackModeParam(url),
@@ -1095,6 +1117,8 @@ export function createApiServer(
               consumer: typeof body.consumer === "string" ? body.consumer : undefined,
               namespaces,
               source: typeof body.source === "string" ? body.source : undefined,
+              ...(typeof body.written_by === "string" && body.written_by ? { writtenBy: body.written_by } : {}),
+              ...(typeof body.not_written_by === "string" && body.not_written_by ? { notWrittenBy: body.not_written_by } : {}),
             });
             audit({ op: "changes.ack", label: principal.label, kind: "changes", detail: `consumer=${r.consumer} seq=${r.seq}` });
             sendJson(res, 200, { acked: true, ...r });

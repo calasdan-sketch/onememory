@@ -141,6 +141,14 @@ is compared, except for writes with no recorded writer (CLI, scripts, rows from
 before v12), which fall back to `source`. Give each device its own token label and
 use that label as its `consumer`; devices sharing a label hide each other's writes.
 
+Since 1.3.3 every change entry carries `written_by` (the server-stamped writer: token
+label, or `stdio` / `cli` / `server`; `""` for rows before schema v13), and the feed
+takes `written_by=` / `not_written_by=` (MCP `memory_since`, `memory_ack`; REST
+`GET /changes`, `POST /ack`) to keep or drop one writer's changes. The filter applies to
+change *events*: a note created by A and edited by B shows as A's create under
+`not_written_by=B`. A cursor, `last` marker or `ack_token` is bound to the filter it was
+issued for. See [provenance.md](./provenance.md).
+
 A consumer whose `last` marker is older than the change-log retention (90 days) gets
 `markerReset: true` with whatever is still retained, rather than silently skipping
 the purged events.

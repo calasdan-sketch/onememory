@@ -248,6 +248,22 @@ token).
 
 ---
 
+## Who wrote this?
+
+Every note carries a **server-stamped** `written_by` (the last writer) and `created_by`
+(the first). It is the label of the authenticated token that made the call, or a fixed
+marker for writers with no token: `stdio` (local MCP), `cli` (an `onememory` command),
+`server` (its own jobs). A client cannot set it: `written_by` in a request body is
+ignored, and an import stamps the *importing* admin. The old `source` field is still
+there, but it is only what the writer *claims*, so anyone can put anything in it.
+
+A note written by Claude Code and one written by Cursor are therefore no longer
+identical on read-back. MCP results add a "who wrote this" block under the untrusted-data
+banner, the session-start recall names the writer, and `state_list`, `state_search` and
+`memory_since` take `written_by` / `not_written_by` (REST: `?written_by=`) so an agent can
+ignore its own writes or distrust a client. Rows from before 1.3.3 read `""` (unknown).
+Details and limits: [docs/provenance.md](./docs/provenance.md).
+
 ## Security in one paragraph
 
 Loopback by default and fail-closed: it refuses to bind a public interface
@@ -286,6 +302,7 @@ recall@1 on it. See [docs/encryption-retention.md](./docs/encryption-retention.m
 | [docs/file-sync.md](./docs/file-sync.md) | Markdown export/import, GitHub and Syncthing workflows |
 | [docs/sessionstart-hook.md](./docs/sessionstart-hook.md) | automatic recall at Claude Code session start |
 | [docs/encryption-retention.md](./docs/encryption-retention.md) | at-rest encryption, retention (TTL + archive), retrieval visibility |
+| [docs/provenance.md](./docs/provenance.md) | who wrote a note: server-stamped `written_by`, filters, what is and is not trusted |
 | [docs/token-namespaces.md](./docs/token-namespaces.md) | per-token namespace permissions — one shared bridge, isolated agents |
 | [docs/architecture.md](./docs/architecture.md) | modules, tools, REST API, schema |
 | [SKILL.md](./SKILL.md) | when and how an agent should use the memory |

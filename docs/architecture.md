@@ -166,5 +166,7 @@ is idempotent. v1 rev + source, v2 note_vectors, v3 access tracking, v4
 similarity edges, v5 `_meta` + gated FTS trigger, v6 edge indexes, v7
 `quarantine`, `sync_map`, `sync_base`, `idx_notes_updated`, v8 `change_log`
 (+ triggers; replaces the 1.1.0-rc `note_tombstones`) and
-`quarantine.set_namespace`. There is no downgrade path: once a 1.1.0 binary
+`quarantine.set_namespace`, v12 `change_log.actor`, v13 `notes.written_by` /
+`created_by` / `imported_written_by` (+ `change_log.written_by`,
+`quarantine.written_by`; see [provenance.md](./provenance.md)). There is no downgrade path: once a 1.1.0 binary
 has opened a database, don't go back to 1.0.x.

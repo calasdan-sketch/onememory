@@ -121,6 +121,7 @@ export function createMcpHttpServer(
       const server = createMcpServer(store, scope, resolveNsForRequest(principal.namespace), {
         waitKey: tokenKey(principal.token),
         label: principal.label,
+        authed: true,
         signal: gone.signal,
       });
       const transport = new StreamableHTTPServerTransport({

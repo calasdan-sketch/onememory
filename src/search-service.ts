@@ -349,6 +349,10 @@ export interface SearchOpts {
    * (newest first).
    */
   timeRange?: { start: Date; end: Date };
+  /** Only notes whose server-stamped last writer (written_by) is exactly this. */
+  writtenBy?: string;
+  /** Only notes whose server-stamped last writer is NOT this. */
+  notWrittenBy?: string;
 }
 
 /**
@@ -379,16 +383,22 @@ export async function runSearch(
   const limit = clampInt(opts.limit, 20, 1, 200);
   const mode: SearchMode = opts.mode ?? parseMode(undefined);
   const range = opts.timeRange;
-  const rangeOpts =
-    range !== undefined
+  const writerOpts = {
+    ...(opts.writtenBy !== undefined ? { writtenBy: opts.writtenBy } : {}),
+    ...(opts.notWrittenBy !== undefined ? { notWrittenBy: opts.notWrittenBy } : {}),
+  };
+  const rangeOpts = {
+    ...(range !== undefined
       ? { startISO: range.start.toISOString(), endISO: range.end.toISOString() }
-      : {};
+      : {}),
+    ...writerOpts,
+  };
   const staleCfg = stalenessConfig();
 
   // Time-only query: no keywords to rank by -> time-scoped newest-first list.
   // A newest-first list has no relevance ranking to boost, but the returned
   // notes were still read by the caller, so their access counters bump.
-  if (range !== undefined && !query.trim()) {
+  if ((range !== undefined || Object.keys(writerOpts).length > 0) && !query.trim()) {
     const listed = store.list({ namespace: opts.namespace, limit, ...rangeOpts }).notes;
     bumpAccess(store, listed);
     return listed;
@@ -477,15 +487,21 @@ export async function runSearchExplained(
   const limit = clampInt(opts.limit, 20, 1, 200);
   const mode: SearchMode = opts.mode ?? parseMode(undefined);
   const range = opts.timeRange;
-  const rangeOpts =
-    range !== undefined
+  const writerOpts = {
+    ...(opts.writtenBy !== undefined ? { writtenBy: opts.writtenBy } : {}),
+    ...(opts.notWrittenBy !== undefined ? { notWrittenBy: opts.notWrittenBy } : {}),
+  };
+  const rangeOpts = {
+    ...(range !== undefined
       ? { startISO: range.start.toISOString(), endISO: range.end.toISOString() }
-      : {};
+      : {}),
+    ...writerOpts,
+  };
   const staleCfg = stalenessConfig();
 
   // Time-only query: a recency list has no relevance score to explain, but
   // the notes were still read by the caller, so bump access like runSearch.
-  if (range !== undefined && !query.trim()) {
+  if ((range !== undefined || Object.keys(writerOpts).length > 0) && !query.trim()) {
     const listed = store.list({ namespace: opts.namespace, limit, ...rangeOpts }).notes;
     bumpAccess(store, listed);
     return listed.map((note) => ({
@@ -569,6 +585,8 @@ function explainedRecencyOnly(note: NoteRecord): ScoreBreakdown {
 export interface RelevantOpts {
   namespace?: string;
   limit?: number;
+  writtenBy?: string;
+  notWrittenBy?: string;
 }
 
 /**
@@ -613,6 +631,8 @@ export async function runRelevantSearch(
     const ranked = store.searchRanked(kw, {
       namespace: opts.namespace,
       limit: perKeyword,
+      ...(opts.writtenBy !== undefined ? { writtenBy: opts.writtenBy } : {}),
+      ...(opts.notWrittenBy !== undefined ? { notWrittenBy: opts.notWrittenBy } : {}),
     });
     const ids: number[] = [];
     for (const h of ranked) {

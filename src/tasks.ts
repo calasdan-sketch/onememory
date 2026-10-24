@@ -115,6 +115,10 @@ export interface Task {
   approval_expires_at: string | null;
   result: Record<string, unknown> | null;
   rev: number;
+  /** Server-stamped last writer of this task (token label / stdio / cli / server); "" = unknown. */
+  written_by: string;
+  /** Server-stamped creator of this task; "" = unknown. */
+  created_by: string;
   created_at: string;
   updated_at: string;
 }
@@ -122,7 +126,7 @@ export interface Task {
 /** The compact shape catch_up and the board use: no notes, no command params. */
 export type TaskSummary = Pick<
   Task,
-  "id" | "namespace" | "title" | "status" | "owner" | "next_step" | "priority" | "due" | "parent_id" | "blocked_by" | "rev" | "updated_at"
+  "id" | "namespace" | "title" | "status" | "owner" | "next_step" | "priority" | "due" | "parent_id" | "blocked_by" | "rev" | "written_by" | "updated_at"
 >;
 
 export function compactTask(t: Task): TaskSummary {
@@ -138,6 +142,7 @@ export function compactTask(t: Task): TaskSummary {
     parent_id: t.parent_id,
     blocked_by: t.blocked_by,
     rev: t.rev,
+    written_by: t.written_by,
     updated_at: t.updated_at,
   };
 }
@@ -422,6 +427,8 @@ export function taskFromNote(n: NoteRecord, store?: Store, now = Date.now()): Ta
     })(),
     result: body.result,
     rev: n.rev,
+    written_by: n.written_by,
+    created_by: n.created_by,
     created_at: n.created_at,
     updated_at: n.updated_at,
   };
@@ -1043,6 +1050,8 @@ export interface Handoff {
   done: string[];
   pending: string[];
   decisions: string[];
+  /** Server-stamped writer of this handoff (token label / stdio / cli / server); "" = unknown. `surface` is only the writer's claim. */
+  written_by: string;
 }
 
 function items(v: unknown, name: string): string[] {
@@ -1082,6 +1091,7 @@ export function handoffFromNote(n: NoteRecord): Handoff {
     done: [],
     pending: [],
     decisions: [],
+    written_by: n.written_by,
   };
   let section: "done" | "pending" | "decisions" | null = null;
   for (const raw of n.body.split("\n")) {

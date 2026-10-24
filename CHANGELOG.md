@@ -6,6 +6,43 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-10-24
+
+"Who wrote this?" A note now records which connection wrote it, stamped by the
+server so a client cannot forge it. **Schema is now v13** (additive columns; see
+"Changed"): a database opened by 1.3.3 cannot be opened by 1.3.2 or older. Back up
+before upgrading.
+
+### Added
+- `written_by` (last writer) and `created_by` (first writer) on every note: the
+  authenticated token's label, or `stdio` / `cli` / `server` for writers with no
+  token. Set on create and on every update, from the connection only: a
+  `written_by` / `created_by` in a request body is ignored. A token labelled like a
+  marker is stored as `token:<label>`.
+- Returned on read, list, search, `state_relevant`, export, tasks, handoffs and in
+  change-feed entries. MCP results get a second "WHO WROTE THIS" block (writer first,
+  the writer's `source` claim labelled unverified); the SessionStart recall names the
+  writer.
+- `written_by` / `not_written_by` filters on `state_list`, `state_search`,
+  `memory_since`, `memory_ack` and the REST equivalents (`GET /notes`, `/search`,
+  `/changes`, `POST /ack`). They respect namespace scope.
+- Import: the importing caller is stamped as the writer; an export's `written_by` is
+  kept only as a separate `imported_written_by` claim. A quarantined write keeps its real
+  author when approved.
+- docs/provenance.md and a README section "Who wrote this?".
+
+### Changed
+- Schema v13: `notes.written_by`, `notes.created_by`, `notes.imported_written_by`
+  (default `''`), `change_log.written_by`, `quarantine.written_by`, and an index on
+  `notes.written_by`. Rows written before v13 read `''` (unknown); they are not
+  guessed from `source`. Tested upgrading from v11 and v12 databases.
+- `source` is documented, and described in the MCP tool schema, as an unverified claim.
+- `written_by` is plaintext, like title and tags (so it can be filtered); it is not
+  note content.
+
+### Not included
+- A `distrust_writers` trust policy or per-note trust flag (idea only; see docs/provenance.md).
+
 ## [1.3.2] - 2026-10-24
 
 Test-only fix for Windows CI. No runner/allowlist change, no schema change (still v12).
