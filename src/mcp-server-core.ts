@@ -20,7 +20,15 @@ import {
   type NoteRecord,
 } from "./store.js";
 import type { LintFinding } from "./lint.js";
-import { runChanges } from "./changes.js";
+import {
+  putTask,
+  listTasks,
+  writeHandoff,
+  catchUp,
+  TASK_STATUSES,
+  TASK_LIMITS,
+} from "./tasks.js";
+import { waitForChanges, parseWait, WAIT_MAX_SECONDS } from "./change-wait.js";
 import { type Scope, PACKAGE_VERSION } from "./config.js";
 export { PACKAGE_VERSION };
 import { scopeAllows, UNTRUSTED_BANNER } from "./security.js";
@@ -107,6 +115,16 @@ function errorFor(e: unknown) {
 }
 
 /**
+ * Per-connection facts the transport knows and the tools need for live
+ * waits: an identity for the per-token waiter cap (a hash, never the token)
+ * and a signal that fires when the HTTP client goes away.
+ */
+export interface ConnectionCtx {
+  waitKey?: string;
+  signal?: AbortSignal;
+}
+
+/**
  * Build the MCP server. `scope` is the caller's access level (from their
  * token on the HTTP transport); it defaults to "admin" for the local stdio
  * transport, which has no token and is trusted as the machine owner.
@@ -121,7 +139,8 @@ function errorFor(e: unknown) {
 export function createMcpServer(
   store: Store,
   scope: Scope = "admin",
-  opts: ServerNamespaceOpts = {}
+  opts: ServerNamespaceOpts = {},
+  conn: ConnectionCtx = {}
 ): McpServer {
   const server = new McpServer({
     name: "onememory",
@@ -950,9 +969,16 @@ export function createMcpServer(
           .string()
           .optional()
           .describe('Label for the "last" marker, e.g. "phone" or "claude-code" (default "default").'),
+        wait_seconds: z
+          .number()
+          .int()
+          .optional()
+          .describe(
+            `Live wait: if nothing new yet, hold the call open up to this many seconds (0-${WAIT_MAX_SECONDS}) and return the moment something changes in your scope. Returns timedOut:true if nothing did. Not with \`cursor\`; best with since:"last".`
+          ),
       },
     },
-    async ({ since, cursor, namespace, source, limit, consumer }) => {
+    async ({ since, cursor, namespace, source, limit, consumer, wait_seconds }, extra) => {
       try {
         const denied = denyIfUnder("read");
         if (denied) return errorResult(denied);
@@ -963,8 +989,173 @@ export function createMcpServer(
         } else if (namespace) {
           namespaces = [namespace];
         }
-        const out = runChanges(store, { since, cursor, namespaces, source, limit, consumer });
+        const signals = [extra?.signal, conn.signal].filter((x): x is AbortSignal => Boolean(x));
+        const out = await waitForChanges(
+          store,
+          { since, cursor, namespaces, source, limit, consumer },
+          {
+            waitSeconds: parseWait(wait_seconds),
+            signal: signals.length ? AbortSignal.any(signals) : undefined,
+            key: conn.waitKey ?? "mcp-local",
+          }
+        );
         // Titles are attacker-writable content: untrusted banner.
+        return untrustedResult({ ...out, searchedNamespaces: namespaces ?? [] });
+      } catch (e) {
+        return errorFor(e);
+      }
+    }
+  );
+
+  // --- Task board, handoffs, catch-up (conventions on notes; see tasks.ts) ---
+
+  // Read scope: the model-supplied namespace is an untrusted hint when
+  // resolution is active (same rule as memory_since / state_search).
+  const readScope = (namespace: string | undefined): string[] | undefined => {
+    if (nsActive) {
+      const hint = trustedHint(namespace);
+      return hint ? [hint] : readable();
+    }
+    return namespace ? [namespace] : undefined;
+  };
+  const writeScope = (): { namespace?: string } => (nsActive ? { namespace: ownNs } : {});
+
+  server.registerTool(
+    "task_put",
+    {
+      title: "Create or update a task",
+      description:
+        "Shared task board across devices and models. Create a task (no `id`: `title` required) or update one " +
+        "(`id`: only the fields you pass change). status: idea | planned | running | blocked | done. " +
+        "`next_step` is the one concrete thing to do next; `owner` is which device/chat/model has it " +
+        "(e.g. \"phone\", \"pc-claude-code\"). Pass `if_rev` (from a previous result) to avoid overwriting a " +
+        "change another session just made. Tasks are notes tagged `task`: they show up in memory_since and search." +
+        (nsActive ? " SERVER-RESOLVED NAMESPACE: tasks are written to this server's own namespace." : ""),
+      inputSchema: {
+        id: z.number().int().optional().describe("Task id to update. Omit to create."),
+        ...(nsActive ? {} : { namespace: z.string().optional().describe("Namespace for a new task. Default 'default'.") }),
+        title: z.string().optional().describe(`Short title (max ${TASK_LIMITS.title}). Required when creating.`),
+        status: z.enum(TASK_STATUSES).optional().describe("idea | planned | running | blocked | done (default idea)."),
+        next_step: z.string().optional().describe(`The next concrete step, one line (max ${TASK_LIMITS.nextStep}). Empty string clears it.`),
+        owner: z.string().optional().describe("Which device, chat or model owns this now. Empty string clears it."),
+        notes: z.string().optional().describe(`Free-form details (max ${TASK_LIMITS.notes}).`),
+        if_rev: z.number().int().optional().describe("Compare-and-swap: only update if the task is still at this rev."),
+      },
+    },
+    async ({ id, namespace, title, status, next_step, owner, notes, if_rev }) => {
+      const warnings: LintFinding[] = [];
+      try {
+        const denied = denyIfUnder("write");
+        if (denied) return errorResult(denied);
+        const { task, note } = putTask(
+          store,
+          { id, namespace, title, status, next_step, owner, notes, if_rev },
+          writeScope(),
+          warnings
+        );
+        await maybeEmbed(store, note);
+        return untrustedResult(withWarnings({ task }, warnings));
+      } catch (e) {
+        if (e instanceof QuarantinedError) return quarantinedResult(e);
+        return errorFor(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "task_list",
+    {
+      title: "List tasks",
+      annotations: { readOnlyHint: true },
+      description:
+        "List tasks on the shared board, most recently changed first. By default shows everything except " +
+        "done; pass status (idea | planned | running | blocked | done) for one status, or \"all\" to include done. " +
+        "Filter by `owner` to see what one device/model is holding." +
+        (nsActive ? " The `namespace` parameter is an untrusted hint: only readable namespaces are searched." : ""),
+      inputSchema: {
+        status: z.string().optional().describe('One status, "open" (default: all but done) or "all".'),
+        owner: z.string().optional().describe("Only tasks owned by this device/chat/model."),
+        namespace: z.string().optional().describe(nsActive ? "Untrusted hint: restrict to this namespace." : "Restrict to this namespace."),
+        limit: z.number().int().optional().describe(`Max tasks (default 50, max ${TASK_LIMITS.maxList}).`),
+      },
+    },
+    async ({ status, owner, namespace, limit }) => {
+      try {
+        const denied = denyIfUnder("read");
+        if (denied) return errorResult(denied);
+        const namespaces = readScope(namespace);
+        const { tasks, total } = listTasks(store, { namespaces, status, owner, limit });
+        return untrustedResult({ tasks, total, searchedNamespaces: namespaces ?? [] });
+      } catch (e) {
+        return errorFor(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "session_handoff",
+    {
+      title: "Write a session handoff",
+      description:
+        "Leave a structured handoff for the next session (any device or model) before you stop: what you did, " +
+        "what is still pending, what was decided, and the one next step. The next session reads it with " +
+        "catch_up (or it appears at session start via `onememory recall`). Stored as a note tagged `handoff`." +
+        (nsActive ? " SERVER-RESOLVED NAMESPACE: written to this server's own namespace." : ""),
+      inputSchema: {
+        surface: z.string().describe('Who is handing off: device/chat/model, e.g. "phone" or "claude-code on pc".'),
+        ...(nsActive ? {} : { namespace: z.string().optional().describe("Namespace. Default 'default'.") }),
+        summary: z.string().optional().describe(`One or two sentences (max ${TASK_LIMITS.summary}).`),
+        done: z.array(z.string()).optional().describe("What got done (short items)."),
+        pending: z.array(z.string()).optional().describe("What is still open."),
+        decisions: z.array(z.string()).optional().describe("Decisions made that the next session must respect."),
+        next_step: z.string().optional().describe("The single next thing to do."),
+      },
+    },
+    async ({ surface, namespace, summary, done, pending, decisions, next_step }) => {
+      const warnings: LintFinding[] = [];
+      try {
+        const denied = denyIfUnder("write");
+        if (denied) return errorResult(denied);
+        const { handoff, note } = writeHandoff(
+          store,
+          { surface, namespace, summary, done, pending, decisions, next_step },
+          writeScope(),
+          warnings
+        );
+        await maybeEmbed(store, note);
+        return untrustedResult(withWarnings({ handoff }, warnings));
+      } catch (e) {
+        if (e instanceof QuarantinedError) return quarantinedResult(e);
+        return errorFor(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "catch_up",
+    {
+      title: "Catch up (start of session)",
+      annotations: { readOnlyHint: true },
+      description:
+        "One call to learn where things stand: what changed since THIS consumer last called (titles only; the " +
+        "marker then advances), the open tasks, and the latest handoffs. Call it first in a new session, passing " +
+        'a stable `consumer` label for this device/model (e.g. "phone", "claude-code-pc"). The first call for a ' +
+        "label covers the last 24h." +
+        (nsActive ? " The `namespace` parameter is an untrusted hint: only readable namespaces are included." : ""),
+      inputSchema: {
+        consumer: z.string().optional().describe('Label for the "last" marker (default "default").'),
+        namespace: z.string().optional().describe(nsActive ? "Untrusted hint: restrict to this namespace." : "Restrict to this namespace."),
+        include_changes: z.boolean().optional().describe("false = skip the changes part (and leave the marker alone). Default true."),
+        tasks: z.number().int().optional().describe("Max open tasks (default 20)."),
+        handoffs: z.number().int().optional().describe("Max handoffs (default 3)."),
+      },
+    },
+    async ({ consumer, namespace, include_changes, tasks, handoffs }) => {
+      try {
+        const denied = denyIfUnder("read");
+        if (denied) return errorResult(denied);
+        const namespaces = readScope(namespace);
+        const out = catchUp(store, { namespaces, consumer, changes: include_changes, tasks, handoffs });
         return untrustedResult({ ...out, searchedNamespaces: namespaces ?? [] });
       } catch (e) {
         return errorFor(e);

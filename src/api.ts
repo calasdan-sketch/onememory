@@ -77,7 +77,15 @@ import {
 } from "./namespace.js";
 import { parseTimePhrase } from "./time-parse.js";
 import { annotateStaleness } from "./staleness.js";
-import { runChanges } from "./changes.js";
+import {
+  putTask,
+  listTasks,
+  writeHandoff,
+  listHandoffs,
+  catchUp,
+  TaskNotFoundError,
+} from "./tasks.js";
+import { waitForChanges, parseWait, WaitBusyError } from "./change-wait.js";
 import type { LintFinding } from "./lint.js";
 
 // Minimum scope a request needs: deletes, imports and full /export are admin,
@@ -921,20 +929,141 @@ export function createApiServer(
           sendJson(res, 400, { error: "limit must be an integer" });
           return;
         }
+        // &wait=<seconds> (0-55): long-poll -- hold the request until the
+        // feed has something new for this token's scope (see change-wait.ts).
+        const abort = new AbortController();
+        const onClose = (): void => abort.abort();
+        res.once("close", onClose);
         try {
-          const out = runChanges(store, {
-            since: url.searchParams.get("since") ?? undefined,
-            cursor: url.searchParams.get("cursor") ?? undefined,
-            namespaces,
-            source: url.searchParams.get("source") ?? undefined,
-            limit: limitRaw !== null ? Number(limitRaw) : undefined,
-            consumer: url.searchParams.get("consumer") ?? undefined,
-          });
+          const out = await waitForChanges(
+            store,
+            {
+              since: url.searchParams.get("since") ?? undefined,
+              cursor: url.searchParams.get("cursor") ?? undefined,
+              namespaces,
+              source: url.searchParams.get("source") ?? undefined,
+              limit: limitRaw !== null ? Number(limitRaw) : undefined,
+              consumer: url.searchParams.get("consumer") ?? undefined,
+            },
+            {
+              waitSeconds: parseWait(url.searchParams.get("wait")),
+              signal: abort.signal,
+              key: tokenKey(principal.token),
+            }
+          );
           sendJson(res, 200, { ...out, searchedNamespaces: namespaces ?? [] });
         } catch (e) {
-          sendError(res, e);
+          if (e instanceof WaitBusyError) sendJson(res, 429, { error: e.message });
+          else sendError(res, e);
+        } finally {
+          res.off("close", onClose);
         }
         return;
+      }
+
+      // --- Task board, handoffs, catch-up (conventions on notes; tasks.ts) ---
+      // Same gating as the notes routes: GET = read, POST/PUT = write (see
+      // requiredScope); writes land in the request's own namespace when
+      // namespace resolution / a token pin is active; reads cover the
+      // readable set, with ?namespace= as an untrusted hint.
+      if (path === "/tasks" || path === "/handoffs" || path === "/catch-up" || /^\/tasks\/\d+$/.test(path)) {
+        const readNs = (): string[] | undefined => {
+          const hint = url.searchParams.get("namespace") ?? undefined;
+          if (nsCtx.active) {
+            const t = trustedHint(nsCtx, hint);
+            return t ? [t] : readable(nsCtx);
+          }
+          return hint ? [hint] : undefined;
+        };
+        const writeNs = nsCtx.active ? { namespace: nsCtx.ownNamespace } : {};
+        const jsonBody = async (): Promise<Record<string, unknown> | null> => {
+          const raw = await readBody(req);
+          try {
+            const v = JSON.parse(raw || "{}");
+            if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, unknown>;
+          } catch {
+            /* fall through */
+          }
+          sendJson(res, 400, { error: "invalid JSON body (expected an object)" });
+          return null;
+        };
+        try {
+          if (req.method === "GET" && path === "/tasks") {
+            const namespaces = readNs();
+            const limit = intParam(url, "limit", 1);
+            const { tasks, total } = listTasks(store, {
+              namespaces,
+              status: url.searchParams.get("status") ?? undefined,
+              owner: url.searchParams.get("owner") ?? undefined,
+              limit,
+            });
+            sendJson(res, 200, { tasks, total, searchedNamespaces: namespaces ?? [] });
+            return;
+          }
+          if (req.method === "POST" && path === "/tasks") {
+            const body = await jsonBody();
+            if (!body) return;
+            if (body.id !== undefined) {
+              sendJson(res, 400, { error: "POST /tasks creates; update with PUT /tasks/:id" });
+              return;
+            }
+            const warnings: LintFinding[] = [];
+            const { task, note } = putTask(store, body as never, writeNs, warnings);
+            await maybeEmbed(store, note);
+            sendJson(res, 201, warnings.length ? { task, warnings } : { task });
+            return;
+          }
+          const tid = /^\/tasks\/(\d+)$/.exec(path);
+          if (req.method === "PUT" && tid) {
+            const body = await jsonBody();
+            if (!body) return;
+            const warnings: LintFinding[] = [];
+            try {
+              const { task, note } = putTask(store, { ...(body as object), id: Number(tid[1]) } as never, writeNs, warnings);
+              await maybeEmbed(store, note);
+              sendJson(res, 200, warnings.length ? { task, warnings } : { task });
+            } catch (e) {
+              if (e instanceof TaskNotFoundError) sendJson(res, 404, { error: "not found" });
+              else if (e instanceof ValidationError && e.message.startsWith("stale write:")) sendJson(res, 409, { error: e.message });
+              else throw e;
+            }
+            return;
+          }
+          if (req.method === "POST" && path === "/handoffs") {
+            const body = await jsonBody();
+            if (!body) return;
+            const warnings: LintFinding[] = [];
+            const { handoff, note } = writeHandoff(store, body as never, writeNs, warnings);
+            await maybeEmbed(store, note);
+            sendJson(res, 201, warnings.length ? { handoff, warnings } : { handoff });
+            return;
+          }
+          if (req.method === "GET" && path === "/handoffs") {
+            const namespaces = readNs();
+            const handoffs = listHandoffs(store, {
+              namespaces,
+              surface: url.searchParams.get("surface") ?? undefined,
+              limit: intParam(url, "limit", 1),
+            });
+            sendJson(res, 200, { handoffs, searchedNamespaces: namespaces ?? [] });
+            return;
+          }
+          if (req.method === "GET" && path === "/catch-up") {
+            const namespaces = readNs();
+            const out = catchUp(store, {
+              namespaces,
+              consumer: url.searchParams.get("consumer") ?? undefined,
+              changes: !["0", "false"].includes((url.searchParams.get("changes") ?? "").toLowerCase()),
+              tasks: intParam(url, "tasks", 1),
+              handoffs: intParam(url, "handoffs", 1),
+            });
+            sendJson(res, 200, { ...out, searchedNamespaces: namespaces ?? [] });
+            return;
+          }
+        } catch (e) {
+          sendError(res, e);
+          return;
+        }
       }
 
       // GET /export -> all notes, for backup / migration. Exempt from the

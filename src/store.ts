@@ -758,6 +758,28 @@ function archivedClause(includeArchived?: boolean, archivedOnly?: boolean): stri
   return " AND archived_at IS NULL";
 }
 
+/** SQL prefilter for exact-tag filters over the JSON-array tags column. */
+function tagClause(withTags?: string[], withoutTags?: string[]): { sql: string; params: string[] } {
+  const esc = (t: string): string => "%" + JSON.stringify(t).replace(/[\\%_]/g, "\\$&") + "%";
+  let sql = "";
+  const params: string[] = [];
+  for (const t of withTags ?? []) {
+    sql += " AND tags LIKE ? ESCAPE '\\'";
+    params.push(esc(t));
+  }
+  for (const t of withoutTags ?? []) {
+    sql += " AND tags NOT LIKE ? ESCAPE '\\'";
+    params.push(esc(t));
+  }
+  return { sql, params };
+}
+
+function tagsMatch(rawTags: string, withTags?: string[], withoutTags?: string[]): boolean {
+  if (!withTags?.length && !withoutTags?.length) return true;
+  const have = parseTags(rawTags);
+  return (withTags ?? []).every((t) => have.includes(t)) && !(withoutTags ?? []).some((t) => have.includes(t));
+}
+
 function rangeClause(opts: RangeOpts): { sql: string; params: string[] } {
   const clauses: string[] = [];
   const params: string[] = [];
@@ -1306,6 +1328,7 @@ export class Store {
       }
       throw e;
     }
+    if (!nested) this.announceChange();
     audit({ op: "create", id, namespace, bytes: body.length });
     return this.read(id)!;
   }
@@ -1854,6 +1877,7 @@ export class Store {
       throw e;
     }
 
+    this.announceChange();
     audit({ op: "update", id, namespace, bytes: body.length });
     return this.read(id);
   }
@@ -1882,7 +1906,10 @@ export class Store {
       )
       .run(iso, iso, ...(namespaces ?? []));
     const n = Number(res.changes ?? 0);
-    if (n > 0) this.edgeIndexes.clear(); // archived notes leave the similarity index
+    if (n > 0) {
+      this.edgeIndexes.clear(); // archived notes leave the similarity index
+      this.announceChange();
+    }
     return n;
   }
 
@@ -1893,6 +1920,7 @@ export class Store {
       .prepare("UPDATE notes SET archived_at = ? WHERE id = ? AND archived_at IS NULL")
       .run(iso, id);
     this.edgeIndexes.clear();
+    this.announceChange();
     return this.read(id);
   }
 
@@ -1907,6 +1935,7 @@ export class Store {
       .prepare("UPDATE notes SET archived_at = NULL, expires_at = ? WHERE id = ? AND archived_at IS NOT NULL")
       .run(opts.forget_after === undefined ? null : retentionDeadline(opts.forget_after), id);
     this.edgeIndexes.clear(); // restored note rejoins the similarity index lazily
+    this.announceChange();
     return this.read(id);
   }
 
@@ -2104,6 +2133,7 @@ export class Store {
     const ok = Number(result.changes) > 0;
     if (ok) {
       this.noteWritten(row.namespace, id, null);
+      if (!this.db.isTransaction) this.announceChange();
       audit({ op: "delete", id });
     }
     return ok;
@@ -2138,6 +2168,7 @@ export class Store {
     try {
       const out = fn();
       this.db.exec("COMMIT");
+      this.announceChange();
       return out;
     } catch (e) {
       // The edge index may have synced uncommitted rows (a rolled-back
@@ -2210,6 +2241,10 @@ export class Store {
       includeArchived?: boolean;
       /** Only archived notes -- backs the archive view / restore flow. */
       archivedOnly?: boolean;
+      /** Only notes carrying ALL of these exact tags. */
+      withTags?: string[];
+      /** Only notes carrying NONE of these exact tags. */
+      withoutTags?: string[];
     } & RangeOpts = {}
   ): {
     notes: NoteRecord[];
@@ -2218,8 +2253,13 @@ export class Store {
     const limit = clampInt(opts.limit, 50, 1, 500);
     const offset = clampInt(opts.offset, 0, 0, Number.MAX_SAFE_INTEGER);
     const range = rangeClause(opts);
+    const tagF = tagClause(opts.withTags, opts.withoutTags);
     // Archived filter: default hides archived; archivedOnly inverts it.
     const archSql = archivedClause(opts.includeArchived, opts.archivedOnly);
+    const extra = [...range.params, ...tagF.params];
+    // SQL LIKE is only a prefilter (tags are a JSON array string); the exact
+    // match is re-checked below so a tag never matches inside another value.
+    const exact = (r: NoteRow): boolean => tagsMatch(r.tags, opts.withTags, opts.withoutTags);
 
     let rows: NoteRow[];
     let total: number;
@@ -2229,37 +2269,37 @@ export class Store {
       const inList = `namespace IN (${opts.namespaces.map(() => "?").join(",")})`;
       rows = this.db
         .prepare(
-          `SELECT * FROM notes WHERE ${inList}${archSql}${range.sql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
+          `SELECT * FROM notes WHERE ${inList}${archSql}${range.sql}${tagF.sql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
         )
-        .all(...opts.namespaces, ...range.params, limit, offset) as unknown as NoteRow[];
+        .all(...opts.namespaces, ...extra, limit, offset) as unknown as NoteRow[];
       total = (
         this.db
-          .prepare(`SELECT COUNT(*) as c FROM notes WHERE ${inList}${archSql}${range.sql}`)
-          .get(...opts.namespaces, ...range.params) as { c: number }
+          .prepare(`SELECT COUNT(*) as c FROM notes WHERE ${inList}${archSql}${range.sql}${tagF.sql}`)
+          .get(...opts.namespaces, ...extra) as { c: number }
       ).c;
     } else if (opts.namespace) {
       rows = this.db
         .prepare(
-          `SELECT * FROM notes WHERE namespace = ?${archSql}${range.sql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
+          `SELECT * FROM notes WHERE namespace = ?${archSql}${range.sql}${tagF.sql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
         )
-        .all(opts.namespace, ...range.params, limit, offset) as unknown as NoteRow[];
+        .all(opts.namespace, ...extra, limit, offset) as unknown as NoteRow[];
       total = (
         this.db
-          .prepare(`SELECT COUNT(*) as c FROM notes WHERE namespace = ?${archSql}${range.sql}`)
-          .get(opts.namespace, ...range.params) as { c: number }
+          .prepare(`SELECT COUNT(*) as c FROM notes WHERE namespace = ?${archSql}${range.sql}${tagF.sql}`)
+          .get(opts.namespace, ...extra) as { c: number }
       ).c;
     } else {
       rows = this.db
         .prepare(
-          `SELECT * FROM notes WHERE 1 = 1${archSql}${range.sql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
+          `SELECT * FROM notes WHERE 1 = 1${archSql}${range.sql}${tagF.sql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
         )
-        .all(...range.params, limit, offset) as unknown as NoteRow[];
+        .all(...extra, limit, offset) as unknown as NoteRow[];
       total = (
-        this.db.prepare(`SELECT COUNT(*) as c FROM notes WHERE 1 = 1${archSql}${range.sql}`).get(...range.params) as { c: number }
+        this.db.prepare(`SELECT COUNT(*) as c FROM notes WHERE 1 = 1${archSql}${range.sql}${tagF.sql}`).get(...extra) as { c: number }
       ).c;
     }
 
-    return { notes: rows.map((r) => this.rec(r)), total };
+    return { notes: rows.filter(exact).map((r) => this.rec(r)), total };
   }
 
   search(
@@ -3266,6 +3306,40 @@ export class Store {
   }
 
   // --- Change feed (v8: change_log) ---------------------------------------
+
+  /** In-process listeners told "something was written" (live wait; see change-wait.ts). */
+  private changeListeners = new Set<() => void>();
+
+  /**
+   * Subscribe to "a write committed in this process". Listeners must be
+   * cheap and must not throw; they only wake a waiter, which then re-reads
+   * the feed itself. Writes from OTHER processes (the CLI) do not call this;
+   * waiters cover those with a slow poll of changeHeadSeq(). Returns the
+   * unsubscribe function.
+   */
+  onChange(fn: () => void): () => void {
+    this.changeListeners.add(fn);
+    return () => {
+      this.changeListeners.delete(fn);
+    };
+  }
+
+  private announceChange(): void {
+    for (const fn of [...this.changeListeners]) {
+      try {
+        fn();
+      } catch {
+        /* a broken listener must never fail a write */
+      }
+    }
+  }
+
+  /** Highest change_log seq (0 when empty): a cheap "did anything change?" probe. */
+  changeHeadSeq(): number {
+    return Number(
+      (this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM change_log").get() as { m: number }).m
+    );
+  }
 
   /** When purgeChangeLog last ran (ms epoch); the feed purges at most hourly. */
   private lastChangeLogPurge = 0;

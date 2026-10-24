@@ -117,11 +117,16 @@ export function createMcpHttpServer(
       // fresh McpServer is built per request here, threading the resolved
       // context in as `opts` is sufficient -- and concurrency-safe, since no
       // state is shared between requests.
-      const server = createMcpServer(store, scope, resolveNsForRequest(principal.namespace));
+      const gone = new AbortController();
+      const server = createMcpServer(store, scope, resolveNsForRequest(principal.namespace), {
+        waitKey: tokenKey(principal.token),
+        signal: gone.signal,
+      });
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
       });
       res.on("close", () => {
+        gone.abort(); // ends any live memory_since wait and frees its slot
         // Runs in an event callback outside the try/catch below; a throw here
         // (e.g. client vanished mid-connect) would be an uncaught exception.
         try {

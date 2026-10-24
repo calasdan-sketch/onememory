@@ -87,6 +87,8 @@ export type ChangesResponse = Omit<ChangesPage, "consumer" | "seq"> & {
    * changes older than that may have been missed.
    */
   markerReset?: true;
+  /** Only with `wait`: the wait ran out with nothing new for this caller. */
+  timedOut?: true;
 };
 
 /**

@@ -132,14 +132,21 @@ async function resolveRecallNamespace(): Promise<NamespaceResolution> {
   }
 }
 
-async function fetchRecentNotes(opts: RecallOptions): Promise<NoteRecord[]> {
+interface RecallData {
+  notes: NoteRecord[];
+  /** Open-task + latest-handoff text ("" when there are none). */
+  board: string;
+}
+
+async function fetchRecentNotes(opts: RecallOptions): Promise<RecallData> {
   const { DB_PATH } = await import("./config.js");
   const { Store } = await import("./store.js");
+  const { listTasks, listHandoffs, buildBoardSummary, TASK_TAG, HANDOFF_TAG } = await import("./tasks.js");
   const limit = clampInt(opts.limit ?? 10, 10, 1, 100);
   const resolution = await resolveRecallNamespace();
   if (resolution.kind === "unresolvable") {
     // Configured-but-unresolvable: fail closed to NOTHING, never unscoped.
-    return [];
+    return { notes: [], board: "" };
   }
   // NOTE on token/scope checks: the hook path deliberately performs none.
   // The recall hook runs as a local subprocess on the operator's own machine
@@ -153,7 +160,20 @@ async function fetchRecentNotes(opts: RecallOptions): Promise<NoteRecord[]> {
     resolution.kind === "resolved" ? resolution.namespace : undefined;
   const store = new Store(opts.dbPath ?? DB_PATH);
   try {
-    return store.list({ namespace, limit }).notes;
+    // Tasks and handoffs get their own section (below), so they are kept
+    // out of the generic recent-notes list instead of appearing twice.
+    const notes = store.list({ namespace, limit, withoutTags: [TASK_TAG, HANDOFF_TAG] }).notes;
+    let board = "";
+    try {
+      const ns = namespace ? [namespace] : undefined;
+      const tasks = listTasks(store, { namespaces: ns, limit: 10 }).tasks;
+      const handoff = listHandoffs(store, { namespaces: ns, limit: 1 })[0] ?? null;
+      board = buildBoardSummary(tasks, handoff);
+    } catch (e) {
+      // The board is a bonus: never let it cost the recent-notes recall.
+      console.error("onememory recall: task board skipped: " + (e as Error).message);
+    }
+    return { notes, board };
   } finally {
     store.close();
   }
@@ -184,8 +204,8 @@ export async function runRecall(opts: RecallOptions = {}): Promise<string> {
       (t as unknown as { unref?: () => void }).unref?.();
     });
 
-    const notes = await Promise.race([fetchRecentNotes(opts), timer]);
-    if (notes === null) {
+    const data = await Promise.race([fetchRecentNotes(opts), timer]);
+    if (data === null) {
       console.error("onememory recall: hard timeout, returning empty context");
       return buildHookOutput("");
     }
@@ -200,7 +220,9 @@ export async function runRecall(opts: RecallOptions = {}): Promise<string> {
     // injection-on-read guard uses so the agent treats notes as data, never
     // instructions. Empty context stays empty (no banner noise for a
     // nothing-to-report hook).
-    const summary = buildSummary(notes);
+    const recent = buildSummary(data.notes);
+    let summary = [data.board, recent].filter(Boolean).join("\n\n");
+    if (summary.length > RECALL_MAX_CHARS) summary = summary.slice(0, RECALL_MAX_CHARS - 1) + "…";
     return buildHookOutput(summary ? UNTRUSTED_BANNER + summary : "");
   } catch (e) {
     console.error("onememory recall failed: " + (e as Error).message);
