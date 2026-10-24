@@ -15,7 +15,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { runnerStatus, runnerNotice, staleAfterSeconds, clearRunnerStatusCache } from "../src/liveness.js";
+import { runnerStatus, runnerNotice, staleAfterSeconds, clearRunnerStatusCache, pruneStaleHeartbeats, heartbeatPruneDays } from "../src/liveness.js";
 import { createMcpServer } from "../src/mcp-server-core.js";
 import { createApiServer } from "../src/api.js";
 
@@ -540,5 +540,90 @@ describe("runner status: recall hook, CLI, dashboard", () => {
     const body = src.slice(i, src.indexOf("\n}", i));
     assert.match(body, /textContent/);
     assert.doesNotMatch(body, /innerHTML/);
+  });
+});
+
+describe("runner status: 1.4.1 review fixes", () => {
+  let store: Store;
+  const keep = { prune: process.env.ONEMEMORY_RUNNER_HEARTBEAT_PRUNE_DAYS, ns: process.env.ONEMEMORY_RUNNER_TASK_NAMESPACE, id: process.env.ONEMEMORY_RUNNER_ID };
+  beforeEach(() => {
+    store = new Store(":memory:");
+    for (const k of ["ONEMEMORY_RUNNER_HEARTBEAT_PRUNE_DAYS", "ONEMEMORY_RUNNER_TASK_NAMESPACE", "ONEMEMORY_RUNNER_ID"]) delete process.env[k];
+  });
+  afterEach(() => {
+    store.close();
+    for (const [k, v] of [["ONEMEMORY_RUNNER_HEARTBEAT_PRUNE_DAYS", keep.prune], ["ONEMEMORY_RUNNER_TASK_NAMESPACE", keep.ns], ["ONEMEMORY_RUNNER_ID", keep.id]] as const) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  test("a runner that NEVER sent a heartbeat still raises the notice for commands waiting on it", () => {
+    approvedTask(store, "tasks");
+    const s = runnerStatus(store);
+    assert.equal(s.runner.state, "never_seen");
+    assert.equal(s.waiting_total, 1, "the command is not silently invisible");
+    assert.ok(s.notice && /no heartbeat seen/.test(s.notice), `notice: ${s.notice}`);
+    assert.doesNotMatch(s.notice!, new RegExp(SECRET_WORD), "the notice never carries command text");
+    const t = s.targets.find((x: any) => x.target === "pc-1");
+    assert.equal(t?.state, "never_seen");
+    assert.equal(t?.namespace_unconfirmed, true);
+    // once the runner reports its namespace, the flag goes away and other namespaces stop counting
+    heartbeat(store, 5 * 3600, { runner: "pc-1", ns: "tasks" });
+    const s2 = runnerStatus(store);
+    assert.equal(s2.targets.find((x: any) => x.target === "pc-1")?.namespace_unconfirmed, undefined);
+    approvedTask(store, "elsewhere");
+    assert.equal(runnerStatus(store).waiting_total, 1, "elsewhere is not pc-1's namespace");
+  });
+
+  test("a namespace-pinned caller sees only its own namespaces' waiting commands, not runner host names", () => {
+    heartbeat(store, 5 * 3600, { runner: "pc-1", ns: "tasks" });
+    heartbeat(store, 5, { runner: "secret-box", ns: "private-ns", writer: "runner" });
+    approvedTask(store, "tasks");
+    const open = runnerStatus(store);
+    assert.ok(open.targets.some((t: any) => t.target === "secret-box"));
+    const pinned = runnerStatus(store, ["other-ns"], undefined, { pinned: true });
+    assert.equal(pinned.waiting_total, 0);
+    assert.ok(!JSON.stringify(pinned).includes("secret-box"), JSON.stringify(pinned));
+    assert.ok(!JSON.stringify(pinned).includes("private-ns"));
+    const mine = runnerStatus(store, ["tasks"], undefined, { pinned: true });
+    assert.equal(mine.waiting_total, 1);
+    assert.ok(!JSON.stringify(mine).includes("secret-box"));
+  });
+
+  test("heartbeat notes of runner ids that stopped beating are pruned after a configurable age; live ones are kept", () => {
+    // one note per runner id, exactly as the runner writes them ("runner heartbeat: <id>")
+    const beat = (runner: string, ageSec: number): number => {
+      const n = store.create(
+        { namespace: "runner", title: `runner heartbeat: ${runner}`, body: JSON.stringify({ kind: "heartbeat", alive_at: new Date(Date.now() - ageSec * 1000).toISOString(), runner }), tags: ["heartbeat"] },
+        { writtenBy: "runner" }
+      );
+      backdate(store, n.id, ageSec);
+      return n.id;
+    };
+    const fresh = beat("pc-live", 60);
+    const old = beat("old-container-7f3a", 40 * 86400);
+    assert.equal(pruneStaleHeartbeats(store, 30), 1);
+    assert.ok(store.read(fresh));
+    assert.equal(store.read(old), null);
+    // configurable: 0 = never prune; env var read by heartbeatPruneDays()
+    beat("ancient", 400 * 86400);
+    process.env.ONEMEMORY_RUNNER_HEARTBEAT_PRUNE_DAYS = "0";
+    assert.equal(heartbeatPruneDays(), 0);
+    assert.equal(pruneStaleHeartbeats(store), 0);
+    process.env.ONEMEMORY_RUNNER_HEARTBEAT_PRUNE_DAYS = "90";
+    assert.equal(heartbeatPruneDays(), 90);
+    assert.equal(pruneStaleHeartbeats(store), 1);
+    delete process.env.ONEMEMORY_RUNNER_HEARTBEAT_PRUNE_DAYS;
+    assert.equal(heartbeatPruneDays(), 30);
+  });
+
+  test("the runner id and task namespace are read from the environment in ONE place", async () => {
+    const task = await import("../src/task-core.js");
+    process.env.ONEMEMORY_RUNNER_ID = "box-9";
+    process.env.ONEMEMORY_RUNNER_TASK_NAMESPACE = "jobs";
+    assert.equal(task.envRunnerId(), "box-9");
+    assert.equal(task.envRunnerTaskNamespace(), "jobs");
+    assert.equal((task as any).waitingCommandTasks, undefined, "the dead helper is gone");
   });
 });

@@ -830,6 +830,10 @@ describe("I: migration backup", () => {
       assert.match(doc.stdout + doc.stderr, /pre-upgrade|pre-v14/i, doc.stdout + doc.stderr);
       const bak = path + ".pre-v14-backup";
       assert.ok(existsSync(bak));
+      const enc = run("encrypt", "enable");
+      assert.equal(enc.status, 0, enc.stderr + enc.stdout);
+      assert.match(enc.stdout, /PLAINTEXT/);
+      assert.match(enc.stdout, /prune-premigration/);
       const pr = run("backup", "--prune-premigration", "--out", join(dir, "out"));
       assert.equal(pr.status, 0, pr.stderr + pr.stdout);
       assert.ok(!existsSync(bak), "the pre-upgrade copy was removed");
@@ -873,3 +877,28 @@ describe("backup: --include-attest-key", () => {
     }
   });
 });
+
+describe("L: CLI help", () => {
+  test("`trust --help` and `trust help` print the actions and exit 0; an unknown action prints them and exits 1", () => {
+    const dir = mkdtempSync(join(tmpdir(), "om-help-"));
+    try {
+      const env = { ...process.env, ONEMEMORY_DB_PATH: join(dir, "db", "state.db"), ONEMEMORY_HOME: join(dir, "home") };
+      const run = (...a: string[]) => spawnSync(process.execPath, [CLI, "trust", ...a], { env, encoding: "utf8", timeout: 60000 });
+      for (const flag of ["--help", "help", "-h"]) {
+        const r = run(flag);
+        assert.equal(r.status, 0, `${flag}: ${r.stderr}`);
+        for (const word of ["attester-add", "distrust", "export-key", "rotate", "--not-after"]) assert.ok(r.stdout.includes(word), `${flag} lacks ${word}`);
+      }
+      assert.ok(!existsSync(join(dir, "db")), "asking for help does not create a database");
+      const bad = run("frobnicate");
+      assert.equal(bad.status, 1);
+      assert.match(bad.stderr + bad.stdout, /attester-add/);
+      const extra = run("distrust", "alice", "stray-arg", "another");
+      assert.equal(extra.status, 1);
+      assert.match(extra.stderr, /quote|Unexpected/i);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+

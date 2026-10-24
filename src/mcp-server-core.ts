@@ -107,7 +107,7 @@ const WRITER_FILTER_SHAPE = {
     .string()
     .optional()
     .describe(
-      "Skip notes this writer touched (their last writer, a verified original author carried in by an import, or a writer whose notes a consolidation merged) (e.g. your own label to ignore your own writes, or a client you do not trust). Rows from before schema v13 have an unknown writer ('') and are not excluded. On memory_since / memory_ack the filter matches each change's own writer (the note may have been changed by someone else since: see `note_written_by` on each entry)."
+      "Skip notes this writer touched: their last writer, an EARLIER content writer (a rewrite keeps the previous hands on record), a verified or claimed original author carried in by an import, or a writer whose notes a consolidation merged (e.g. your own label to ignore your own writes, or a client you do not trust). Rows from before schema v13 have an unknown writer ('') and are not excluded. On memory_since / memory_ack the filter matches each change's own writer (the note may have been changed by someone else since: see `note_written_by` on each entry)."
     ),
 };
 /** Filters on the NOTE's current writer, for the change feed (whose written_by/not_written_by match the change's own writer). */
@@ -119,7 +119,7 @@ const NOTE_WRITER_SHAPE = {
   not_note_written_by: z
     .string()
     .optional()
-    .describe("Skip changes to notes whose current writer is this."),
+    .describe("Skip changes to notes this writer touched (the exclusion form: also notes they wrote earlier, before someone else rewrote them, or whose text a merge took from them). note_written_by, by contrast, matches only the CURRENT writer."),
 };
 type WriterFilterArgs = { writtenBy?: string; notWrittenBy?: string; includeDistrusted?: boolean };
 function writerFilterArgs(written_by?: string, not_written_by?: string, include_distrusted?: boolean): WriterFilterArgs {
@@ -1342,7 +1342,8 @@ export function createMcpServer(
         "(unless the approval expires first). Counts and ages only, never command text (task_get shows that). " +
         "The runner's liveness comes from the server's own timestamp of its heartbeat note (only a note written by the runner process counts); " +
         "it is a good hint, not a cryptographic proof (a human can check a signed result on the sign page). Only commands addressed to that runner, " +
-        "in the namespace it serves, are counted." +
+        "in the namespace it serves, are counted. The result lists `targets`: one entry per runner id (its state, age and the commands waiting for exactly that runner); " +
+        "a target that never sent a heartbeat is listed with `namespace_unconfirmed: true` and counted in the command's own namespace." +
         (nsActive ? " The `namespace` parameter is an untrusted hint: only readable namespaces are counted." : ""),
       inputSchema: {
         namespace: z.string().optional().describe(nsActive ? "Untrusted hint: restrict to this namespace." : "Restrict to this namespace."),

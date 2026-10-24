@@ -213,9 +213,10 @@ export function distrustSql(
       parts.push(`(${cols.attBy} = ? AND ${cols.attWriter} = ?)`);
       gp.push(f.sid, f.label);
     }
-    for (const t of tokens) {
-      parts.push(mergedHasSql(cols.merged));
-      gp.push(JSON.stringify(t), t);
+    if (tokens.size) {
+      // One cheap emptiness test guards every token probe: nearly every row has no merged writers.
+      parts.push(`(${cols.merged} <> '' AND (${[...tokens].map(() => mergedHasSql(cols.merged)).join(" OR ")}))`);
+      for (const t of tokens) gp.push(JSON.stringify(t), t);
     }
     if (!parts.length) continue;
     const any = `(${parts.join(" OR ")})`;

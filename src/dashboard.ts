@@ -167,6 +167,11 @@ function loadRunner(){
   }).catch(function(){ el.style.display = "none"; });
 }
 
+// "distrusted" needs an admin token: the server refuses it for any other (403); untick the box so the next load works.
+function incRefused(e){
+  if(inc() && /admin/i.test(String(e && e.message))){ document.getElementById("inc").checked = false; }
+}
+
 function load(){
   loadRunner();
   var q = document.getElementById("q").value.trim();
@@ -176,7 +181,7 @@ function load(){
   if(q){ path = "/search?q=" + encodeURIComponent(q) + (qs?("&"+qs):""); }
   else { path = "/notes" + (qs?("?"+qs):""); }
   api(path).then(function(j){ render(j.results || j.notes || []); })
-    .catch(function(e){ document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
+    .catch(function(e){ incRefused(e); document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
 }
 
 function loadChanges(){
@@ -199,7 +204,7 @@ function loadChanges(){
     }).join("");
     document.getElementById("list").innerHTML = "<div class='row'>"+srcs+"</div>" +
       (rows || "<p class='muted'>Nothing changed in the last 24 hours.</p>");
-  }).catch(function(e){ document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
+  }).catch(function(e){ incRefused(e); document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
 }
 
 function addNote(){
