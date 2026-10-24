@@ -8,6 +8,8 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.2.1] - 2026-10-24
 
+**Package renamed:** published on npm as `onememory` (previously `onememory-mcp`, whose earlier releases were withdrawn). The command is still `onememory`.
+
 Hardening and honesty release from an independent multi-reviewer pass over
 1.2.0 (crypto and namespaces, data and retention, retrieval and MCP, docs and
 release). Docs were corrected to match what actually ships.

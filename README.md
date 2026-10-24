@@ -3,7 +3,7 @@
 **One small, self-hosted memory store that every AI agent you use can share — over MCP or plain REST, from your desktop, the web, or your phone.**
 
 [![CI](https://github.com/calasdan-sketch/onememory/actions/workflows/ci.yml/badge.svg)](https://github.com/calasdan-sketch/onememory/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/onememory-mcp)](https://www.npmjs.com/package/onememory-mcp)
+[![npm](https://img.shields.io/npm/v/onememory)](https://www.npmjs.com/package/onememory)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Node](https://img.shields.io/badge/node-%3E%3D24-green)
 
@@ -21,7 +21,7 @@ that speaks MCP or HTTP.
 > `node -v`. Can't upgrade? Use [Docker](#docker) instead.
 
 ```bash
-npm i -g onememory-mcp                           # 1. install
+npm i -g onememory                           # 1. install
 claude mcp add onememory -- onememory mcp        # 2. wire it into Claude Code (stdio)
 onememory doctor                                 # 3. verify Node, database, token
 ```
@@ -31,7 +31,7 @@ and in a fresh chat ask "what port is my staging server on?". Step 4, only
 if you want the dashboard, REST API and MCP-over-HTTP (the `curl` examples
 below need it): `onememory start`.
 
-No global install: `claude mcp add onememory -- npx -y onememory-mcp mcp`.
+No global install: `claude mcp add onememory -- npx -y onememory mcp`.
 `onememory init` prints the config for Claude Desktop / Cursor / Copilot;
 [INSTALL.md](./INSTALL.md) has every client.
 
@@ -60,18 +60,7 @@ database. On macOS/Linux the folder is owner-only (`0700`, files `0600`).
 A from-source git checkout that already has `./data/state.db` keeps using
 it. `onememory doctor` shows which directory is in use.
 
-**Upgrading from 1.0.x**, whose data sat inside the package: `npm install -g
-onememory-mcp` copies the old `data/state.db` and token files into
-`~/.onememory` before npm removes the old version (and a first start that
-still finds them copies them too), printing what it did. To be safe, copy
-them yourself **before** upgrading (stop the server first):
-
-```bash
-mkdir -p ~/.onememory && cp -Rn "$(npm root -g)/onememory-mcp/data/." ~/.onememory/
-```
-
-(Windows: copy `%APPDATA%\npm\node_modules\onememory-mcp\data\*` to
-`%USERPROFILE%\.onememory\`.) Then run `onememory rebuild-edges` once.
+**Upgrading from an early 1.0.x install** (data kept inside the package folder): copy it yourself before removing the old package, e.g. `mkdir -p ~/.onememory && cp -Rn "$(npm root -g)/onememory-mcp/data/." ~/.onememory/` (Windows: `%APPDATA%\npm\node_modules\onememory-mcp\data\*` to `%USERPROFILE%\.onememory\`), then run `onememory rebuild-edges` once.
 
 ### Docker
 

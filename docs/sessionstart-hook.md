@@ -41,9 +41,9 @@ installed it, and verify it (next section) before wiring the hook:
 
 | Install path | Hook command to use |
 |---|---|
-| `npm i -g onememory-mcp` | `onememory recall --budget-ms 800` -- **only if** `command -v onememory` prints a path (npm's global bin dir must be on your PATH; check that `$(npm prefix -g)/bin` is on your PATH; `npm bin -g` was removed in npm 9+) |
+| `npm i -g onememory` | `onememory recall --budget-ms 800` -- **only if** `command -v onememory` prints a path (npm's global bin dir must be on your PATH; check that `$(npm prefix -g)/bin` is on your PATH; `npm bin -g` was removed in npm 9+) |
 | Source checkout | `node /abs/path/to/onememory/dist/src/cli.js recall --budget-ms 800` (absolute path; run `npm run build` first) |
-| npx (no install) | `npx -y onememory-mcp recall --budget-ms 800` (adds startup latency; prefer a real install) |
+| npx (no install) | `npx -y onememory recall --budget-ms 800` (adds startup latency; prefer a real install) |
 | Docker only | The hook runs on your **host**, not in the container -- use one of the rows above, pointed at the same SQLite file (`ONEMEMORY_DB_PATH`), or `docker exec <container> node dist/src/cli.js recall` |
 
 If the command from your row doesn't work in a fresh terminal, the hook

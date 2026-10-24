@@ -1,5 +1,5 @@
 {
-  "name": "onememory-mcp",
+  "name": "onememory",
   "version": "1.2.1",
   "description": "OneMemory — one self-hosted SQLite memory store shared across your AI agents over MCP and a plain REST API, reachable from desktop, web, and your phone.",
   "license": "MIT",

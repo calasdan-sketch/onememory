@@ -259,7 +259,7 @@ async function init(): Promise<void> {
     JSON.stringify({ mcpServers: { onememory: { command: "onememory", args: ["mcp"] } } }, null, 2)
   );
   console.log(
-    "\nNot installed globally? Use npx instead: command \"npx\", args [\"-y\", \"onememory-mcp\", \"mcp\"]."
+    "\nNot installed globally? Use npx instead: command \"npx\", args [\"-y\", \"onememory\", \"mcp\"]."
   );
   console.log("See INSTALL.md for every client, and INFRA.md to reach your phone.");
 }
