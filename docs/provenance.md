@@ -4,17 +4,31 @@ One memory that every agent reads means whatever one agent writes, the next one
 trusts. Since 1.3.3 a note says which connection wrote it, and the writer cannot
 fake that.
 
-## The fields
+## The fields (glossary)
 
-| Field | Set by | Meaning |
-|---|---|---|
-| `written_by` | **the server** | who last changed the note's **content** (title or body): see below |
-| `created_by` | **the server** | the first writer; never changes on update |
-| `writer_id` | **the server** | `<server_id>/<written_by>`: the label plus the id of the database that minted it (1.4.0, additive; see [trust.md](./trust.md)) |
-| `imported_written_by` | the import payload | only on a restored note: who the *payload claimed* wrote it. Unverified. |
-| `attested_writer`, `attested_by` | a **verified** signature | only on an imported note whose attestation checked out against a trusted key: the original author and the server that vouched for it (1.4.0) |
-| `merged_from_writers` | **the server** | on a consolidated note: the distinct writers of the notes merged into it. Stored for good since 1.4.0 |
-| `source` | **the client** | free text. A claim, not a fact. |
+Seven writer-related fields exist because they answer seven different questions. The table is the
+whole truth: who sets each, when it changes, and whether a distrust rule or `not_written_by` looks at it.
+
+| Field | Question it answers | Set by | Changes when | Distrust rule / `not_written_by` |
+|---|---|---|---|---|
+| `written_by` | who last changed the **content** (title or body)? | the server, from the token label or process marker | every content edit (not tags, status, archive); a merge | yes (current writer) |
+| `created_by` | who first wrote it? | the server | never | no, on its own (kept for display and audit) |
+| `writer_id` | which database minted that label? `<server_id>/<written_by>` | derived | with `written_by` | the id form of a rule uses it |
+| `merged_from_writers` | whose hands has the content passed through? (the **taint set**) | the server: merge sources, every earlier content writer, claimed names from an import | **only grows**; survives edits and exports | yes: any listed name matches |
+| `attested_writer`, `attested_by` | the original author a **verified** signature vouched for, and the vouching server | an import whose attestation verified against a trusted key | cleared by a later content edit (the previous values move into the taint set) | yes |
+| `imported_written_by`, `imported_created_by` | what a file or payload **claimed** | the import payload (unverified) | never | adds taint at import time (copied into `merged_from_writers`); the field itself is display only |
+| `source` | what the client says it is | the client (free text) | any edit | no (a claim) |
+
+**Why these were not collapsed into one `touched_by` set (reviewed in 1.4.1).** The taint set *is* the
+single thing a policy needs, and the three matchers read nothing else in practice. But
+`written_by` and the attested pair have jobs of their own that a set cannot do: `written_by` is "who
+holds the content now" (the `written_by` / `note_written_by` filters, the WHO WROTE THIS banner, and
+the stamp the runner trusts for heartbeats), and the attested pair is a *verified* author that a
+signature covers byte for byte. Folding them would change the shape of every API result and the
+signed record, and need a migration over every row and change-log entry. 1.4.1 keeps the shapes
+(additive changes only), makes the taint set complete (earlier writers and claims are in it), and
+documents the table above. A future major version can collapse the display fields once clients stop
+reading them.
 
 ### Exactly what `written_by` means
 
@@ -25,8 +39,8 @@ restore, or an edit of `source`. Who made such a change is recorded in the chang
 (`change_log.actor`), not in `written_by`. So an admin tagging an untrusted agent's note does not
 become its author, and `not_written_by=<untrusted agent>` keeps hiding it. A merge made by
 `memory_consolidate` is stamped with whoever ran the merge (its sources are deleted), and the
-note stores `merged_from_writers` (the sources' distinct writers, since 1.4.0; before it was returned once and
-not stored). `not_written_by=<a source's writer>` therefore treats the merged note as touched by that writer
+note stores `merged_from_writers` (the sources' distinct writers; since 1.4.1 also every earlier content writer
+of the note, so a rewrite never clears them). `not_written_by=<a source's writer>` therefore treats the merged note as touched by that writer
 and hides it, and a distrust rule on that writer hides it too. The task *text* is the content: editing a task's title, next step, notes or command
 changes `written_by`, and the approval is voided anyway.
 

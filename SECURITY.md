@@ -53,16 +53,31 @@ content as untrusted input to your agents** — see "Memory safety" below.
   mitigated, not eliminated (OWASP GenAI #1); there is no OAuth, only static
   bearer tokens.
 
-## Writer trust (1.4.0)
+## Writer trust (1.4.0, hardened in 1.4.1)
 
 A note's `written_by` is stamped by the server from the authenticated token; an admin can put a writer on a
-per-namespace distrust list that every read path honours, and a JSON export carries Ed25519 attestations so a
-server you chose to trust can vouch for a note's original author. Read [docs/trust.md](./docs/trust.md) for
-exactly what this proves and does not: it is a policy on labels, not protection against the operator; a trusted
-server can still export a hostile note; attestations have no freshness or revocation; `.attest-key` must be
-protected like the encryption key; and a writer who obtains a new token under a new label is not on the list.
-Heartbeats from runners older than 1.3.4 are no longer believed by default (`ONEMEMORY_RUNNER_ACCEPT_LEGACY=1`
-restores the old behaviour).
+per-namespace distrust list that every read path honours (through one gate, with a guard test), and a JSON export
+made with `--attest` / `?attest=1` carries Ed25519 attestations so a server you chose to trust can vouch for a
+note's original author. Read [docs/trust.md](./docs/trust.md) for exactly what this proves and does not.
+
+- A distrusted writer's content **stays hidden** after anyone else edits it (the taint set only grows); only the
+  admin lifting the rule shows it again. `include_distrusted` is admin-only on every surface.
+- A trusted key is **pinned to one `server_id`** (an unpinned key needs an explicit `--any-server`), can carry a
+  `not_after`, and is rotated with `onememory trust rotate`. Version-2 attestations also sign `created_at`,
+  `source`, `expires_at`, `archived_at`, `rev` and the export time.
+- **Replay:** an old export stays validly signed. Replaying it into a server that trusts the key restores the old
+  content (with its old provenance); `not_after` retires a whole key, but there is no per-note freshness.
+  Import only files you hold, and treat `exported_at` as the signer's claim of when it exported.
+- `.attest-key` is the identity: protect it like the encryption key and **do not keep the data directory in a
+  synced folder** (Dropbox, iCloud, OneDrive copy it to every device). It is re-tightened to 0600 at every start and
+  left out of `onememory backup` unless you pass `--include-attest-key`.
+- It is a policy on labels, not protection against the operator; a trusted server can still export a hostile
+  note; and a writer who obtains a new token under a new label is not on the list.
+- Heartbeats from runners older than 1.3.4 are no longer believed by default (`ONEMEMORY_RUNNER_ACCEPT_LEGACY=1`
+  restores the old behaviour). A heartbeat counts only if the runner process wrote it and its own `alive_at` agrees
+  with the server's clock within two minutes, so a tag-only touch of an old heartbeat does not make it fresh.
+- Pre-upgrade copies (`<db>.pre-v14-backup`) are plaintext snapshots: remove them
+  (`onememory backup --prune-premigration`) once the upgrade is checked, especially before enabling encryption.
 
 ## Encryption at rest (shipped in 1.2.0)
 

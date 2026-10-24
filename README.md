@@ -271,11 +271,12 @@ banner, the session-start recall names the writer, and `state_list`, `state_sear
 ignore its own writes or distrust a client. Rows from before 1.3.3 read `""` (unknown).
 Details and limits: [docs/provenance.md](./docs/provenance.md).
 
-**Trust (1.4.0).** `writer_id` (`<server_id>/<label>`) says which server a label came from. An admin can put a
+**Trust (1.4.0, hardened in 1.4.1).** `writer_id` (`<server_id>/<label>`) says which server a label came from. An admin can put a
 writer on a per-namespace **distrust list** (`onememory trust distrust <writer> --namespace work`, the
 `trust_policy` MCP tool, `/trust` REST): its notes, tasks, handoffs and feed entries are then left out of every
-read path unless a reader passes `include_distrusted`, and a distrusted command task is never run. A JSON
-export carries a per-note Ed25519 **attestation**; an import that trusts the exporting server's key keeps the
+read path unless an **admin** passes `include_distrusted`, they stay hidden after anyone else edits them, and a
+distrusted command task is never run. A JSON export made with `--attest` (`?attest=1`; the default export is the
+plain `{"notes": [...]}` as in 1.3.x) carries a per-note Ed25519 **attestation**; an import that trusts the exporting server's key keeps the
 original author as `attested_writer`, otherwise it flattens provenance as before. What that proves and what it
 does not: [docs/trust.md](./docs/trust.md).
 

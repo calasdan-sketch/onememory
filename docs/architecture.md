@@ -79,6 +79,9 @@ immediately visible through the others:
 - **`src/attest.ts`** — the Ed25519 signing key, the canonical attestation record, sign and verify.
 - **`src/task-core.ts`** — the command-task queue rule shared by the runner and `runner_status` (no runner code,
   so the server can use it). `src/liveness.ts` builds on it (no import cycle).
+- **`src/trust.ts`, `src/attest.ts`** — the distrust rule matchers (one JS, one SQL, tested to agree), writer ids, and
+  the Ed25519 export attestations ([trust.md](./trust.md)). `Store.readVisible` / `filterVisible` are the one gate
+  every by-id and set read goes through (`test/trust-gate-guard.test.ts` enforces it).
 - **`src/sync.ts`** — Markdown export / three-way import.
 - **`src/start.ts`** — boots the API/dashboard **and** the MCP-over-HTTP
   endpoint in one process on a single store (what `npm start`, the CLI, and
@@ -109,6 +112,7 @@ immediately visible through the others:
 | `memory_consolidate` | admin | Merge 2+ notes (`dry_run`, `keep_sources`) |
 | `memory_rebuild_edges` | admin | Rebuild the similarity graph (confirmation gate above 2,000 notes) |
 | `memory_quarantine` | admin | List / approve / reject writes the memory linter held ([memory-linter.md](./memory-linter.md)) |
+| `trust_policy` | admin | The distrust list and the trusted export signers: `list`, `distrust`, `undistrust`, `add_attester`, `remove_attester`. A namespace-pinned admin sees and changes only its own namespace's rules ([trust.md](./trust.md)) |
 
 ## HTTP API
 
@@ -156,6 +160,7 @@ ways. The rules, so you can guess the other side:
   `memory_*` are store-level views and maintenance (`memory_since`,
   `memory_stats`, `memory_ack`), `task_*` and `session_handoff` / `catch_up`
   are the task board. New tools follow `task_*` / `memory_*`; nothing is renamed.
+`GET /runner/status` mirrors the `runner_status` tool (read scope; per-runner `targets`, counts and ages, never command text). `GET /trust`, `POST /trust/distrust`, `DELETE /trust/distrust`, `POST /trust/attesters` and `DELETE /trust/attesters/:key_id` are the admin-only REST side of `trust_policy` ([trust.md](./trust.md)); `GET /export?attest=1` adds signatures (the default is the plain `{"notes": [...]}`). `include_distrusted` on any read route is admin-only (403 otherwise).
 `POST /notes/:id/archive` and `POST /notes/:id/restore` soft-forget and bring back a note by id; `POST /sweep-expired` archives every note past its TTL (all three are admin scope; see [encryption-retention.md](./encryption-retention.md)).
 `POST /notes` and `PUT /notes/:id` answer `202 { quarantined: { id, reasons } }`
 when the memory linter holds the write, and add a `warnings` array under
@@ -173,5 +178,9 @@ similarity edges, v5 `_meta` + gated FTS trigger, v6 edge indexes, v7
 (+ triggers; replaces the 1.1.0-rc `note_tombstones`) and
 `quarantine.set_namespace`, v12 `change_log.actor`, v13 `notes.written_by` /
 `created_by` / `imported_written_by` (+ `change_log.written_by`,
-`quarantine.written_by`; see [provenance.md](./provenance.md)). There is no downgrade path: once a 1.1.0 binary
+`quarantine.written_by`; see [provenance.md](./provenance.md)), v14 (1.4.0) `notes.attested_writer` / `attested_by` /
+`merged_from_writers` (+ the matching `change_log.note_*` columns) and three tables: `trust_distrust` (the distrust
+rules, per namespace), `trust_attesters` (trusted export signers: key, pinned `server_id`, `label`, optional
+`not_after`) and `trust_log` (who changed the policy; newest 1000 rows kept); see [trust.md](./trust.md). Opening a
+v1-v13 database first writes a verified `<db>.pre-v14-backup`. There is no downgrade path: once a 1.1.0 binary
 has opened a database, don't go back to 1.0.x.

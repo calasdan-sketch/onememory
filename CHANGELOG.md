@@ -6,6 +6,101 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-10-24
+
+A second expert review of 1.4.0 (coding, security, architecture, developer experience, infrastructure) found
+real holes in the trust feature. All are fixed here; schema is **unchanged at v14** (an idempotent
+`trust_attesters.not_after` column is added on open). Result shapes only gained fields.
+
+### Security
+- **Distrust can no longer be laundered.** `merged_from_writers` is now a monotonic *taint set*: a content
+  rewrite adds the previous writer (and the attested author it carried) instead of dropping them, an import
+  folds the file's claimed names into it, and a verified attestation's earlier hops stay. A trusted writer
+  editing, tagging or re-exporting a distrusted writer's note leaves it hidden; stripping the attestation,
+  deleting the attester or losing a key cannot remove taint. (Only lifting the rule shows it again.)
+- **One gate for reads by id.** `Store.readVisible` / `filterVisible` are used by `GET /notes/:id`, `PUT`,
+  archive/restore, `state_read`, `state_write` by id, `task_get`, the consolidation candidates and the janitor.
+  A tags-only update of a hidden note no longer echoes its body (404 for non-admins). New
+  `test/trust-gate-guard.test.ts` fails if a new GET route, MCP tool or raw store read is added unclassified
+  and runs a canary note through every classified route.
+- **The janitor and `memory_consolidate`** never merge a distrusted note into a trusted one (the pool excludes
+  hidden notes; a mixed manual merge is refused).
+- **`client_key` replay** (`task_put`, `session_handoff`) can no longer return, or be blocked by, a distrusted
+  writer's task or handoff; `task_put` by id refuses a hidden task.
+- **`include_distrusted` is admin-only** on REST (403), MCP (error), the CLI flags that need it and the
+  dashboard (which unticks its box). A namespace-pinned admin sees only its own rules, trust-log lines and
+  runner targets, never the attester list. Rules are capped per namespace (50) as well as in total (500); the
+  trust log keeps its newest 1000 rows.
+- **The markdown vault export** skips distrusted notes (and prunes their older files); `--include-distrusted`
+  writes them marked `distrusted: true`. A vault file's `origin_writer` joins the taint set.
+- **Attestations:** a trusted key is now **pinned** to one `server_id` (`attester-add` requires `--server-id`,
+  or an explicit `--any-server` that is flagged everywhere and logged); an unpinned key cannot claim this
+  database's own id; `server_id` in an attestation must be a UUID; `--not-after` retires a key; a
+  `ONEMEMORY_TRUSTED_ATTESTERS` entry needs `<server_id>=<key>` (or the JSON form), a bare key is refused and
+  logged. **Version-2 attestations** also sign `created_at`, `source`, `expires_at`, `archived_at`, `rev` and
+  the export time; version-1 attestations from 1.4.0 still verify. The verifier caches parsed public keys.
+- **Runner heartbeat forgery:** a tag-only edit (or any non-heartbeat write) by the `runner` label no longer
+  refreshes liveness: the body's own `alive_at` must agree with the server stamp within 120 s, and a
+  `runner` note without a valid body is ignored. A *future* `alive_at` is still never believed.
+- **Import robustness:** a corrupt `.attest-key`, or a key location that cannot be created, no longer fails an
+  import of unsigned notes; the CLI strips terminal escapes and control characters from every string it
+  prints out of an import file and never builds a suggested command from file text.
+
+### Changed
+- **`GET /export` and `onememory export --format json` are back to the 1.3.x shape by default**:
+  `{"notes": [...]}`, byte for byte. The header and signatures are opt-in: `?attest=1` / `--attest`
+  (`--no-attest` and `?attest=0` are accepted no-ops). `POST /import` and `import --file` read the plain
+  object, the attested envelope and a bare array. *(1.4.0 had made the envelope the default and described
+  `?attest=0` wrongly; see the correction in that entry.)*
+- `not_written_by` / `not_note_written_by` now also skip notes the writer touched earlier (the taint set), which
+  is what an exclusion filter is for; `written_by` / `note_written_by` still match only the current writer.
+- `parseWriterRef` split a `<server_id>/<label>` after truncating the whole string, so a label of about 64+
+  characters lost its server id; the id is now split first and the label normalised like a stored `written_by`.
+  Rules that can never match (an empty label, a bare server id) are refused. SQL and JS matching agree on
+  quotes, backslashes, unicode and case (tested pairwise).
+- **Faster policy checks.** The distrust predicate lost its `COALESCE` wrapper (every column it reads is
+  `NOT NULL`) and probes the taint set only on rows that have one. On a 300,000-note database, `list` with 100
+  rules went from 4267 ms to 659 ms, `/changes` from 5101 ms to 1458 ms; with 10 rules 811 to 378 ms and
+  1317 to 929 ms; with no rules nothing changed (74 ms / 577 ms).
+- **Runner status:** a runner that never sent a heartbeat now raises the "no heartbeat seen" notice for the
+  commands addressed to it (its namespace is unknown, so they count in their own namespace and the target
+  carries `namespace_unconfirmed: true`). Heartbeat notes of runner ids silent for 30 days are pruned
+  (`ONEMEMORY_RUNNER_HEARTBEAT_PRUNE_DAYS`, `0` = never). Removed the dead `waitingCommandTasks` helper and the
+  duplicate runner-id/namespace readers.
+- `trust --help` prints help; `trust` rejects stray arguments (an unquoted `--namespace *` that the shell
+  expanded) with a hint; `trust list` no longer creates a signing key; `trust export-key --out` and
+  `trust rotate` are new; `attester-add --not-after`; a value flag no longer swallows a following known flag.
+- `runner_status` and `not_written_by` tool descriptions say what they now do.
+
+### Migration and backup
+- The pre-upgrade copy is written to `<db>.pre-v14-backup.<pid>.partial`, checked (size, schema version, note
+  count, integrity) and only then renamed; a crash leaves a sweepable `.partial`, never a truncated backup. A
+  valid existing copy is kept, an empty or truncated one replaced. The disk space is checked first. The
+  rollback text says to **move** the file back.
+- `onememory doctor` reports the copies (size, age) and the key file mode; `onememory backup
+  --prune-premigration` removes them; `onememory encrypt enable` warns that earlier copies are plaintext.
+- `onememory backup --include-attest-key` (the key is left out, with a message, otherwise). Restoring a database
+  without its key mints a new one and says so. `.attest-key`, `ONEMEMORY_ATTEST_KEY_FILE` and the pre-upgrade
+  copies are re-tightened to 0600 at every start.
+
+### Docs and tests
+- docs/trust.md, provenance.md (a field glossary: which field answers which question, who sets it, whether
+  distrust reads it, and why the fields were not collapsed), configuration.md (the real
+  `ONEMEMORY_TRUSTED_ATTESTERS` format, the new variables), architecture.md (`trust_policy`, `/trust*`,
+  `/runner/status`, schema v14), tasks.md, SECURITY.md (replay, synced folders) and SKILL.md (`trust_policy`,
+  the admin-only option) updated. Shipped docs no longer link to `RUNNER.md` (which is not in the npm package);
+  the links point at the repository, and a test checks every relative link in the packed markdown.
+- Three tests that did not test what their names said were fixed: "survives a reopen" (now reopens a file),
+  "two processes at once" (now two real child processes), "not named runner-*" (now checks that no shipped
+  module imports a runner module). The pack smoke test extracts the tarball with Node (no `tar` binary).
+- 49 new tests (1186 to 1235): `test/trust-141.test.ts`, `test/trust-gate-guard.test.ts` and additions in the liveness,
+  migration and policy suites.
+
+### Not covered (stated plainly)
+The distrust list is still a policy on labels; a file that omits every writer field carries no taint; replaying
+an old signed export is possible (`not_after` retires a key, not a note); the heartbeat check trusts the
+`runner` label, which anyone holding that token can use. Windows and macOS were not exercised in this review.
+
 ## [1.4.0] - 2026-10-24
 
 Trust. A server can now say whom not to believe, name writers across servers, and vouch for
@@ -27,7 +122,7 @@ the writers it exports; the runner liveness signal is per machine. **Schema v14*
 - **Signed writer attestations.** Per-database Ed25519 key (`.attest-key` beside the database, mode 0600,
   never exported, not in `onememory backup`). `GET /export` and `export --format json` carry a header
   (`server_id`, `key_id`, public key) and a detached attestation per note (`?attest=0` / `--no-attest`
-  off). Import verifies against the admin's attester list plus `ONEMEMORY_TRUSTED_ATTESTERS`; a verified
+  switched them off, and then returned the pre-1.4.0 shape; 1.4.1 makes that the default, see below). Import verifies against the admin's attester list plus `ONEMEMORY_TRUSTED_ATTESTERS`; a verified
   note keeps `attested_writer` / `attested_by`, anything else imports exactly as before. Tamper tests cover
   content, writer, namespace, timestamp and id. `onememory import --file backup.json` is new.
 - **Per-runner heartbeats and status.** Heartbeat note `runner heartbeat: <machine>`; `runner_status`,
@@ -45,8 +140,10 @@ the writers it exports; the runner liveness signal is per machine. **Schema v14*
 ### Changed
 - **Breaking-ish: legacy runner heartbeats.** A heartbeat with no writer marker (runner older than 1.3.4) is
   no longer believed. Update the runner, or set `ONEMEMORY_RUNNER_ACCEPT_LEGACY=1` on the server meanwhile.
-- `GET /export` JSON is now `{"export": {...header}, "notes": [...]}` (still streamed). Use `?attest=0` for
-  the header with unsigned notes. `onememory import --file` and `POST /import` read both shapes.
+- `GET /export` JSON is now `{"export": {...header}, "notes": [...]}` (still streamed). *(Correction made in
+  1.4.1: this entry said `?attest=0` kept the header with unsigned notes. It did not: `?attest=0` returned the
+  pre-1.4.0 `{"notes": [...]}` exactly. 1.4.1 restores that shape as the default.)* `onememory import --file`
+  and `POST /import` read both shapes.
 - `catch_up` and the recall notice return early (no work) when no command task is queued.
 - Removed the `tasks.ts` <-> `liveness.ts` import cycle (shared rule now in `task-core.ts`).
 

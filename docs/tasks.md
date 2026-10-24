@@ -147,8 +147,11 @@ Returns, in one compact result:
 - **runner_notice**: one line when approved commands are waiting and a runner is not online (omitted, and
   its check skipped entirely, when no command task is queued).
 
-`catch_up`, `task_list`, `task_get` and handoffs take `written_by` / `not_written_by` and
-`include_distrusted` like the notes tools (`catch_up` also `note_written_by` / `not_note_written_by`). Tasks and
+`catch_up`, `task_list` and handoffs take `written_by` / `not_written_by` and
+`include_distrusted` like the notes tools (`catch_up` also `note_written_by` / `not_note_written_by`);
+`task_get` takes only `include_distrusted` (it names one task by id; a hidden one reads as not found).
+`include_distrusted` is admin-only. A `client_key` replay never returns a distrusted writer's task or
+handoff to someone else, and `task_put` by id refuses one. Tasks and
 handoffs written by a **distrusted** writer ([trust.md](./trust.md)) are left out; `task_claim` and
 `task_approve` refuse them, and a distrusted command task is never run by the runner, even if it was approved
 before the writer was distrusted.
