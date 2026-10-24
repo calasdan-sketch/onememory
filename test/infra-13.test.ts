@@ -248,7 +248,7 @@ function startServer(env: Record<string, string>) {
 }
 
 describe("server process", () => {
-  test("SIGTERM with a live wait: the waiter gets timedOut:true and the process drains fast", async () => {
+  test("SIGTERM with a live wait: the waiter gets timedOut:true and the process drains fast", { skip: process.platform === "win32" && "Windows has no SIGTERM: child.kill() is a hard TerminateProcess, so graceful drain cannot be observed" }, async () => {
     const dir = mk("om-term-");
     const apiPort = await freePort();
     const mcpPort = await freePort();

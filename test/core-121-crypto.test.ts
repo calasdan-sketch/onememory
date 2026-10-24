@@ -24,7 +24,7 @@ beforeEach(() => {
 afterEach(() => {
   if (savedKeyFile === undefined) delete process.env.ONEMEMORY_KEY_FILE;
   else process.env.ONEMEMORY_KEY_FILE = savedKeyFile;
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 describe("1: encrypt enable/disable while a server holds the DB", () => {

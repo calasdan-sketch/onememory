@@ -233,6 +233,13 @@ describe("MCP: real version, explain, forget_after", () => {
   });
 });
 
+async function killAndWait(child: ReturnType<typeof spawn>): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const done = new Promise<void>((r) => child.once("exit", () => r()));
+  child.kill();
+  await done;
+}
+
 describe("stdio MCP answers malformed JSON with -32700", () => {
   test("{bad on stdin yields a JSON-RPC parse error", async () => {
     const home = mkdtempSync(join(tmpdir(), "om-stdio-"));
@@ -258,8 +265,8 @@ describe("stdio MCP answers malformed JSON with -32700", () => {
       assert.equal(reply.error.code, -32700);
       assert.equal(reply.id, null);
     } finally {
-      child.kill();
-      rmSync(home, { recursive: true, force: true });
+      await killAndWait(child);
+      rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 });

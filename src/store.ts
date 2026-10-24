@@ -876,12 +876,23 @@ export class Store {
     // store can read existing rows. loadKey throws on a corrupt key file
     // rather than silently degrading -- see crypto.ts.
     this.keyDir = dirname(dbPath);
-    this.lastKey = loadKey(this.keyDir);
-    if (!this.lastKey) this.recoverStrandedKey();
-    this.keyStamp = this.stampOf();
-    this.init();
-    this.installActorStamp();
-    this.upgradeV1Envelopes();
+    try {
+      this.lastKey = loadKey(this.keyDir);
+      if (!this.lastKey) this.recoverStrandedKey();
+      this.keyStamp = this.stampOf();
+      this.init();
+      this.installActorStamp();
+      this.upgradeV1Envelopes();
+    } catch (e) {
+      // A constructor that throws never hands the caller a Store to close();
+      // release the file handle here (Windows cannot delete an open database).
+      try {
+        this.db.close();
+      } catch {
+        /* already closed */
+      }
+      throw e;
+    }
     // Notes are private: owner-only db + WAL/SHM (POSIX; no-op on Windows).
     if (dbPath !== ":memory:") for (const ext of ["", "-wal", "-shm"]) chmodQuiet(dbPath + ext, 0o600);
   }
@@ -911,7 +922,7 @@ export class Store {
       }
       throw new Error(
         `onememory: this database is at schema version ${found}, newer than this build supports ` +
-          `(${SCHEMA_VERSION}). Upgrade onememory (npm i -g @decnutz/onememory@latest) instead of opening it with an older version.`
+          `(${SCHEMA_VERSION}). Upgrade onememory (npm i -g onememory-mcp@latest) instead of opening it with an older version.`
       );
     }
     if (found >= SCHEMA_VERSION) return;

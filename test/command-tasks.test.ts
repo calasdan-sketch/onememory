@@ -39,7 +39,7 @@ describe("command tasks", () => {
       mark: {
         file: process.execPath,
         args: ["-e", "require('fs').writeFileSync(process.argv[1], 'ran')"],
-        params: { p: "[A-Za-z0-9/_.-]{1,200}" },
+        params: { p: "[A-Za-z0-9/_.:\\\\-]{1,200}" },
         paramArgs: ["{p}"],
         description: "write a marker file",
       },

@@ -35,7 +35,7 @@ beforeEach(() => {
 afterEach(() => {
   if (savedKeyFile === undefined) delete process.env.ONEMEMORY_KEY_FILE;
   else process.env.ONEMEMORY_KEY_FILE = savedKeyFile;
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 describe("1: key stranded by a crashed `encrypt disable`", () => {
@@ -236,7 +236,11 @@ describe("5: low items", () => {
       assert.equal(lines.length, 1);
       assert.equal(JSON.parse(lines[0]).error.code, -32700);
     } finally {
-      child.kill();
+      if (child.exitCode === null && child.signalCode === null) {
+        const done = new Promise<void>((r) => child.once("exit", () => r()));
+        child.kill();
+        await done; // Windows cannot rmSync a directory the child still holds open
+      }
     }
   });
 
