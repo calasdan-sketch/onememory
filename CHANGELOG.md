@@ -6,6 +6,48 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.3.0] - unreleased
+
+Cross-device / cross-model awareness: every session can see what the others
+did and plan. Additive; no schema change, no behaviour change unless you use
+the new parameters and tools. (The change feed, `consumer` markers, `if_rev`
+compare-and-swap, per-token namespaces, the signed runner and the recall hook
+already existed and are unchanged.)
+
+### Added
+
+- **Live wait on the change feed.** `GET /changes?...&wait=<0-55>` and
+  `memory_since { wait_seconds }` hold the request until something changes in
+  the caller's scope (create, update, archive, restore, delete, retention
+  sweep), then answer like a normal read; on timeout they return the empty page
+  with `timedOut: true`. In-process writes wake it immediately; writes by
+  another process are noticed by a 1s poll (`ONEMEMORY_WAIT_POLL_MS`). At most
+  4 parked requests per token and 64 per process (`ONEMEMORY_WAIT_MAX_PER_TOKEN`,
+  `ONEMEMORY_WAIT_MAX_TOTAL`); a client that disconnects frees its slot, timers
+  and listener immediately. Not combinable with `cursor` (400).
+- **Task board.** MCP `task_put` / `task_list` and REST `POST /tasks`,
+  `PUT /tasks/:id`, `GET /tasks`: tasks with status (idea, planned, running,
+  blocked, done), next step and owner, plus `if_rev` compare-and-swap. Stored
+  as tagged notes (no new table), so they are encrypted, namespaced, searchable
+  and appear in the change feed. See docs/tasks.md.
+- **Session handoffs.** MCP `session_handoff` and REST `POST /handoffs`,
+  `GET /handoffs`: a structured note (done, pending, decisions, next step,
+  which surface) for the next session.
+- **`catch_up`** (MCP) / `GET /catch-up`: changes since this consumer last
+  looked + open tasks + latest handoffs in one call.
+- **`onememory recall`** now prints open tasks (up to 10) and the latest
+  handoff before the recent notes, inside the same size cap; with no tasks or
+  handoffs its output is unchanged.
+- `Store.list` accepts `withTags` / `withoutTags` (exact-tag filters);
+  `Store.onChange` / `Store.changeHeadSeq` back the live wait.
+
+### Notes
+
+- The MCP server now advertises 16 tools (was 12). Clients that pin the tool
+  list need to refresh it.
+- Live wait holds an HTTP request open; if you front OneMemory with a proxy,
+  its read timeout must exceed the wait (55s max).
+
 ## [1.2.1] - 2026-10-24
 
 **Package renamed:** published on npm as `onememory` (previously `onememory-mcp`, whose earlier releases were withdrawn). The command is still `onememory`.

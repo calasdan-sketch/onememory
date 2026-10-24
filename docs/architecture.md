@@ -63,7 +63,7 @@ immediately visible through the others:
   `rev` for compare-and-swap, a provenance `source`, tags, and namespaces.
 - **`src/api.ts`** — a small HTTP/JSON API + a built-in web dashboard, on
   plain `node:http` (no framework).
-- **`src/mcp-server-core.ts`** — the transport-agnostic MCP server with twelve
+- **`src/mcp-server-core.ts`** — the transport-agnostic MCP server with sixteen
   tools, shared by both MCP transports.
 - **`src/mcp-stdio.ts`** — stdio entry point for local Claude Code / Desktop
   / editors.
@@ -92,6 +92,10 @@ immediately visible through the others:
 | `state_delete` | admin | Delete a note |
 | `memory_stats` | read | Totals, most-read notes, never-read and stale counts |
 | `memory_since` | read | Change feed: what was created/updated/deleted since a time ([change-feed.md](./change-feed.md)) |
+| `task_put` | write | Create/update a task on the shared board (status, next_step, owner, `if_rev`) ([tasks.md](./tasks.md)) |
+| `task_list` | read | List tasks (default: all but done), filter by status/owner |
+| `session_handoff` | write | Leave a structured handoff (done / pending / decisions / next step) |
+| `catch_up` | read | One call: changes since this consumer last looked + open tasks + latest handoffs |
 | `memory_consolidation_candidates` | admin | Near-duplicate pairs (O(n²), single-flight, time-budgeted) |
 | `memory_consolidate` | admin | Merge 2+ notes (`dry_run`, `keep_sources`) |
 | `memory_rebuild_edges` | admin | Rebuild the similarity graph (confirmation gate above 2,000 notes) |
@@ -123,7 +127,8 @@ This plain REST API is also how non-agent tools plug in. **n8n**, for
 example, can read and write the store via an HTTP Request node (or its MCP
 Client node) — see [INFRA.md](./INFRA.md) § "Use with n8n".
 
-`GET /changes` mirrors `memory_since` (read scope; see [change-feed.md](./change-feed.md)); it requires a `since` parameter and answers `400` without one.
+`GET /changes` mirrors `memory_since` (read scope; see [change-feed.md](./change-feed.md)); it requires a `since` parameter and answers `400` without one. `&wait=<0-55>` holds the request open until something changes ([live wait](./change-feed.md#live-wait)).
+`POST /tasks` · `PUT /tasks/:id` · `GET /tasks` · `POST /handoffs` · `GET /handoffs` · `GET /catch-up` are the REST side of the task board, handoffs and catch-up ([tasks.md](./tasks.md)); writes need write scope, reads read scope, and namespaces apply as for `/notes`.
 `POST /notes/:id/archive` and `POST /notes/:id/restore` soft-forget and bring back a note by id; `POST /sweep-expired` archives every note past its TTL (all three are admin scope; see [encryption-retention.md](./encryption-retention.md)).
 `POST /notes` and `PUT /notes/:id` answer `202 { quarantined: { id, reasons } }`
 when the memory linter holds the write, and add a `warnings` array under

@@ -114,6 +114,15 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
   away" — created, updated **and deleted** notes grouped by source, with a
   per-device "since I last looked" marker. Driven by a local change log, so
   restores, file-sync imports and deletes are never missed. → [docs/change-feed.md](./docs/change-feed.md)
+- **Live wait.** `GET /changes?wait=30` / `memory_since { wait_seconds }` parks
+  until something changes in your scope, so a session sees an idea added from
+  your phone within moments instead of on its next poll. Bounded, and a
+  dropped client frees its slot. → [docs/change-feed.md](./docs/change-feed.md#live-wait)
+- **Task board, handoffs, catch-up.** `task_put` / `task_list`,
+  `session_handoff`, and one `catch_up` call (changes since you last looked +
+  open tasks + latest handoff). Built on plain notes, so it is encrypted,
+  namespaced and searchable like the rest; `onememory recall` includes open
+  tasks and the latest handoff at session start. → [docs/tasks.md](./docs/tasks.md)
 - **Memory linter.** Every write is scanned for secrets (API keys, JWTs,
   private keys, high-entropy tokens) and prompt-injection instructions
   ("ignore previous instructions", chat-template markers, tool-call
@@ -196,12 +205,14 @@ encryption of note bodies. See [SECURITY.md](./SECURITY.md) for what it does
 |---|---|---|
 | `state_write` / `state_read` / `state_delete` | write / read / admin | CRUD with compare-and-swap (`if_rev`) and provenance (`source`) |
 | `state_search` / `state_relevant` / `state_list` | read | keyword, semantic or hybrid search; vague-message recall; listing |
-| `memory_since` | read | change feed |
+| `memory_since` | read | change feed (`wait_seconds` = live wait) |
+| `task_put` / `task_list` | write / read | shared task board across devices and models |
+| `session_handoff` / `catch_up` | write / read | leave a handoff; one-call catch-up at session start |
 | `memory_stats` | read | totals, most-read, never-read, stale |
 | `memory_quarantine` | admin | review linter-held writes |
 | `memory_consolidation_candidates` / `memory_consolidate` / `memory_rebuild_edges` | admin | dedup and similarity-graph maintenance |
 
-REST mirrors them (`/notes`, `/search`, `/relevant`, `/changes`, `/stats`,
+REST mirrors them (`/notes`, `/search`, `/relevant`, `/changes`, `/tasks`, `/handoffs`, `/catch-up`, `/stats`,
 `/export`, `/import`, …). Full reference: [docs/architecture.md](./docs/architecture.md).
 
 ## CLI
@@ -252,6 +263,7 @@ recall@1 on it. See [docs/encryption-retention.md](./docs/encryption-retention.m
 | [docs/configuration.md](./docs/configuration.md) | all environment variables, server-side namespace resolution |
 | [docs/search.md](./docs/search.md) | semantic, time-aware and relevant search; staleness; consolidation |
 | [docs/change-feed.md](./docs/change-feed.md) | `memory_since` / `GET /changes` |
+| [docs/tasks.md](./docs/tasks.md) | task board, session handoffs, one-call catch-up |
 | [docs/memory-linter.md](./docs/memory-linter.md) | `ONEMEMORY_LINT`, detection rules, quarantine |
 | [docs/file-sync.md](./docs/file-sync.md) | Markdown export/import, GitHub and Syncthing workflows |
 | [docs/sessionstart-hook.md](./docs/sessionstart-hook.md) | automatic recall at Claude Code session start |

@@ -6,7 +6,8 @@ description: >-
   starting a task where past context would help — save with state_write and
   recall with state_search / state_list. Backed by the OneMemory MCP
   server (tools: state_write, state_read, state_search, state_relevant,
-  state_list, state_delete, memory_since, memory_stats, memory_quarantine,
+  state_list, state_delete, memory_since, task_put, task_list,
+  session_handoff, catch_up, memory_stats, memory_quarantine,
   memory_consolidation_candidates, memory_consolidate, memory_rebuild_edges). Works in any MCP-capable agent (Claude Code, Claude Desktop,
   Cursor, Copilot, Windsurf, Cline, and more) and across web and mobile.
 license: MIT
@@ -56,6 +57,14 @@ this surface last looked, grouped by source. Use `since: "24h"` (or an ISO
 time) for a fixed window. It returns titles only — `state_read` the ones
 that matter. Page with `nextCursor` until it is null; the "last" marker only
 advances after the final page.
+
+**Starting a session / handing off:** call `catch_up` with a stable `consumer`
+label for this surface to get what changed since you last looked, the open
+tasks and the latest handoff in one result. Track work with `task_put`
+(status idea | planned | running | blocked | done, `next_step`, `owner`) and
+`task_list`. Before you stop, call `session_handoff` (done / pending /
+decisions / next_step) so the next session, on any device or model, can pick
+up. `memory_since` accepts `wait_seconds` (up to 55) to wait for the next change.
 
 If you find relevant notes, use them to inform your work and tell the user
 what you're drawing on. If nothing's there, proceed and save what you learn.

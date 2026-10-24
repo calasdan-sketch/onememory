@@ -6,6 +6,9 @@ All environment variables are optional:
 |---|---|---|
 | `ONEMEMORY_HOME` | `~/.onememory` (Windows `%USERPROFILE%\.onememory`) | Data directory: database, `.token`, `tokens.json`, `spaces.json`. A git checkout that already has `./data/state.db` keeps using `./data`. 1.0.x data found inside the package is copied here once on start. Created owner-only (`0700`, files `0600`) on POSIX and re-tightened on every start |
 | `ONEMEMORY_DB_PATH` | `<data dir>/state.db` | SQLite file path (overrides the data dir for the database only) |
+| `ONEMEMORY_WAIT_POLL_MS` | `1000` | Live wait (`wait` / `wait_seconds`): how often a parked request checks for writes made by another process. Same-process writes wake it immediately. 20-60000 |
+| `ONEMEMORY_WAIT_MAX_PER_TOKEN` | `4` | Live wait: max parked requests per token (more: REST 429 / MCP tool error) |
+| `ONEMEMORY_WAIT_MAX_TOTAL` | `64` | Live wait: max parked requests per process |
 | `ONEMEMORY_NO_CHMOD` | unset | `1` = never tighten data-dir permissions to 0700/0600 (for deliberately shared dirs) |
 | `ONEMEMORY_TOKEN` | auto-generated → `<data dir>/.token` | Primary (admin) bearer token; required to bind a public interface |
 | `ONEMEMORY_TOKENS` | unset | Optional JSON array of extra scoped tokens: `[{"token":"…","scope":"read\|write\|admin","label":"…","namespace":"…"}]` (also readable from `<data dir>/tokens.json`). `namespace` optionally pins a token to one namespace — per-token isolation on a shared server, so several agents can share one bridge without seeing each other's notes. See [token-namespaces.md](./token-namespaces.md) |

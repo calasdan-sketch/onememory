@@ -21,6 +21,11 @@ Recent memory (3 notes):
 - [Pref]: Keep replies short and concrete.
 ```
 
+If you use the [task board](./tasks.md), the open tasks and the latest
+handoff are printed first (under `Open tasks (n):` and `Latest handoff from
+...:`), then the recent notes. Tasks and handoffs are left out of the recent
+list so nothing appears twice. The whole payload keeps the same size cap.
+
 Recency is the recall signal at session start — no embeddings, no query,
 one cheap SQL query (`ORDER BY updated_at DESC`). Flags:
 

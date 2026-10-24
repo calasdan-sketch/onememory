@@ -26,6 +26,7 @@ The dashboard has a **Changes** button (last 24 hours).
 | `namespace` | Restrict to one namespace. Under server-side namespace resolution it is an untrusted hint, intersected with the readable set, exactly like `/search`. |
 | `source` | Only notes with this provenance `source`. |
 | `limit` | Page size, default 100, max 500. |
+| `wait` / `wait_seconds` | Live wait, 0-55 seconds (REST `wait`, MCP `wait_seconds`). See [Live wait](#live-wait). |
 | `consumer` | Label for the `last` marker (`phone`, `claude-code`, …; default `default`). 1–64 chars of `A-Za-z0-9._@-`. |
 
 Scope: **read** (REST and MCP).
@@ -68,6 +69,34 @@ Scope: **read** (REST and MCP).
   that land while you page never shift or duplicate entries. Cursors are
   signed by the store and only valid with the same `namespace` / `source`
   filter they were issued for.
+
+## Live wait
+
+Instead of polling, park on the feed and be answered the moment something
+changes in your scope:
+
+```
+GET /changes?since=last&consumer=pc&wait=30
+memory_since({ since: "last", consumer: "pc", wait_seconds: 30 })
+```
+
+- Something new already? You get it immediately. Otherwise the call is held
+  open until a write lands (including archive, restore and delete), or until
+  the wait runs out, in which case you get the normal empty page plus
+  `"timedOut": true`. Then just call again.
+- `wait` is a whole number of seconds, 0-55 (kept under the usual 60-second
+  proxy and MCP-client timeouts). Anything else is a 400 / tool error.
+- Use it with `since` (best: `since=last`), not with `cursor`: a cursor's
+  window is frozen, so nothing new can appear in it (400).
+- Scope is the same as an ordinary read: a write in a namespace you cannot
+  read never wakes you or shows up.
+- Writes made through this server wake waiters immediately; writes made by
+  another process on the same database (e.g. the CLI) are noticed within
+  about a second (`ONEMEMORY_WAIT_POLL_MS`).
+- Limits: at most 4 parked requests per token (`ONEMEMORY_WAIT_MAX_PER_TOKEN`)
+  and 64 per process (`ONEMEMORY_WAIT_MAX_TOTAL`); past that REST answers 429
+  and MCP returns a tool error. A client that disconnects frees its slot at once.
+- Over MCP, make sure your client's tool-call timeout is longer than the wait.
 
 ## How it is recorded
 
