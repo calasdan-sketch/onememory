@@ -1,0 +1,13 @@
+node_modules
+dist
+data
+.git
+.github
+*.md
+!README.md
+!SKILL.md
+!INSTALL.md
+!INFRA.md
+!SECURITY.md
+.env
+.env.local

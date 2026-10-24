@@ -1,0 +1,83 @@
+name: Publish to npm
+
+# Push a tag like v1.2.1 (or run this workflow manually from a tag) and
+# GitHub publishes that version to npm using "trusted publishing": GitHub
+# proves to npm who is running, so no password, token or emailed code is used.
+#
+# THINGS TO VERIFY ON npmjs.com (cannot be checked from this repo):
+#   Package onememory-mcp -> Settings -> Trusted Publisher -> GitHub Actions
+#     Owner / user:  calasdan-sketch
+#     Repository:    onememory
+#     Workflow file: publish.yml      (file name only, no path, case-sensitive)
+#     Environment:   (leave BLANK - this job declares no `environment:`)
+#   If any value differs, npm's OIDC exchange fails and the publish can end in
+#   a misleading E404 or ENEEDAUTH. Unverified: whether npm lets you configure
+#   a trusted publisher before the package exists; if not, the first version
+#   needs a one-off manual publish. Unverified: whether the repo must be
+#   public for --provenance. Check docs.npmjs.com/trusted-publishers.
+#   npm also never allows reusing a published name@version, even after
+#   unpublish (verify at docs.npmjs.com/policies/unpublish).
+#
+# Manual run (workflow_dispatch): select a tag (not a branch) in the "Use
+# workflow from" box; the version check below refuses to publish otherwise.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          # Deliberately NO registry-url: it writes an .npmrc line
+          # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` and
+          # NODE_AUTH_TOKEN is never set in this tokenless workflow. npm sees
+          # an (empty) auth config instead of reaching for the OIDC exchange
+          # and the registry answers the PUT with a misleading E404 on an
+          # existing package (npm/cli#9088: their working config had no
+          # .npmrc auth config either). npm's default registry is already
+          # registry.npmjs.org.
+      # Trusted publishing needs npm 11.5.1 or newer. Pin the v11 major:
+      # npm@latest became npm 12 in Oct 2026 and breaks the trusted-publishing
+      # handshake with a misleading E404 "Not Found - PUT", which looks like a
+      # missing package or bad login instead (npm/cli#9088; multiple reports
+      # of "npm@latest is now npm 12 ... broke the publish"). Verified locally:
+      # npm 11.16.0 and 12.2.1 both build/test fine, only the OIDC handshake
+      # differs, so the publish job is the one pinned.
+      - run: npm install -g npm@11
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm test
+      - name: Tag must match package.json version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "Refusing to publish from ${GITHUB_REF_TYPE} '${GITHUB_REF_NAME}': run this workflow from a v* tag."
+            exit 1
+          fi
+          v=$(node -p "require('./package.json').version")
+          [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != package.json $v"; exit 1; }
+      - run: npm publish --provenance --access public
+      # npm masks trusted-publishing failures as a generic E404/ENEEDAUTH
+      # (npm/cli#9088), so on failure read its own debug log for what the
+      # OIDC exchange actually did. Long token-shaped strings are stripped.
+      - name: Trusted-publishing diagnostics (on failure)
+        if: failure()
+        run: |
+          echo "== npm debug log: auth/OIDC excerpts (publish step) =="
+          f=$(ls -t /home/runner/.npm/_logs/*-debug-0.log 2>/dev/null | head -1)
+          if [ -z "$f" ]; then echo "no npm debug log found"; exit 0; fi
+          echo "log: $f"
+          echo "--- oidc/exchange/auth/put lines ---"
+          grep -iE "oidc|exchange|need auth|E404|authtoken|security|PUT |code E" "$f" \
+            | grep -vE "[A-Za-z0-9_=-]{80,}" | tail -60
+          echo "--- end of log (token-shaped strings stripped) =="
+          tail -25 "$f" | grep -vE "[A-Za-z0-9_=-]{80,}"

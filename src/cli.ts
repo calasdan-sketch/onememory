@@ -1,0 +1,1120 @@
+#!/usr/bin/env node
+import "./quiet-sqlite.js"; // first: hide the node:sqlite ExperimentalWarning
+import readline from "node:readline";
+// onememory CLI: one command to run, check, or wire up the bridge.
+//   onememory [start]   start the API + dashboard AND MCP-over-HTTP (default)
+//   onememory mcp       start the MCP server over stdio (for Claude Code/Cursor/...)
+//   onememory doctor    check Node, database, and token
+//   onememory init      print the config snippet to wire it into your agent
+//   onememory help      show help
+
+function usage(): void {
+  console.log(
+    [
+      "onememory <command>",
+      "",
+      "  start     Start the API + dashboard AND MCP-over-HTTP (default).",
+      "            When: always-on, so your phone and claude.ai web reach the same memory.",
+      "  mcp       Start the MCP server over stdio.",
+      "            When: wiring a local agent (Claude Code / Cursor / Copilot). See: onememory init",
+      "  --version, -v   Print the installed version.",
+      "  doctor    Check Node, database, token, namespace config, and the recall hook.",
+      "            When: something isn't working, or after changing config.",
+      "  init      Print the config snippet to wire onememory into your agent.",
+      "            When: first-time setup of a new agent client.",
+      "  reindex   Backfill semantic embeddings for notes missing them.",
+      "            When: after enabling embeddings, or after changing the embedding model.",
+      "  recall    SessionStart hook: print recent memory as hook JSON (fail-silent).",
+      "            When: wired into Claude Code settings.json. See:",
+      "            https://github.com/calasdan-sketch/onememory/blob/main/docs/sessionstart-hook.md",
+      "  consolidate [--dry-run] [--yes] [--threshold 0.95] [--namespace ns]",
+      "            Find near-duplicate notes and merge them. Without --yes",
+      "            (or with --dry-run) this only reports — nothing is merged.",
+      "            When: periodic cleanup of duplicated agent notes.",
+      "  rebuild-edges [--threshold 0.25] [--yes] [--force]",
+      "            Recalculate the note similarity graph from scratch: every",
+      "            note is re-scored against same-namespace notes and pairs",
+      "            at/above the threshold get bidirectional edges. Prints the",
+      "            pair count first and asks for confirmation on large",
+      "            rebuilds (--yes skips); refuses while another process",
+      "            holds the write lock (--force overrides); streams",
+      "            progress to stderr. Reports {created, removed} edge",
+      "            counts. O(n^2) — maintenance, not interactive.",
+      "            When: after a bulk import, or after changing the threshold.",
+      "  relevant \"some natural language message\" [--limit 5] [--namespace ns]",
+      "            Extract keywords from a message and show the relevant notes.",
+      "            Prints the keywords used alongside the results.",
+      "            When: you have a vague message and want the memory it touches.",
+      "  changes [--since 24h|ISO|last] [--consumer name] [--namespace ns] [--source s] [--limit 100]",
+      "  changes --purge             delete the whole change log (titles of past changes) and all markers",
+      "            What changed while you were away: created/updated/deleted notes",
+      "            grouped by source. --since last uses (and advances) a per-consumer marker.",
+      "  export --format md --dir <path> [--namespace ns] [--no-prune] [--force]",
+      "            Write one Markdown file per note (YAML front-matter) into",
+      "            namespace folders. Deterministic and git-friendly; prunes",
+      "            files of deleted notes it wrote earlier (--no-prune keeps them).",
+      "  export --format json [--out file]",
+      "            Full JSON backup (same shape as GET /export) to stdout or a file.",
+      "  import --dir <path> [--dry-run] [--allow-move]",
+      "            Merge Markdown files back: newer side wins, conflicts are",
+      "            reported and the losing version is saved under <dir>/.conflicts/.",
+      "            Runs through the memory linter.",
+      "  quarantine [list | approve <id> | reject <id>]",
+      "            Review writes the memory linter held (ONEMEMORY_LINT).",
+      "  encrypt <enable|status|disable>",
+      "            enable   Create the AES-256-GCM key and encrypt every note",
+      "                     body at rest. Keyword search then covers title+tags",
+      "                     only (bodies cannot be indexed as ciphertext).",
+      "            status   Report whether at-rest encryption is on, the key",
+      "                     path, and how many bodies are encrypted.",
+      "            disable  Decrypt every body and remove the key file.",
+      "            When: running OneMemory as a shared / multi-agent store.",
+      "            See: docs/encryption-retention.md for the real tradeoffs.",
+      "  help      Show this help",
+      "",
+    ].join("\n")
+  );
+}
+
+async function doctor(): Promise<void> {
+  const {
+    DB_PATH,
+    BIND_HOST,
+    API_PORT,
+    MCP_HTTP_PORT,
+    resolveToken,
+    DATA_DIR,
+    DATA_DIR_SOURCE,
+    LEGACY_DATA_DIR,
+    TOKEN_FILE,
+    insideNodeModules,
+  } = await import("./config.js");
+  const { existsSync } = await import("node:fs");
+  const { resolve: resolvePath } = await import("node:path");
+  const { Store } = await import("./store.js");
+  const ok = (m: string) => console.log("  [ok]   " + m);
+  const warn = (m: string) => console.log("  [warn] " + m);
+  console.log("onememory doctor\n");
+
+  const parts = process.versions.node.split(".").map(Number);
+  if (parts[0] >= 24) {
+    ok("Node " + process.versions.node);
+  } else {
+    warn("Node " + process.versions.node + " — need >= 24 (for the built-in SQLite)");
+  }
+
+  const why =
+    DATA_DIR_SOURCE === "env"
+      ? "ONEMEMORY_HOME"
+      : DATA_DIR_SOURCE === "checkout"
+        ? "git checkout with an existing ./data/state.db — kept as-is; set ONEMEMORY_HOME to move it"
+        : "default";
+  ok(`data dir ${DATA_DIR} (${why})`);
+  if (insideNodeModules(DB_PATH) || insideNodeModules(DATA_DIR)) {
+    warn(
+      "your data is inside node_modules — npm update / npx cache cleanup will delete it. " +
+        "Set ONEMEMORY_HOME (or ONEMEMORY_DB_PATH) to a directory outside the package."
+    );
+  }
+  if (
+    resolvePath(LEGACY_DATA_DIR) !== resolvePath(DATA_DIR) &&
+    existsSync(`${LEGACY_DATA_DIR}/state.db`) &&
+    !process.env.ONEMEMORY_DB_PATH
+  ) {
+    warn(`an old 1.0.x database is still at ${LEGACY_DATA_DIR} (migrated copy is in ${DATA_DIR}); delete it when you're happy`);
+  }
+
+  let dbProblem = false;
+  try {
+    const s = new Store(DB_PATH);
+    const r = s.list({ limit: 1 });
+    const edges = s.edgeCount();
+    s.close();
+    ok(`database OK at ${DB_PATH} (${r.total} notes)`);
+    // Migration v4 adds the similarity-edge table but does not score
+    // existing notes: a store upgraded from 1.0.0 has notes and no edges
+    // until a one-time rebuild.
+    if (r.total >= 2 && edges === 0) {
+      warn(
+        "notes but no similarity edges (store created before 1.1?) — run " +
+          "`onememory rebuild-edges` once to link existing notes"
+      );
+    }
+  } catch (e) {
+    dbProblem = true;
+    warn("database problem: " + (e as Error).message);
+  }
+
+  try {
+    resolveToken();
+    ok(
+      `bearer token present (${process.env.ONEMEMORY_TOKEN?.trim() ? "ONEMEMORY_TOKEN" : TOKEN_FILE})`
+    );
+  } catch (e) {
+    warn("token: " + (e as Error).message);
+  }
+
+  // Server-side namespace resolution (opt-in): validate the spaces config
+  // and report this directory's resolved namespace.
+  const {
+    loadNamespaceConfig,
+    namespaceConfigSource,
+    validateSpacePaths,
+    resolveNamespace,
+  } = await import("./namespace.js");
+  const nsSource = namespaceConfigSource();
+  if (nsSource) {
+    const nsWhere = nsSource === "env" ? "ONEMEMORY_SPACES" : `${DATA_DIR}/spaces.json`;
+    const nsCfg = loadNamespaceConfig();
+    if (!nsCfg) {
+      warn(`namespace config present (${nsWhere}) but invalid -- resolution disabled`);
+    } else {
+      const n = Object.keys(nsCfg.spaces).length;
+      const missing = validateSpacePaths(nsCfg);
+      if (missing.length === 0) {
+        ok(`namespace resolution: ${n} space(s) configured, all paths exist`);
+      }
+      for (const p of missing) {
+        warn(
+          `namespace space path missing on disk: ${p} — create the directory, ` +
+            `or remove the space from ${nsWhere}`
+        );
+      }
+      try {
+        const here = resolveNamespace(process.cwd(), nsCfg);
+        ok(`namespace resolution: this directory -> "${here}"`);
+      } catch (e) {
+        warn("namespace resolution: " + (e as Error).message);
+      }
+    }
+  }
+
+  // Recall hook smoke test: run the real SessionStart path against this
+  // database and check the payload shape. Also budget-check it: the hook
+  // blocks session start, so a slow recall is worth knowing about.
+  try {
+    const { runRecall } = await import("./recall.js");
+    const t0 = Date.now();
+    const out = await runRecall({ budgetMs: 800, limit: 1, dbPath: DB_PATH });
+    const elapsed = Date.now() - t0;
+    const parsed = JSON.parse(out) as {
+      hookSpecificOutput?: { hookEventName?: string };
+    };
+    if (dbProblem) {
+      // The hook fails silent by design, so its "success" proves nothing here.
+      warn("recall hook smoke test FAILED: the database could not be opened (see the database problem above); the hook only looks healthy because it fails silent");
+    } else if (parsed?.hookSpecificOutput?.hookEventName === "SessionStart") {
+      ok(`recall hook smoke test passed (${elapsed}ms)`);
+    } else {
+      warn("recall hook returned an unexpected payload shape");
+    }
+    if (elapsed > 800) {
+      warn(`recall hook took ${elapsed}ms — over the 800ms soft budget`);
+    }
+  } catch (e) {
+    warn("recall hook smoke test failed: " + (e as Error).message);
+  }
+
+  // Is the hook actually wired into Claude Code? A working `recall` that
+  // never fires is the common silent failure.
+  try {
+    const { homedir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { readFileSync } = await import("node:fs");
+    const settingsPath = join(homedir(), ".claude", "settings.json");
+    const raw = readFileSync(settingsPath, "utf8");
+    const parsed = JSON.parse(raw) as {
+      hooks?: { SessionStart?: unknown };
+    };
+    const entries = parsed?.hooks?.SessionStart;
+    const wired =
+      Array.isArray(entries) &&
+      JSON.stringify(entries).includes("onememory recall");
+    if (wired) {
+      ok("SessionStart hook wired in ~/.claude/settings.json");
+    } else {
+      warn(
+        "~/.claude/settings.json has no onememory SessionStart hook — " +
+          "see https://github.com/calasdan-sketch/onememory/blob/main/docs/sessionstart-hook.md"
+      );
+    }
+  } catch {
+    warn(
+      "~/.claude/settings.json not found or unreadable — hook not installed " +
+        "(see https://github.com/calasdan-sketch/onememory/blob/main/docs/sessionstart-hook.md)"
+    );
+  }
+
+  console.log(`\n  bind ${BIND_HOST}   api :${API_PORT}   mcp :${MCP_HTTP_PORT}`);
+}
+
+async function init(): Promise<void> {
+  // `onememory mcp` (the installed bin), not an absolute path into the
+  // package: that path changes on every update / npx cache refresh.
+  console.log("Wire onememory into your agent (local, over stdio):\n");
+  console.log("Claude Code:");
+  console.log("  claude mcp add onememory -- onememory mcp\n");
+  console.log("Claude Desktop / Cursor / Copilot — add to the MCP config:");
+  console.log(
+    JSON.stringify({ mcpServers: { onememory: { command: "onememory", args: ["mcp"] } } }, null, 2)
+  );
+  console.log(
+    "\nNot installed globally? Use npx instead: command \"npx\", args [\"-y\", \"onememory-mcp\", \"mcp\"]."
+  );
+  console.log("See INSTALL.md for every client, and INFRA.md to reach your phone.");
+}
+
+async function reindex(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const { embeddingsEnabled, embeddingsConfig, embed, noteEmbeddingText } = await import(
+    "./embeddings.js"
+  );
+
+  if (!embeddingsEnabled()) {
+    console.error(
+      "Embeddings are off. Set ONEMEMORY_EMBEDDINGS=on (and, if needed, " +
+        "ONEMEMORY_EMBED_URL / ONEMEMORY_EMBED_MODEL) before reindexing."
+    );
+    return;
+  }
+
+  const cfg = embeddingsConfig();
+  const store = new Store(DB_PATH);
+  // `reindex all` recomputes every note's vector -- use it after changing the
+  // embedding model or its dimension. Plain `reindex` only fills missing ones.
+  const all = process.argv[3] === "all";
+  const ids = all
+    ? store.exportAll().map((n) => n.id)
+    : store.noteIdsMissingVectors();
+  console.error(
+    `onememory reindex${all ? " all" : ""}: ${ids.length} note(s) to embed (model ${cfg.model}).`
+  );
+
+  let done = 0;
+  let failed = 0;
+  for (const id of ids) {
+    const note = store.read(id);
+    if (!note) continue;
+    const vec = await embed(noteEmbeddingText(note.title, note.body), cfg);
+    if (vec) {
+      store.setVector(id, vec, cfg.model);
+      done += 1;
+    } else {
+      failed += 1;
+    }
+  }
+  store.close();
+  console.error(
+    `Done. Embedded ${done}, failed ${failed}. Total vectors now: see 'doctor'.`
+  );
+}
+
+async function recall(): Promise<void> {
+  // Claude Code SessionStart hook. FAIL-SILENT by design: always prints a
+  // valid hook JSON payload and exits 0, whatever happens -- including a
+  // module-load failure (broken install), which degrades to the
+  // empty-context payload instead of a crash.
+  const emptyHookJson =
+    '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""}}';
+  const recallMod: typeof import("./recall.js") | undefined = await import(
+    "./recall.js"
+  ).catch((e: Error) => {
+    console.error(
+      `onememory recall: failed to load recall module (${e.message}); returning empty context`
+    );
+    return undefined;
+  });
+  if (!recallMod) {
+    console.log(emptyHookJson);
+    process.exit(0);
+  }
+
+  const args = process.argv.slice(3);
+  const flag = (name: string): string | undefined => {
+    const eq = args.find((a) => a.startsWith(name + "="));
+    if (eq) return eq.slice(name.length + 1);
+    const i = args.indexOf(name);
+    return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
+  };
+  // A typo like --limt silently degrades the hook (the flag is ignored);
+  // say so on stderr instead. Exit code stays 0 -- fail-silent by design.
+  for (const a of args) {
+    if (
+      a.startsWith("-") &&
+      !a.startsWith("--budget-ms") &&
+      !a.startsWith("--limit")
+    ) {
+      console.error(`onememory recall: unknown option "${a}" ignored`);
+    }
+  }
+  const numFlag = (name: string, fallback: number): number => {
+    const raw = flag(name);
+    if (raw === undefined) return fallback;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) {
+      // --budget-ms 0 (or garbage) used to silently become the default.
+      console.error(
+        `onememory recall: ignoring invalid ${name} "${raw}" (using ${fallback})`
+      );
+      return fallback;
+    }
+    return Math.floor(n);
+  };
+  console.log(
+    await recallMod.runRecall({
+      budgetMs: numFlag("--budget-ms", 800),
+      limit: numFlag("--limit", 10),
+    })
+  );
+  process.exit(0);
+}
+
+// Find near-duplicate notes and merge them. Safe by default: without --yes
+// (or with --dry-run) this only reports candidates and previews merges —
+// nothing is written. Pass --yes to actually merge.
+async function consolidate(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const {
+    findCandidatesCooperative,
+    consolidateNotes,
+    buildConsolidationPreview,
+    groupCandidateIds,
+    clampThreshold,
+    thresholdWasClamped,
+    THRESHOLD_MIN,
+    THRESHOLD_MAX,
+  } = await import("./consolidate.js");
+  const { maybeEmbed } = await import("./search-service.js");
+
+  const args = process.argv.slice(3);
+  let dryRun = false;
+  let yes = false;
+  let namespace: string | undefined;
+  let thresholdRaw: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--dry-run") dryRun = true;
+    else if (a === "--yes" || a === "-y") yes = true;
+    else if (a === "--namespace" && i + 1 < args.length) namespace = args[++i];
+    else if (a.startsWith("--namespace=")) namespace = a.slice("--namespace=".length);
+    else if (a === "--threshold" && i + 1 < args.length) thresholdRaw = args[++i];
+    else if (a.startsWith("--threshold=")) thresholdRaw = a.slice("--threshold=".length);
+    else {
+      console.error(`Unknown option: ${a}`);
+      process.exit(1);
+    }
+  }
+  const rawThreshold =
+    thresholdRaw !== undefined ? Number(thresholdRaw) : undefined;
+  const threshold = clampThreshold(rawThreshold, 0.95);
+  if (thresholdWasClamped(rawThreshold)) {
+    // Don't silently rewrite user input: say what happened.
+    console.error(
+      `Warning: --threshold "${thresholdRaw}" is outside ${THRESHOLD_MIN}..${THRESHOLD_MAX}; using ${threshold}`
+    );
+  }
+
+  const store = new Store(DB_PATH);
+  try {
+    const notes = store
+      .exportAll({ live: true })
+      .filter((n) => !namespace || n.namespace === namespace);
+    // Cooperative scan: yields to the event loop so a large sweep doesn't
+    // stall; identical results to the sync version.
+    const candidates = await findCandidatesCooperative(notes, { threshold });
+    if (candidates.length === 0) {
+      console.log("No duplicate candidates found.");
+      return;
+    }
+    const byId = new Map(notes.map((n) => [n.id, n]));
+    console.log(
+      `Found ${candidates.length} duplicate candidate pair(s) (threshold ${threshold}):`
+    );
+    for (const c of candidates) {
+      console.log(
+        `  #${c.idA} "${byId.get(c.idA)?.title}" <-> #${c.idB} "${byId.get(c.idB)?.title}" ` +
+          `(score ${c.score.toFixed(3)})`
+      );
+    }
+
+    // Connected components: an A-B, B-C chain merges as one group so the
+    // second pair never trips over the first pair's deleted note.
+    const groups = groupCandidateIds(candidates);
+
+    if (dryRun) {
+      for (const g of groups) {
+        const gnotes = g.map((id) => byId.get(id)!).filter(Boolean);
+        const p = buildConsolidationPreview(gnotes);
+        // The preview shows the FULL merged body: approving a destructive
+        // merge from title/tag-count/body-length alone is approving blind.
+        console.log(
+          `\nWould merge [${g.join(", ")}] -> title "${p.title}" ` +
+            `(${p.tags.length} tag(s), namespace "${p.namespace}")`
+        );
+        console.log("--- merged body ---");
+        console.log(p.body);
+        console.log("--- end merged body ---");
+      }
+      return;
+    }
+    if (!yes) {
+      console.log("\nRe-run with --yes to merge these, or --dry-run for a merge preview.");
+      return;
+    }
+
+    let mergedCount = 0;
+    for (const g of groups) {
+      try {
+        const merged = consolidateNotes(store, g, { deleteSources: true });
+        // Make the merged note visible to semantic search (consolidateNotes
+        // itself doesn't embed; store.create is embedding-agnostic).
+        await maybeEmbed(store, merged);
+        console.log(`Merged [${g.join(", ")}] -> #${merged.id} "${merged.title}"`);
+        mergedCount += 1;
+      } catch (e) {
+        console.error(`Skipped [${g.join(", ")}]: ${(e as Error).message}`);
+      }
+    }
+    console.log(`Done: ${mergedCount} merge(s).`);
+  } finally {
+    store.close();
+  }
+}
+
+// `onememory relevant "message" [--limit 5] [--namespace ns]`: keyword
+// extraction + permissive search over the local store. Prints the keywords
+// used (transparency) and the matching notes.
+async function relevant(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const { runRelevantSearch } = await import("./search-service.js");
+
+  const args = process.argv.slice(3);
+  let limit: number | undefined;
+  let namespace: string | undefined;
+  const parts: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--limit" && i + 1 < args.length) limit = Number(args[++i]);
+    else if (a.startsWith("--limit=")) limit = Number(a.slice("--limit=".length));
+    else if (a === "--namespace" && i + 1 < args.length) namespace = args[++i];
+    else if (a.startsWith("--namespace=")) namespace = a.slice("--namespace=".length);
+    else if (a.startsWith("-")) {
+      console.error(`Unknown option: ${a}`);
+      process.exit(1);
+    } else parts.push(a);
+  }
+  const message = parts.join(" ");
+  if (!message.trim()) {
+    console.error('Usage: onememory relevant "some natural language message" [--limit 5] [--namespace ns]');
+    process.exit(1);
+  }
+  const store = new Store(DB_PATH);
+  try {
+    const { annotateStaleness } = await import("./staleness.js");
+    const { keywords, results } = await runRelevantSearch(store, message, {
+      namespace,
+      limit: limit ?? 5,
+    });
+    console.log(`Keywords: ${keywords.length > 0 ? keywords.join(", ") : "(none)"}`);
+    if (results.length === 0) {
+      console.log("No relevant notes found.");
+      return;
+    }
+    console.log(`Relevant notes (${results.length}):`);
+    for (const n of results) {
+      const ann = annotateStaleness(n);
+      const stale = ann.stale ? ` [stale, ${ann.ageDays}d]` : "";
+      console.log(`  #${n.id} [${n.namespace}] ${n.title}${stale}`);
+    }
+  } finally {
+    store.close();
+  }
+}
+
+// Recalculate the similarity edge graph from scratch. The store owns the
+// cooperative O(n^2) rebuild; the CLI prices the work up front (pair count),
+// refuses when another process holds the write lock (unless --force), asks
+// for confirmation on large rebuilds (unless --yes), and streams progress
+// to stderr so a long run never looks hung.
+async function rebuildEdges(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const {
+    Store,
+    ValidationError,
+    EDGE_SIMILARITY_THRESHOLD,
+    REBUILD_CONFIRM_PAIR_COUNT,
+  } = await import("./store.js");
+
+  const args = process.argv.slice(3);
+  let thresholdRaw: string | undefined;
+  let yes = false;
+  let force = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--threshold" && i + 1 < args.length) thresholdRaw = args[++i];
+    else if (a.startsWith("--threshold=")) thresholdRaw = a.slice("--threshold=".length);
+    else if (a === "--yes" || a === "-y") yes = true;
+    else if (a === "--force") force = true;
+    else {
+      console.error(`Unknown option: ${a}`);
+      process.exit(1);
+    }
+  }
+  const threshold = thresholdRaw !== undefined ? Number(thresholdRaw) : undefined;
+
+  // P-LOW-3: resolve the namespace from the cwd when server-side namespace
+  // resolution is configured, and confine the rebuild to it -- mirroring
+  // the MCP memory_rebuild_edges tool (writes stay local). Without
+  // resolution the whole store is rebuilt (legacy behavior).
+  const { resolveStartupNamespace } = await import("./namespace.js");
+  const nsOpts = resolveStartupNamespace(process.cwd());
+  const namespace = nsOpts ? nsOpts.namespace : undefined;
+  if (nsOpts) {
+    console.error(
+      `[onememory] namespace resolution ACTIVE: rebuilding namespace "${namespace}" only`
+    );
+  }
+
+  const store = new Store(DB_PATH);
+  try {
+    // Never contend with a running server's writes: a second process
+    // holding BEGIN IMMEDIATE used to starve the server (SQLITE_BUSY for
+    // clients). Probe a few times to ride out transient writes; refuse if
+    // the lock stays held. --force overrides for operators who know the
+    // server is down.
+    if (!force) {
+      let busy = false;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (store.writeLockHeld()) {
+          busy = true;
+          await new Promise((r) => setTimeout(r, 250));
+        } else {
+          busy = false;
+          break;
+        }
+      }
+      if (busy) {
+        console.error(
+          "Refusing: another process holds the database write lock (is the server running?). " +
+            "Re-run when it is idle, or pass --force if you are sure nothing is writing."
+        );
+        process.exit(1);
+      }
+    }
+
+    const plan = store.rebuildPlan({ namespace });
+    const notes = plan.reduce((s, g) => s + g.notes, 0);
+    const pairs = plan.reduce((s, g) => s + g.pairs, 0);
+    console.error(
+      `Rebuilding similarity edges${namespace ? ` (namespace "${namespace}")` : ""}: ` +
+        `${notes} notes, ~${pairs.toLocaleString("en-US")} pairs to score.`
+    );
+    if (pairs > REBUILD_CONFIRM_PAIR_COUNT && !yes) {
+      if (!process.stdin.isTTY) {
+        console.error(
+          `Refusing: ~${pairs.toLocaleString("en-US")} pairs exceeds the ` +
+            `${REBUILD_CONFIRM_PAIR_COUNT.toLocaleString("en-US")}-pair confirmation threshold ` +
+            "and stdin is not interactive. Re-run with --yes to proceed non-interactively."
+        );
+        process.exit(1);
+      }
+      const ok = await askYesNo(
+        `Score ~${pairs.toLocaleString("en-US")} pairs across ${notes} notes? [y/N] `
+      );
+      if (!ok) {
+        console.error("Aborted.");
+        process.exit(1);
+      }
+    }
+
+    const t0 = Date.now();
+    const { created, removed } = await store.rebuildEdgesCooperative({
+      threshold,
+      namespace,
+      onProgress: (done, total) => {
+        const pct = total > 0 ? Math.floor((done / total) * 100) : 100;
+        process.stderr.write(
+          `\rRebuilding edges: ${done.toLocaleString("en-US")}/${total.toLocaleString("en-US")} pairs (${pct}%)`
+        );
+      },
+    });
+    process.stderr.write("\n");
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(
+      `Rebuilt similarity edges (threshold ${threshold ?? EDGE_SIMILARITY_THRESHOLD}): ` +
+        `${created} created, ${removed} removed ` +
+        `(${pairs.toLocaleString("en-US")} pairs scored in ${secs}s).`
+    );
+  } catch (e) {
+    // A bad threshold is a usage error, not a crash: say so and exit 1.
+    if (e instanceof ValidationError) {
+      console.error(`Error: ${(e as Error).message}`);
+      process.exit(1);
+    }
+    throw e;
+  } finally {
+    store.close();
+  }
+}
+
+/** Tiny flag parser: --name value / --name=value / boolean flags. */
+function parseFlags(
+  args: string[],
+  spec: { values: string[]; bools: string[] }
+): { flags: Record<string, string | true>; rest: string[] } {
+  const flags: Record<string, string | true> = {};
+  const rest: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    const eq = a.indexOf("=");
+    const name = a.startsWith("--") ? (eq > 0 ? a.slice(2, eq) : a.slice(2)) : null;
+    if (name && spec.values.includes(name)) {
+      if (eq > 0) flags[name] = a.slice(eq + 1);
+      else if (i + 1 < args.length) flags[name] = args[++i];
+      else {
+        console.error(`Missing value for --${name}`);
+        process.exit(1);
+      }
+    } else if (name && spec.bools.includes(name)) {
+      flags[name] = true;
+    } else if (a.startsWith("-")) {
+      console.error(`Unknown option: ${a}`);
+      process.exit(1);
+    } else rest.push(a);
+  }
+  return { flags, rest };
+}
+
+const str = (v: string | true | undefined): string | undefined => (typeof v === "string" ? v : undefined);
+
+// `onememory changes`: the change feed over the local store (full local
+// trust, like every CLI command). Prints every page.
+async function changes(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store, ValidationError } = await import("./store.js");
+  const { runChanges } = await import("./changes.js");
+  const { flags } = parseFlags(process.argv.slice(3), {
+    values: ["since", "consumer", "namespace", "source", "limit"],
+    bools: ["json", "purge"],
+  });
+  const store = new Store(DB_PATH);
+  try {
+    if (flags.purge) {
+      const n = store.purgeChangeLogAll();
+      console.log(`Purged ${n} change-log row(s) and every "last" marker.`);
+      return;
+    }
+    const base = {
+      namespaces: str(flags.namespace) ? [str(flags.namespace)!] : undefined,
+      source: str(flags.source),
+      limit: str(flags.limit) ? Number(flags.limit) : undefined,
+    };
+    let page = runChanges(store, {
+      ...base,
+      since: str(flags.since) ?? "24h",
+      consumer: str(flags.consumer),
+    });
+    if (flags.json) {
+      const all = [...page.changes];
+      while (page.nextCursor) {
+        page = runChanges(store, { ...base, cursor: page.nextCursor });
+        all.push(...page.changes);
+      }
+      console.log(JSON.stringify({ ...page, changes: all, nextCursor: null }, null, 2));
+      return;
+    }
+    const c = page.counts;
+    console.log(
+      `Changes ${page.since} -> ${page.until}: ${c.created} created, ${c.updated} updated, ${c.deleted} deleted` +
+        (page.quarantined ? `, ${page.quarantined} quarantined` : "")
+    );
+    for (const [src, n] of Object.entries(page.bySource)) {
+      console.log(`  ${src || "(no source)"}: +${n.created} ~${n.updated} -${n.deleted}`);
+    }
+    for (;;) {
+      for (const e of page.changes) {
+        const mark = e.kind === "created" ? "+" : e.kind === "updated" ? "~" : "-";
+        console.log(`${mark} #${e.id} [${e.namespace}] ${e.title}  (${e.at}${e.source ? `, ${e.source}` : ""})`);
+      }
+      if (!page.nextCursor) break;
+      page = runChanges(store, { ...base, cursor: page.nextCursor });
+    }
+  } catch (e) {
+    if (e instanceof ValidationError) {
+      console.error(`Error: ${e.message}`);
+      process.exit(1);
+    }
+    throw e;
+  } finally {
+    store.close();
+  }
+}
+
+// `onememory export --format md --dir <path>` / `--format json [--out f]`.
+async function exportCmd(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const { flags } = parseFlags(process.argv.slice(3), {
+    values: ["format", "dir", "namespace", "out"],
+    bools: ["no-prune", "force"],
+  });
+  const format = str(flags.format) ?? (str(flags.dir) ? "md" : undefined);
+  const { EXPORT_PAGE_SIZE } = await import("./store.js");
+  const store = new Store(DB_PATH);
+  try {
+    if (format === "json") {
+      const ns = str(flags.namespace);
+      // STREAMED export: the old path called exportAll() then JSON.stringify
+      // on the whole array, holding every row + record + the finished string
+      // in memory at once (~3x the backup). With months of notes that spikes
+      // hard on a small box. exportBatch pages by primary key so peak memory
+      // is one page. The output is still valid {"notes":[...]} JSON, only
+      // pretty-printed with one note per line so diffs stay readable.
+      const { createWriteStream, mkdirSync } = await import("node:fs");
+      const { dirname } = await import("node:path");
+      const { chmodQuiet } = await import("./config.js");
+
+      const outPath = str(flags.out);
+      let out: NodeJS.WritableStream;
+      if (outPath) {
+        mkdirSync(dirname(outPath), { recursive: true });
+        out = createWriteStream(outPath, { mode: 0o600 });
+      } else {
+        out = process.stdout;
+      }
+      const write = (s: string): Promise<void> =>
+        out.write(s) ? Promise.resolve() : new Promise((r) => out.once("drain", r));
+
+      await write('{\n  "notes": [\n');
+      let afterId = 0;
+      let first = true;
+      let count = 0;
+      for (;;) {
+        const page = store.exportBatch(afterId, EXPORT_PAGE_SIZE);
+        if (page.length === 0) break;
+        afterId = page[page.length - 1].id;
+        for (const note of page) {
+          if (ns && note.namespace !== ns) continue;
+          await write((first ? "" : ",\n") + "    " + JSON.stringify(note));
+          first = false;
+          count++;
+        }
+        if (page.length < EXPORT_PAGE_SIZE) break;
+      }
+      await write("\n  ]\n}\n");
+      if (outPath && "end" in out) {
+        await new Promise<void>((resolve, reject) => {
+          out.end(() => resolve());
+          out.on("error", reject);
+        });
+        chmodQuiet(outPath, 0o600); // mode only applies on create
+        console.error(`Exported ${count} note(s) to ${outPath}`);
+      }
+      return;
+    }
+    if (format !== "md" || !str(flags.dir)) {
+      console.error("Usage: onememory export --format md --dir <path> [--namespace ns] [--no-prune] [--force]");
+      console.error("       onememory export --format json [--out file]");
+      process.exit(1);
+    }
+    const { exportMarkdown } = await import("./sync.js");
+    const r = exportMarkdown(store, str(flags.dir)!, {
+      namespace: str(flags.namespace),
+      prune: !flags["no-prune"],
+      force: flags.force === true,
+    });
+    console.log(
+      `Exported ${r.notes} note(s) to ${r.dir}: ${r.written} written, ${r.unchanged} unchanged, ${r.removed} removed.`
+    );
+    for (const s of r.skipped ?? []) console.error(`skipped     ${s.file} — ${s.detail}`);
+    if (r.skipped?.length) {
+      console.error(
+        `${r.skipped.length} file(s) were edited outside OneMemory since the last sync and were NOT overwritten. ` +
+          "Run `onememory import` first, or re-run export with --force (the edited files are saved to .conflicts/)."
+      );
+    }
+  } finally {
+    store.close();
+  }
+}
+
+// `onememory import --dir <path> [--dry-run]`: merge Markdown files back.
+async function importCmd(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store, ValidationError } = await import("./store.js");
+  const { importMarkdown } = await import("./sync.js");
+  const { flags } = parseFlags(process.argv.slice(3), {
+    values: ["dir"],
+    bools: ["dry-run", "json", "allow-move"],
+  });
+  if (!str(flags.dir)) {
+    console.error("Usage: onememory import --dir <path> [--dry-run] [--allow-move]");
+    process.exit(1);
+  }
+  const store = new Store(DB_PATH);
+  try {
+    const r = await importMarkdown(store, str(flags.dir)!, { dryRun: flags["dry-run"] === true, allowMove: flags["allow-move"] === true });
+    if (flags.json) {
+      console.log(JSON.stringify(r, null, 2));
+      return;
+    }
+    for (const e of r.entries) {
+      if (e.action === "unchanged") continue;
+      console.log(`${e.action.padEnd(11)} ${e.file}${e.id ? ` (#${e.id})` : ""}${e.detail ? ` — ${e.detail}` : ""}`);
+    }
+    const c = r.counts;
+    console.log(
+      `${flags["dry-run"] ? "[dry run] " : ""}Imported from ${r.dir}: ${c.created} created, ${c.updated} updated, ` +
+        `${c.restored} restored, ${c.unchanged} unchanged, ${c.skipped} skipped, ${c.conflict} conflict(s), ` +
+        `${c.quarantined} quarantined, ${c.rejected} rejected.`
+    );
+  } catch (e) {
+    if (e instanceof ValidationError) {
+      console.error(`Error: ${e.message}`);
+      process.exit(1);
+    }
+    throw e;
+  } finally {
+    store.close();
+  }
+}
+
+// `onememory quarantine [list | approve <id> | reject <id>]`.
+async function quarantineCmd(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store, ValidationError } = await import("./store.js");
+  const { maybeEmbed } = await import("./search-service.js");
+  const [action = "list", idRaw] = process.argv.slice(3);
+  const store = new Store(DB_PATH);
+  try {
+    if (action === "list") {
+      const items = store.listQuarantine({ limit: 500 });
+      if (items.length === 0) {
+        console.log("Quarantine is empty.");
+        return;
+      }
+      for (const q of items) {
+        const what = q.op === "update" ? `update of #${q.target_id}` : "new note";
+        console.log(`#${q.id} [${q.namespace}] ${what}: ${q.title ?? "(title unchanged)"}  (${q.created_at})`);
+        console.log(`    reasons: ${q.reasons.map((r) => `${r.label} in ${r.field}`).join("; ")}`);
+        if (q.body) {
+          const preview = q.body.length > 200 ? q.body.slice(0, 200) + "…" : q.body;
+          console.log(`    body: ${preview.replace(/\n/g, "\n          ")}`);
+        }
+      }
+      return;
+    }
+    const id = Number(idRaw);
+    if ((action !== "approve" && action !== "reject") || !Number.isInteger(id)) {
+      console.error("Usage: onememory quarantine [list | approve <id> | reject <id>]");
+      process.exit(1);
+    }
+    if (action === "reject") {
+      if (!store.rejectQuarantine(id)) {
+        console.error(`No quarantined write with id ${id}`);
+        process.exit(1);
+      }
+      console.log(`Rejected quarantined write #${id}.`);
+      return;
+    }
+    const note = store.approveQuarantine(id);
+    await maybeEmbed(store, note);
+    console.log(`Approved #${id} -> note #${note.id} "${note.title}"`);
+  } catch (e) {
+    if (e instanceof ValidationError) {
+      console.error(`Error: ${e.message}`);
+      process.exit(1);
+    }
+    throw e;
+  } finally {
+    store.close();
+  }
+}
+
+/**
+ * `onememory encrypt <enable|status|disable>` -- at-rest body encryption.
+ *
+ * enable  creates the AES-256-GCM key (if absent) and encrypts every
+ *         plaintext body in place. disable decrypts them and removes the key.
+ * Both open the store AFTER touching the key file, so the Store constructor
+ * picks up the new encryption state. See docs/encryption-retention.md.
+ */
+async function encryptCmd(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const crypto = await import("./crypto.js");
+  const { dirname } = await import("node:path");
+  const { existsSync, renameSync, rmSync } = await import("node:fs");
+  // ONE key resolver: the same directory the Store itself looks in (beside
+  // the database), so ONEMEMORY_DB_PATH pointing elsewhere cannot split the
+  // key from the data.
+  const keyDir = dirname(DB_PATH);
+  const [action] = process.argv.slice(3);
+
+  if (action !== "enable" && action !== "status" && action !== "disable") {
+    console.error("Usage: onememory encrypt <enable|status|disable>");
+    process.exit(1);
+  }
+
+  if (action === "status") {
+    const store = new Store(DB_PATH); // opening restores a key stranded by a crashed `disable`
+    const enabled = crypto.encryptionEnabled(keyDir);
+    const keyFile = crypto.keyPath(keyDir);
+    try {
+      console.log(`encryption: ${enabled ? "on" : "off"}`);
+      console.log(`key file:   ${keyFile}${enabled ? "" : " (not present)"}`);
+      console.log(`encrypted bodies: ${store.encryptedCount()}`);
+      if (enabled) {
+        console.log(
+          "note: keyword search covers title+tags only for encrypted notes " +
+            "(bodies are not indexed as ciphertext)."
+        );
+      }
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  if (action === "enable") {
+    // Create the key, then encrypt. A running server notices the key file on
+    // its next write (it checks per write, under the write lock), so notes
+    // written meanwhile are sealed too -- and encryptAll picks up any that
+    // slipped in as plaintext before the key existed.
+    const key = crypto.ensureKey(keyDir);
+    const store = new Store(DB_PATH);
+    try {
+      // Verify the Store sees the very key we just made before touching data.
+      if (!existsSync(crypto.keyPath(keyDir))) throw new Error("key file vanished after creation");
+      const n = store.encryptAll(key);
+      console.log(`Enabled at-rest encryption. Encrypted ${n} note ${n === 1 ? "body" : "bodies"}.`);
+      console.log(`Key file: ${crypto.keyPath(keyDir)} -- back it up; losing it loses the bodies.`);
+      console.log("Keyword search now covers title+tags only (bodies cannot be indexed as ciphertext).");
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  // disable: decrypt everything BEFORE removing the key, so a failure leaves
+  // the store untouched and still readable. The key file is moved aside
+  // INSIDE the decrypting transaction (under the write lock): a running
+  // server's next write then sees "no key" and stores plaintext, instead of
+  // sealing a body with a key that is about to be deleted.
+  new Store(DB_PATH).close(); // opening restores a key stranded by a crashed `disable`
+  const key = crypto.loadKey(keyDir);
+  if (!key) {
+    console.error("Encryption is not enabled (no key file); nothing to disable.");
+    process.exit(1);
+  }
+  const keyFile = crypto.keyPath(keyDir);
+  const aside = `${keyFile}.disabling-${process.pid}`;
+  let moved = false;
+  const store = new Store(DB_PATH);
+  let decrypted: number;
+  try {
+    decrypted = store.decryptAll(key, {
+      beforeCommit: () => {
+        renameSync(keyFile, aside);
+        moved = true;
+      },
+    });
+  } catch (e) {
+    if (moved && !existsSync(keyFile)) renameSync(aside, keyFile); // commit failed: keep the key
+    throw e;
+  } finally {
+    store.close();
+  }
+  // Delete the key only after every body decrypted and the transaction committed.
+  rmSync(aside, { force: true });
+  console.log(`Disabled at-rest encryption. Decrypted ${decrypted} note ${decrypted === 1 ? "body" : "bodies"}.`);
+  console.log("Key file removed. Keyword search again covers full body text.");
+}
+
+/** TTY yes/no prompt; anything but y/yes aborts. */
+function askYesNo(prompt: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    rl.question(prompt, (answer: string) => {
+      rl.close();
+      resolve(/^y(es)?$/i.test(answer.trim()));
+    });
+  });
+}
+
+async function main(): Promise<void> {
+  const cmd = process.argv[2] || "start";
+  if (cmd === "--version" || cmd === "-v" || cmd === "version") {
+    const { PACKAGE_VERSION } = await import("./config.js");
+    console.log(PACKAGE_VERSION);
+    return;
+  }
+  // Move 1.0.x state out of the package before anything opens the DB.
+  if (!["help", "--help", "-h", "init"].includes(cmd)) (await import("./config.js")).prepareDataDir();
+  switch (cmd) {
+    case "start":
+    case "serve":
+      await import("./start.js");
+      break;
+    case "mcp":
+    case "mcp:stdio":
+      await import("./mcp-stdio.js");
+      break;
+    case "doctor":
+      await doctor();
+      break;
+    case "init":
+      await init();
+      break;
+    case "reindex":
+      await reindex();
+      break;
+    case "recall":
+      await recall();
+      break;
+    case "consolidate":
+      await consolidate();
+      break;
+    case "rebuild-edges":
+      await rebuildEdges();
+      break;
+    case "relevant":
+      await relevant();
+      break;
+    case "changes":
+      await changes();
+      break;
+    case "export":
+      await exportCmd();
+      break;
+    case "import":
+      await importCmd();
+      break;
+    case "quarantine":
+      await quarantineCmd();
+      break;
+    case "encrypt":
+      await encryptCmd();
+      break;
+    case "help":
+    case "--help":
+    case "-h":
+      usage();
+      break;
+    default:
+      console.error(`Unknown command: ${cmd}\n`);
+      usage();
+      process.exit(1);
+  }
+}
+
+main().catch((e) => {
+  console.error((e as Error).message);
+  process.exit(1);
+});

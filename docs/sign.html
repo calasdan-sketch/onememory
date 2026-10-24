@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<!-- No third-party anything. The page may hold a signing secret in memory,
+     so give an injected script as little to work with as possible. -->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src *; form-action 'none'; base-uri 'none'" />
+<title>OneMemory — send a command</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 16px/1.5 system-ui, -apple-system, Segoe UI, sans-serif;
+    margin: 0 auto; padding: 1.25rem; max-width: 34rem;
+  }
+  h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
+  p.sub { margin: 0 0 1.5rem; opacity: .7; font-size: .9rem; }
+  label { display: block; margin: .9rem 0 .25rem; font-weight: 600; font-size: .85rem; }
+  input, textarea, button {
+    width: 100%; box-sizing: border-box; font: inherit;
+    padding: .6rem .7rem; border-radius: .5rem;
+    border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+    background: transparent; color: inherit;
+  }
+  textarea { min-height: 7rem; font-family: ui-monospace, monospace; font-size: .8rem; }
+  button { margin-top: 1rem; font-weight: 600; cursor: pointer; }
+  button.primary { background: #155F87; color: #fff; border-color: #155F87; }
+  .row { display: flex; gap: .6rem; }
+  .row > * { flex: 1; }
+  .note {
+    margin-top: 1.5rem; padding: .75rem .9rem; font-size: .82rem;
+    border-left: 3px solid #F0C171; opacity: .85;
+  }
+  #out { white-space: pre-wrap; word-break: break-all; }
+  .ok { color: #1a7f4b; } .err { color: #b3261e; }
+</style>
+</head>
+<body>
+<h1>Send a command</h1>
+<p class="sub">Signs it on this device. The secret is used here and never sent to the store.</p>
+
+<label for="secret">Runner secret</label>
+<input id="secret" type="password" autocomplete="off" placeholder="same value as ONEMEMORY_RUNNER_SECRET" />
+<label style="font-weight:400; display:flex; gap:.5rem; align-items:center; margin-top:.5rem;">
+  <input id="remember" type="checkbox" style="width:auto;" />
+  Remember the secret and token on this device
+</label>
+
+<label for="action">Action</label>
+<input id="action" placeholder="status  (or __actions to ask what's allowed)" value="__actions" />
+
+<label for="params">Parameters — one key=value per line</label>
+<textarea id="params" placeholder="repo=calas-site" style="min-height:4rem"></textarea>
+
+<label for="target">Target machine (optional)</label>
+<input id="target" placeholder="leave blank for any listener" />
+
+<div class="row">
+  <div>
+    <label for="url">Store URL (blank = this site)</label>
+    <input id="url" placeholder="leave blank if you opened this from your store" />
+  </div>
+  <div>
+    <label for="token">Store token</label>
+    <input id="token" type="password" autocomplete="off" />
+  </div>
+</div>
+
+<button id="make">Build signed command</button>
+<button id="send" class="primary">Build and send</button>
+
+<label for="out">Result</label>
+<textarea id="out" readonly></textarea>
+<button id="copy">Copy</button>
+
+<h1 style="margin-top:2rem">Check a result</h1>
+<p class="sub">Results and the heartbeat are signed by the PC. Anyone with a store
+token can write a note that <em>looks</em> like a result; only a signed one is real.</p>
+<label for="check">Command id, the word <code>heartbeat</code>, or a pasted note body</label>
+<textarea id="check" style="min-height:4rem" placeholder="9f1c...  or  heartbeat  or  { ... }"></textarea>
+<button id="verify">Check</button>
+<label for="checkout">Verdict</label>
+<textarea id="checkout" readonly style="min-height:5rem"></textarea>
+
+<p class="note">
+  If you only build it, paste the result into a new note in your
+  <strong>commands</strong> namespace. The PC replies in <strong>results</strong>
+  within one poll. Check the <strong>runner heartbeat</strong> note first if
+  nothing comes back — a stale heartbeat means the PC is not listening, which
+  is a different problem from a command being refused.
+</p>
+
+<script type="module">
+import { buildCommand, verifyResult } from "./signer.js";
+
+const $ = (id) => document.getElementById(id);
+// Two tiers on purpose. The URL and target are harmless, so they persist.
+// The SECRET and STORE TOKEN are credentials: anything that can run script in
+// this page could read them back out of localStorage, and a phone gets lost
+// or lent out. So they are kept only in memory unless you deliberately ask
+// otherwise, and unticking the box wipes what was stored.
+const HARMLESS = ["url", "target"];
+const SENSITIVE = ["secret", "token"];
+
+for (const k of HARMLESS) {
+  const saved = localStorage.getItem("om." + k);
+  if (saved) $(k).value = saved;
+  $(k).addEventListener("change", () => localStorage.setItem("om." + k, $(k).value));
+}
+
+const remembering = localStorage.getItem("om.remember") === "1";
+$("remember").checked = remembering;
+if (remembering) {
+  for (const k of SENSITIVE) {
+    const saved = localStorage.getItem("om." + k);
+    if (saved) $(k).value = saved;
+  }
+}
+
+function persistSensitive() {
+  if ($("remember").checked) {
+    localStorage.setItem("om.remember", "1");
+    for (const k of SENSITIVE) localStorage.setItem("om." + k, $(k).value);
+  } else {
+    localStorage.removeItem("om.remember");
+    for (const k of SENSITIVE) localStorage.removeItem("om." + k);
+  }
+}
+$("remember").addEventListener("change", persistSensitive);
+for (const k of SENSITIVE) $(k).addEventListener("change", persistSensitive);
+
+function readParams() {
+  const out = {};
+  for (const line of $("params").value.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    const eq = t.indexOf("=");
+    if (eq <= 0) throw new Error(`expected key=value, got "${t}"`);
+    out[t.slice(0, eq).trim()] = t.slice(eq + 1).trim();
+  }
+  return out;
+}
+
+async function build() {
+  const secret = $("secret").value.trim();
+  if (!secret) throw new Error("enter your runner secret");
+  const action = $("action").value.trim();
+  if (!action) throw new Error("enter an action");
+  return buildCommand(secret, action, readParams(), $("target").value.trim());
+}
+
+function show(text, cls) {
+  $("out").value = text;
+  $("out").className = cls || "";
+}
+
+$("make").addEventListener("click", async () => {
+  try {
+    show(JSON.stringify(await build(), null, 2));
+  } catch (e) {
+    show("Error: " + e.message, "err");
+  }
+});
+
+$("send").addEventListener("click", async () => {
+  try {
+    // Served by the store itself? Then the store is this page's own origin.
+    const url = storeBase();
+    const token = $("token").value.trim();
+    if (!url || !token) throw new Error("store URL and token are both needed to send");
+    const cmd = await build();
+    const res = await fetch(url + "/notes", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        namespace: "commands",
+        title: "cmd " + cmd.action,
+        body: JSON.stringify(cmd, null, 2),
+        tags: ["command"],
+        source: "sign.html",
+      }),
+    });
+    if (!res.ok) throw new Error(res.status + " " + (await res.text()));
+    show("Sent. Watch for result " + cmd.cmd_id + " in the results namespace.", "ok");
+  } catch (e) {
+    show("Error: " + e.message, "err");
+  }
+});
+
+function storeBase() {
+  const sameOrigin = location.protocol.startsWith("http") ? location.origin : "";
+  return ($("url").value.trim() || sameOrigin).replace(/\/$/, "");
+}
+
+function describe(v, wantId) {
+  const p = v.payload;
+  if (v.kind === "heartbeat") {
+    const age = Math.round((Date.now() - Date.parse(p.alive_at)) / 1000);
+    return `AUTHENTIC heartbeat from ${p.runner || p.host}: alive ${age}s ago (at ${p.alive_at}).`;
+  }
+  if (wantId && p.cmd_id !== wantId) return null; // signed, but for another command
+  let text = `AUTHENTIC result for ${p.cmd_id}: ${p.status}` + (p.reason ? ` (${p.reason})` : "");
+  if (p.exit_code !== undefined) text += `, exit ${p.exit_code}`;
+  if (p.stdout) text += `\n\n${p.stdout}`;
+  if (p.stderr) text += `\n\nstderr:\n${p.stderr}`;
+  return text;
+}
+
+$("verify").addEventListener("click", async () => {
+  const out = (t, cls) => { $("checkout").value = t; $("checkout").className = cls || ""; };
+  try {
+    const secret = $("secret").value.trim();
+    if (!secret) throw new Error("enter your runner secret");
+    const input = $("check").value.trim();
+    if (!input) throw new Error("enter a command id, heartbeat, or a note body");
+
+    if (input.startsWith("{")) {
+      const v = await verifyResult(secret, input);
+      const text = v.ok ? describe(v) : null;
+      out(text || "NOT AUTHENTIC: " + (v.reason || "not a result"), text ? "ok" : "err");
+      return;
+    }
+
+    const base = storeBase();
+    const token = $("token").value.trim();
+    if (!base || !token) throw new Error("store URL and token are both needed to fetch");
+    const hb = input.toLowerCase() === "heartbeat";
+    const ns = hb ? "runner" : "results";
+    const title = hb ? "runner heartbeat" : "result " + input;
+    const res = await fetch(`${base}/notes?namespace=${ns}&limit=200`, {
+      headers: { Authorization: "Bearer " + token },
+    });
+    if (!res.ok) throw new Error(res.status + " " + (await res.text()));
+    const notes = ((await res.json()).notes || []).filter((n) => n.title === title);
+    if (notes.length === 0) throw new Error(`no note titled "${title}" in ${ns} (yet)`);
+    let forged = 0;
+    for (const n of notes) {
+      const v = await verifyResult(secret, n.body);
+      const text = v.ok ? describe(v, hb ? undefined : input) : null;
+      if (text) {
+        out(text + (forged ? `\n\nWarning: ${forged} newer note(s) with this title failed the check.` : ""), "ok");
+        return;
+      }
+      forged++;
+    }
+    out(`NOT AUTHENTIC: ${notes.length} note(s) titled "${title}" and none is signed by your PC.`, "err");
+  } catch (e) {
+    out("Error: " + e.message, "err");
+  }
+});
+
+$("copy").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText($("out").value);
+  } catch {
+    $("out").select();
+  }
+});
+</script>
+</body>
+</html>

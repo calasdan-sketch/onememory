@@ -1,0 +1,174 @@
+# Plain-file sync (Markdown)
+
+Your memory as a folder of Markdown files you can read, grep, edit in any
+editor, diff in git, and sync with anything that syncs files.
+
+```bash
+onememory export --format md --dir ~/memory     # store -> files
+onememory import --dir ~/memory --dry-run       # what would merge back?
+onememory import --dir ~/memory                 # files -> store
+```
+
+## Layout
+
+```
+~/memory/
+  work/
+    release-cadence--b48d83f6-12.md
+  home/
+    dentist--b48d83f6-3.md
+  .conflicts/            # only after a conflict; never imported
+```
+
+One file per note, in a folder per namespace (unsafe characters become
+`_`, Windows-reserved names such as `CON`/`NUL`/`COM1` get a `_` prefix,
+trailing dots are dropped, at most 64 chars; the folder is cosmetic, the
+front-matter `namespace` is authoritative). The filename is
+`<title-slug>--<origin store, 8 hex>-<id>.md`; the slug keeps Unicode
+letters (Greek, CJK titles stay readable) and is shortened so the full path
+stays under Windows' 260-char limit.
+
+```markdown
+---
+id: 12
+origin: "b48d83f6-2fdc-4df8-899b-98d7bc60bdc5"
+namespace: "work"
+title: "Release cadence"
+tags: ["decision"]
+source: "claude-code"
+created_at: "2026-10-14T09:00:00.000Z"
+updated_at: "2026-10-15T10:30:00.000Z"
+rev: 3
+hash: "9b1f0c2a7d3e4f51"
+---
+Ship weekly on Thursdays.
+```
+
+Values are JSON-encoded, which is valid YAML. The body is stored verbatim
+(one trailing newline is added on export and removed on import; files are
+LF-only and CR/CRLF in a body counts as the same content, so a round trip
+never bumps `rev`). `hash` is the content hash at export.
+
+**Deterministic:** fixed key order, notes in id order, LF endings, and a file
+is only rewritten when its bytes change — re-exporting an unchanged store
+produces no diff. `--namespace ns` exports one namespace.
+
+**Export never clobbers an unimported edit.** If a file was changed since
+this store last synced it (by you, or another machine's export), export
+skips it and reports it: run import first. The `force` option (API:
+`exportMarkdown(store, dir, { force: true })`) overwrites anyway after
+copying the file to `.conflicts/<name>.overwritten.md`. One file that cannot
+be written (bad path, permissions) is reported and the rest still export.
+
+Export **prunes** only stale copies it can account for: the old file of a
+note this store renamed, and the file of a note this store deleted (its own
+notes, and another machine's notes it imported and then deleted) — and
+only while the file still holds what was last synced. Another machine's file
+this store never imported is never pruned, nor are files without OneMemory
+front-matter. `--no-prune` keeps everything.
+
+**Deleting an imported note is remembered.** When you delete a note that
+came from another machine, the store keeps its sync identity and merge base
+(table `sync_deleted`), so the next import treats the file as deleted here
+(`skipped`) instead of creating the note again; only a file edited since
+brings it back (`restored`). The other machine still has the note and may
+re-export the file — it stays skipped here until someone edits it.
+
+**Symlinks:** every write, prune and `.conflicts/` copy checks each path
+segment under the sync folder with `lstat` and refuses symlinks, and right
+before each write, rename or delete re-checks that the real (resolved)
+directory is still inside the sync folder. Writes go through an
+owner-only (0600) temp file opened with `O_EXCL`/`O_NOFOLLOW` + rename, so
+a planted `work -> ~/.ssh` link cannot redirect a write.
+
+## Writing new notes as files
+
+Drop any `.md` file into the folder. Front-matter is optional: without
+`title`, a leading `# Heading` (or the filename) becomes the title; without
+`namespace`, the folder name (or `default`). Plain YAML (`title: My note`,
+`tags: [a, b]`, block lists) is accepted. After the import creates the note,
+the file is rewritten with full front-matter so the next import updates it
+instead of creating it again.
+
+A file may only claim a note of **this** store (`origin` = this store) if
+this store exported or merged that note before; otherwise it is `rejected`,
+so a dropped-in file cannot overwrite an arbitrary local note. A file that
+would move a note to another namespace is `rejected` unless moves are
+allowed (API: `importMarkdown(store, dir, { allowMove: true })`).
+
+## How import merges
+
+Import is three-way. The **base** is the content hash this store last
+exported or merged for the note (kept per store in `sync_base`); for a note
+this store never synced, the file's own `hash` is used.
+
+| File vs base | Store vs base | Result |
+|---|---|---|
+| same | same | `unchanged` |
+| changed | same | `updated` — file wins (compare-and-swap on the note's rev) |
+| same | changed | `skipped` — store is newer; the next export refreshes the file |
+| changed | changed, same content | `unchanged` |
+| changed | changed, different | `conflict` — the **newer** side wins; the loser is written to `.conflicts/` |
+
+"Newer" compares the store's `updated_at` with the file's front-matter
+`updated_at` (file mtime is ignored: sync tools rewrite it). A hand edit
+that leaves `updated_at` alone therefore loses a conflict — its text is kept
+in `.conflicts/`. Nothing is silently lost: a
+conflict always leaves the losing version in `.conflicts/` and is listed in
+the report. After a conflict is resolved it is not raised again.
+
+Other outcomes: `created` (new file or another store's note), `restored`
+(the note was deleted here but the file was edited afterwards — your own
+note's file is rewritten with the restored note's new id so it is restored
+once; another machine's note is re-linked to its origin; an unedited file of
+a deleted note is `skipped`), `quarantined` / `rejected`
+(every import write goes through the [memory linter](./memory-linter.md);
+re-importing content that is already pending in quarantine reports it again
+without queuing a duplicate).
+**Import never deletes notes.** Deleting a file does not delete the note; to
+propagate a delete, delete the note in the store and export (prune).
+
+`--json` prints the full per-file report.
+
+## Several machines, one folder
+
+Every store has a UUID (`_meta.store_uuid`). A note's identity is
+`(origin store, id)`, so ids that collide between machines never get mixed
+up: importing another store's file creates a local note and remembers the
+mapping (`sync_map`), the next import updates that same note, and this
+store's export writes it back under its **original** identity and filename.
+Two machines exporting into one git repo converge on the same files.
+
+### GitHub (private repo)
+
+```bash
+# once
+mkdir ~/memory && cd ~/memory && git init && git remote add origin git@github.com:you/memory.git
+
+# on each machine, e.g. from cron or a shell alias
+cd ~/memory
+git pull --rebase
+onememory import --dir .          # merge others' edits in
+onememory export --format md --dir .
+git add -A && git commit -m "memory sync $(hostname) $(date -u +%FT%TZ)" && git push
+```
+
+Import before export, so your store absorbs remote edits before it rewrites
+the files. Add `.conflicts/` to `.gitignore` if you would rather review
+conflicts locally only. Use a **private** repository: notes are plaintext.
+
+### Syncthing / Dropbox / iCloud
+
+Point the sync tool at the folder and run the same two commands on each
+machine (import, then export) on a timer. The sync tool's own conflict
+copies (`*.sync-conflict-*.md`, Dropbox "conflicted copy") carry the same
+note identity as the original, so import **skips** them and reports them —
+merge them by hand.
+
+## Limits
+
+- Not a live sync: run the commands (or a timer). The CLI uses full local
+  trust and ignores server-side namespace resolution, like the other
+  maintenance commands.
+- Conflicts are whole-note, not line-level merges.
+- Deletes do not propagate through files (see above).

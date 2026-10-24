@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Runtime data (SQLite store + bearer token file)
+data/
+*.db
+*.db-shm
+*.db-wal
+*.token
+
+# Node
+npm-debug.log*
+.npm
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Env files (not currently used, but never commit if added later)
+.env
+.env.local
+
+# Internal working files (never publish)
+/reviews/
+/ROADMAP.md
+/COMPETITOR-*.md
+/CLAUDE.md
+/bench-*.mjs
+/test-mcp-probe.mjs
+/CHANGES_*.md

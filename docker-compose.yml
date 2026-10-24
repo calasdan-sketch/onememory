@@ -1,0 +1,27 @@
+# onememory — one-command self-host.
+#   1. copy .env.example to .env and set a strong ONEMEMORY_TOKEN
+#   2. docker compose up -d
+#   3. dashboard at http://localhost:8790  (paste your token)
+#
+# The bridge binds 0.0.0.0 INSIDE the container (needed for Docker networking),
+# but you should only expose it to the internet behind an authenticated tunnel
+# (Cloudflare Tunnel + Access, Tailscale, or a reverse proxy with auth).
+# Your notes never leave this machine — the tunnel is only a pipe.
+
+services:
+  onememory:
+    build: .
+    ports:
+      - "127.0.0.1:8790:8790" # HTTP API + dashboard (host loopback only)
+      - "127.0.0.1:8791:8791" # MCP over HTTP (point your tunnel here)
+    environment:
+      ONEMEMORY_BIND: "0.0.0.0"
+      ONEMEMORY_TOKEN: "${ONEMEMORY_TOKEN:?set ONEMEMORY_TOKEN in a .env file}"
+      ONEMEMORY_HOME: "/data"
+      ONEMEMORY_DB_PATH: "/data/state.db"
+    volumes:
+      - onememory-data:/data
+    restart: unless-stopped
+
+volumes:
+  onememory-data:

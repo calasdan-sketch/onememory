@@ -1,0 +1,71 @@
+{
+  "name": "onememory-mcp",
+  "version": "1.2.1",
+  "description": "OneMemory — one self-hosted SQLite memory store shared across your AI agents over MCP and a plain REST API, reachable from desktop, web, and your phone.",
+  "license": "MIT",
+  "author": "Dan Calas",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/calasdan-sketch/onememory.git"
+  },
+  "bugs": {
+    "url": "https://github.com/calasdan-sketch/onememory/issues"
+  },
+  "homepage": "https://github.com/calasdan-sketch/onememory#readme",
+  "keywords": [
+    "mcp",
+    "memory",
+    "ai-agents",
+    "claude",
+    "sqlite",
+    "fts5",
+    "self-hosted",
+    "note-store",
+    "semantic-search",
+    "rest-api"
+  ],
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/start.js",
+    "api": "node dist/src/index.js",
+    "mcp:stdio": "node dist/src/mcp-stdio.js",
+    "mcp:http": "node dist/src/mcp-http.js",
+    "doctor": "node dist/src/cli.js doctor",
+    "cli": "node dist/src/cli.js",
+    "test": "npm run build && node --test \"dist/test/*.test.js\"",
+    "prepublishOnly": "npm run build",
+    "runner": "node dist/src/runner-start.js",
+    "runner:sign": "node dist/src/runner-sign-start.js"
+  },
+  "bin": {
+    "onememory": "dist/src/cli.js"
+  },
+  "files": [
+    "dist/src",
+    "!dist/src/runner*",
+    "README.md",
+    "INSTALL.md",
+    "INFRA.md",
+    "SECURITY.md",
+    "SKILL.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "docs/*.md",
+    "!docs/RUNNER.md"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.2"
+  }
+}
