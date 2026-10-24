@@ -144,6 +144,14 @@ Returns, in one compact result:
   title, status, owner, next step, priority, due, parent, blockers, rev. No notes or
   command text; fetch one with `task_get`.
 - **handoffs**: the latest three.
+- **runner_notice**: one line when approved commands are waiting and a runner is not online (omitted, and
+  its check skipped entirely, when no command task is queued).
+
+`catch_up`, `task_list`, `task_get` and handoffs take `written_by` / `not_written_by` and
+`include_distrusted` like the notes tools (`catch_up` also `note_written_by` / `not_note_written_by`). Tasks and
+handoffs written by a **distrusted** writer ([trust.md](./trust.md)) are left out; `task_claim` and
+`task_approve` refuse them, and a distrusted command task is never run by the runner, even if it was approved
+before the writer was distrusted.
 
 Use a stable `consumer` label per device or model (`phone`, `claude-code-pc`).
 

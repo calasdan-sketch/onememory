@@ -101,6 +101,10 @@ const KEYS = [
   "created_at",
   "updated_at",
   "rev",
+  // Who wrote the note on the machine that exported it (`<server_id>/<label>`).
+  // An UNVERIFIED claim: a file can say anything. The importing store keeps it
+  // only as `imported_written_by` and never lets it count as a writer (see docs/trust.md).
+  "origin_writer",
   "hash",
 ] as const;
 
@@ -253,6 +257,7 @@ export function renderNoteFile(
     created_at: note.created_at,
     updated_at: note.updated_at,
     rev: note.rev,
+    origin_writer: note.writer_id || note.written_by || "",
     hash: contentHash(note),
   };
   const lines = KEYS.map((k) => `${k}: ${JSON.stringify(fm[k])}`);
@@ -636,7 +641,11 @@ export async function importMarkdown(
           source: typeof fm.source === "string" ? fm.source : undefined,
           created_at: typeof fm.created_at === "string" ? fm.created_at : undefined,
         },
-        { updatedAt: typeof fm.updated_at === "string" ? fm.updated_at : undefined }
+        {
+          updatedAt: typeof fm.updated_at === "string" ? fm.updated_at : undefined,
+          // The file's writer claim is displayed, never trusted: the note is stamped with who imported it.
+          ...(typeof fm.origin_writer === "string" && fm.origin_writer.trim() ? { importedWrittenBy: fm.origin_writer.trim().slice(0, 200) } : {}),
+        }
       );
       if (hasIdentity && origin !== self) store.syncLink(origin!, originId!, n.id);
       // A hand-written file, or one restoring a note deleted here (which

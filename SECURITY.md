@@ -53,6 +53,17 @@ content as untrusted input to your agents** — see "Memory safety" below.
   mitigated, not eliminated (OWASP GenAI #1); there is no OAuth, only static
   bearer tokens.
 
+## Writer trust (1.4.0)
+
+A note's `written_by` is stamped by the server from the authenticated token; an admin can put a writer on a
+per-namespace distrust list that every read path honours, and a JSON export carries Ed25519 attestations so a
+server you chose to trust can vouch for a note's original author. Read [docs/trust.md](./docs/trust.md) for
+exactly what this proves and does not: it is a policy on labels, not protection against the operator; a trusted
+server can still export a hostile note; attestations have no freshness or revocation; `.attest-key` must be
+protected like the encryption key; and a writer who obtains a new token under a new label is not on the list.
+Heartbeats from runners older than 1.3.4 are no longer believed by default (`ONEMEMORY_RUNNER_ACCEPT_LEGACY=1`
+restores the old behaviour).
+
 ## Encryption at rest (shipped in 1.2.0)
 
 `onememory encrypt enable` encrypts note **bodies** with AES-256-GCM. The

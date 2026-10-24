@@ -25,6 +25,47 @@ import { Store, ValidationError, QuarantinedError, DEFAULT_NAMESPACE, type NoteR
 import { runChanges, type ChangesResponse } from "./changes.js";
 import { RESERVED_TAG_PREFIX } from "./reserved-tags.js";
 import { runnerNotice } from "./liveness.js";
+import {
+  TASK_STATUSES,
+  TASK_TAG,
+  TAG_PRIORITY,
+  TAG_DUE,
+  TAG_PARENT,
+  TAG_BLOCKED,
+  TAG_CKEY,
+  TAG_LEASE,
+  TAG_APPROVAL,
+  APPROVAL_RE,
+  stateOf,
+  parseBody,
+  commandHash,
+  verifyApproval,
+  isTaskNote,
+  type TaskStatus,
+  type TaskState,
+  type BodyParts,
+  type TaskCommand,
+  type ApprovalState,
+} from "./task-core.js";
+
+// The task primitives live in task-core.ts (below this module and liveness.ts,
+// which is what keeps those two from importing each other). Re-exported so
+// `import { ... } from "./tasks.js"` keeps working.
+export {
+  TASK_STATUSES,
+  TASK_TAG,
+  commandHash,
+  verifyApproval,
+  isTaskNote,
+  approvalNonce,
+  classifyQueuedCommand,
+  scanQueuedCommands,
+  scanWaitingCommands,
+  waitingCommandTasks,
+  envRunnerId,
+  envRunnerTaskNamespace,
+} from "./task-core.js";
+export type { TaskStatus, TaskCommand, ApprovalState, WaitingCommand, RunnerIdentity, QueuedVerdict } from "./task-core.js";
 
 /** Update of a task that doesn't exist / isn't yours to touch (REST: 404). */
 export class TaskNotFoundError extends ValidationError {}
@@ -40,20 +81,9 @@ export class ClaimConflictError extends ValidationError {
   }
 }
 
-export const TASK_STATUSES = ["idea", "planned", "running", "blocked", "done", "queued", "failed"] as const;
-export type TaskStatus = (typeof TASK_STATUSES)[number];
-
-export const TASK_TAG = "task";
 export const HANDOFF_TAG = "handoff";
 
 const T = RESERVED_TAG_PREFIX; // "task."
-const TAG_PRIORITY = `${T}priority:`;
-const TAG_DUE = `${T}due:`;
-const TAG_PARENT = `${T}parent:`;
-const TAG_BLOCKED = `${T}blocked_by:`;
-const TAG_CKEY = `${T}ckey:`;
-const TAG_LEASE = `${T}lease:`;
-const TAG_APPROVAL = `${T}approval:`;
 
 export const TASK_LIMITS = {
   title: 200,
@@ -84,15 +114,6 @@ const CONTROLS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u2
 // eslint-disable-next-line no-control-regex
 const CONTROLS_G = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
 
-export interface TaskCommand {
-  action: string;
-  params: Record<string, string>;
-  /** Runner (machine) name this command is for. Required. */
-  target: string;
-}
-
-export type ApprovalState = "none" | "approved" | "stale";
-
 export interface Task {
   id: number;
   namespace: string;
@@ -118,8 +139,12 @@ export interface Task {
   rev: number;
   /** Server-stamped last writer of this task (token label / stdio / cli / server); "" = unknown. */
   written_by: string;
+  /** `<server_id>/<written_by>`: the writer's stable id ("" = unknown). Always set by the server. */
+  writer_id?: string;
   /** Server-stamped creator of this task; "" = unknown. */
   created_by: string;
+  /** True only when a read opted in with include_distrusted and the writer is on the distrust list. */
+  distrusted?: true;
   created_at: string;
   updated_at: string;
 }
@@ -127,7 +152,7 @@ export interface Task {
 /** The compact shape catch_up and the board use: no notes, no command params. */
 export type TaskSummary = Pick<
   Task,
-  "id" | "namespace" | "title" | "status" | "owner" | "next_step" | "priority" | "due" | "parent_id" | "blocked_by" | "rev" | "written_by" | "updated_at"
+  "id" | "namespace" | "title" | "status" | "owner" | "next_step" | "priority" | "due" | "parent_id" | "blocked_by" | "rev" | "written_by" | "writer_id" | "distrusted" | "updated_at"
 >;
 
 export function compactTask(t: Task): TaskSummary {
@@ -144,6 +169,8 @@ export function compactTask(t: Task): TaskSummary {
     blocked_by: t.blocked_by,
     rev: t.rev,
     written_by: t.written_by,
+    writer_id: t.writer_id,
+    ...(t.distrusted ? { distrusted: true as const } : {}),
     updated_at: t.updated_at,
   };
 }
@@ -242,51 +269,7 @@ function normDue(v: unknown): string | null | undefined {
   return new Date(t).toISOString();
 }
 
-export function isTaskNote(n: NoteRecord): boolean {
-  return n.tags.includes(TASK_TAG);
-}
-
 // ---- Task <-> note ------------------------------------------------------------
-
-interface TaskState {
-  status: TaskStatus;
-  owner: string;
-  priority: number | null;
-  due: string;
-  parent: number | null;
-  blockedBy: number[];
-  lease: { owner: string; expMs: number } | null;
-  ckey: string | null;
-  approval: string | null; // "<nonce>.<mac>"
-}
-
-function parseLease(tag: string): { owner: string; expMs: number } | null {
-  const m = /^(\d{1,16}):(.+)$/.exec(tag);
-  return m ? { expMs: Number(m[1]), owner: m[2] } : null;
-}
-
-function stateOf(n: NoteRecord): TaskState {
-  const tag = (prefix: string): string | undefined => n.tags.find((t) => t.startsWith(prefix))?.slice(prefix.length);
-  const st = tag("status:") ?? "";
-  const pr = tag(TAG_PRIORITY);
-  const par = tag(TAG_PARENT);
-  const lease = tag(TAG_LEASE);
-  return {
-    status: (TASK_STATUSES as readonly string[]).includes(st) ? (st as TaskStatus) : "idea",
-    owner: tag("owner:") ?? "",
-    priority: pr !== undefined && /^\d$/.test(pr) ? Number(pr) : null,
-    due: tag(TAG_DUE) ?? "",
-    parent: par !== undefined && /^\d+$/.test(par) ? Number(par) : null,
-    blockedBy: n.tags
-      .filter((t) => t.startsWith(TAG_BLOCKED))
-      .map((t) => t.slice(TAG_BLOCKED.length))
-      .filter((x) => /^\d+$/.test(x))
-      .map(Number),
-    lease: lease ? parseLease(lease) : null,
-    ckey: tag(TAG_CKEY) ?? null,
-    approval: tag(TAG_APPROVAL) ?? null,
-  };
-}
 
 function tagsFromState(base: readonly string[], s: TaskState): string[] {
   const keep = base.filter(
@@ -307,86 +290,12 @@ function tagsFromState(base: readonly string[], s: TaskState): string[] {
   ];
 }
 
-interface BodyParts {
-  nextStep: string;
-  command: { action: string; params: Record<string, string>; target: string } | null;
-  result: Record<string, unknown> | null;
-  notes: string;
-}
-
 function taskBody(p: BodyParts): string {
   const head = [`Next step: ${p.nextStep}`];
   if (p.command) head.push(`Command: ${JSON.stringify({ action: p.command.action, params: p.command.params, target: p.command.target })}`);
   if (p.result) head.push(`Result: ${JSON.stringify(p.result)}`);
   return `${head.join("\n")}\n\n${p.notes}`;
 }
-
-function parseBody(body: string): BodyParts {
-  const lines = body.split("\n");
-  const first = /^Next step:[ \t]*(.*)$/.exec(lines[0] ?? "");
-  if (!first) return { nextStep: "", command: null, result: null, notes: body };
-  let command: BodyParts["command"] = null;
-  let result: BodyParts["result"] = null;
-  let i = 1;
-  for (; i < lines.length; i++) {
-    const m = /^(Command|Result): (.*)$/.exec(lines[i]);
-    if (!m) break;
-    try {
-      const v = JSON.parse(m[2]) as unknown;
-      if (v && typeof v === "object" && !Array.isArray(v)) {
-        if (m[1] === "Command") {
-          const c = v as { action?: unknown; params?: unknown; target?: unknown };
-          if (typeof c.action === "string" && typeof c.target === "string") {
-            const params: Record<string, string> = {};
-            if (c.params && typeof c.params === "object" && !Array.isArray(c.params)) {
-              for (const [k, x] of Object.entries(c.params)) if (typeof x === "string") params[k] = x;
-            }
-            command = { action: c.action, params, target: c.target };
-          }
-        } else {
-          result = v as Record<string, unknown>;
-        }
-      }
-    } catch {
-      /* a mangled header is just ignored */
-    }
-  }
-  if (lines[i] === "") i++;
-  return { nextStep: first[1].trim(), command, result, notes: lines.slice(i).join("\n") };
-}
-
-/** Canonical text of a command, bound into the approval MAC. */
-export function commandHash(namespace: string, id: number, c: TaskCommand): string {
-  return createHash("sha256")
-    .update(JSON.stringify(["onememory-task-cmd-v1", namespace, id, c.action, Object.entries(c.params).sort(), c.target]))
-    .digest("hex");
-}
-
-/**
- * Is this note's approval tag a valid, current approval of the command it
- * carries? (store-keyed MAC over namespace, id, nonce and the command hash)
- */
-export function verifyApproval(store: Store, n: NoteRecord, now = Date.now()): ApprovalState {
-  const st = stateOf(n);
-  if (!st.approval) return "none";
-  const cmd = parseBody(n.body).command;
-  const m = APPROVAL_RE.exec(st.approval);
-  if (!cmd || !m) return "stale";
-  const expMs = Number(m[2]);
-  if (!Number.isSafeInteger(expMs) || expMs <= now) return "stale"; // expired approvals die
-  try {
-    const want = store.approvalMac([n.namespace, String(n.id), m[1], String(expMs), commandHash(n.namespace, n.id, cmd)], false);
-    if (want === null) return "stale";
-    const a = Buffer.from(want, "hex");
-    const b = Buffer.from(m[3], "hex");
-    return a.length === b.length && timingSafeEqual(a, b) ? "approved" : "stale";
-  } catch {
-    return "stale"; // fail closed
-  }
-}
-
-/** Approval tag: "<nonce16>.<expiry ms>.<mac32>". */
-const APPROVAL_RE = /^([0-9a-f]{16})\.(\d{1,16})\.([0-9a-f]{32})$/;
 
 /** How long an approval stays valid (ONEMEMORY_APPROVAL_TTL_SECONDS, default 24 h, 60 s - 30 d). */
 export function approvalTtlMs(): number {
@@ -429,7 +338,9 @@ export function taskFromNote(n: NoteRecord, store?: Store, now = Date.now()): Ta
     result: body.result,
     rev: n.rev,
     written_by: n.written_by,
+    writer_id: n.writer_id ?? "",
     created_by: n.created_by,
+    ...(n.distrusted ? { distrusted: true as const } : {}),
     created_at: n.created_at,
     updated_at: n.updated_at,
   };
@@ -730,7 +641,8 @@ export function putTask(
   // retries (even from two processes) cannot both create.
   let replay = false;
   const note = inTransaction(store, () => {
-    const hit = store.list({ namespace, limit: 1, withTags: [TASK_TAG, `${TAG_CKEY}${s0.ckey}`] }).notes[0];
+    // includeDistrusted: an idempotent retry must find its own task even if the writer was distrusted since.
+    const hit = store.list({ namespace, limit: 1, withTags: [TASK_TAG, `${TAG_CKEY}${s0.ckey}`], includeDistrusted: true }).notes[0];
     if (hit) {
       replay = true;
       return hit;
@@ -749,7 +661,8 @@ function assertCommandQuota(store: Store, namespace: string, exceptId: number | 
   let n = 0;
   const page = 500;
   for (let offset = 0; ; offset += page) {
-    const r = store.list({ namespace, limit: page, offset, withTags: [TASK_TAG, "status:queued"] });
+    // Distrusted tasks still count against the quota: a hidden task must not be a way round it.
+    const r = store.list({ namespace, limit: page, offset, withTags: [TASK_TAG, "status:queued"], includeDistrusted: true });
     for (const x of r.notes) if (x.id !== exceptId && parseBody(x.body).command !== null) n++;
     if (n >= quota || r.notes.length < page) break;
   }
@@ -772,6 +685,8 @@ export interface TaskListOpts {
   writtenBy?: string;
   /** Skip tasks whose server-stamped content writer is this. */
   notWrittenBy?: string;
+  /** Also list tasks whose writer is on the distrust list (marked `distrusted`). Default: they are left out. */
+  includeDistrusted?: boolean;
 }
 
 export function listTasks(store: Store, opts: TaskListOpts = {}): { tasks: Task[]; total: number } {
@@ -784,18 +699,41 @@ export function listTasks(store: Store, opts: TaskListOpts = {}): { tasks: Task[
   if (owner) withTags.push(`owner:${owner}`);
   if (opts.parent_id !== undefined) withTags.push(`${TAG_PARENT}${intOrNull(opts.parent_id, "parent_id")}`);
   const limit = Math.min(TASK_LIMITS.maxList, Math.max(1, Math.floor(opts.limit ?? 50) || 50));
-  const { notes, total } = store.list({ namespaces: opts.namespaces, limit, withTags, withoutTags, writtenBy: opts.writtenBy, notWrittenBy: opts.notWrittenBy });
-  return { tasks: notes.map((n) => taskFromNote(n, store)), total };
+  const { notes, total } = store.list({
+    namespaces: opts.namespaces,
+    limit,
+    withTags,
+    withoutTags,
+    writtenBy: opts.writtenBy,
+    notWrittenBy: opts.notWrittenBy,
+    includeDistrusted: opts.includeDistrusted,
+  });
+  const shown = opts.includeDistrusted ? store.markDistrusted(notes) : notes;
+  return { tasks: shown.map((n) => taskFromNote(n, store)), total };
 }
 
-/** One task, in full (notes, command, result). Same visibility rules as listTasks. */
-export function getTask(store: Store, id: number, namespaces?: string[]): Task {
+/** The refusal for acting on a task a distrusted writer wrote. */
+function distrustedTaskError(id: number): ValidationError {
+  return new ValidationError(
+    `task #${id} was written by a writer on this namespace's distrust list; it cannot be claimed or approved. ` +
+      "An admin can review it (include_distrusted) and, if it is fine, rewrite it under a trusted writer or take the writer off the list."
+  );
+}
+
+/**
+ * One task, in full (notes, command, result). Same visibility rules as
+ * listTasks: a task from a distrusted writer reads as "not found" unless
+ * `includeDistrusted` (then it comes back marked `distrusted: true`).
+ */
+export function getTask(store: Store, id: number, namespaces?: string[], opts: { includeDistrusted?: boolean } = {}): Task {
   if (!Number.isInteger(id) || id < 1) throw new ValidationError("id must be a positive integer");
   const n = store.read(id);
   if (!n || n.archived_at || !isTaskNote(n) || (namespaces !== undefined && !namespaces.includes(n.namespace))) {
     throw new TaskNotFoundError(`no task with id ${id}`);
   }
-  return taskFromNote(n, store);
+  const flagged = store.markDistrusted([n])[0];
+  if (flagged.distrusted && !opts.includeDistrusted) throw new TaskNotFoundError(`no task with id ${id}`);
+  return taskFromNote(opts.includeDistrusted ? flagged : n, store);
 }
 
 // ---- Claim / lease --------------------------------------------------------------
@@ -840,6 +778,8 @@ export function claimTask(
     ) {
       throw new TaskNotFoundError(`no task with id ${input.id}`);
     }
+    // A task a distrusted writer wrote is not for the board to hand out (a holder may still let go of a lease).
+    if (!input.release && store.isDistrusted(existing)) throw distrustedTaskError(existing.id);
     const cur = stateOf(existing);
     if (parseBody(existing.body).command && !input.release) {
       throw new ValidationError(
@@ -924,6 +864,8 @@ export function approveTask(
   ) {
     throw new TaskNotFoundError(`no task with id ${input.id}`);
   }
+  // Never put the admin gate in front of a command a distrusted writer wrote.
+  if (!input.revoke && store.isDistrusted(existing)) throw distrustedTaskError(existing.id);
   const cur = stateOf(existing);
   const cmd = parseBody(existing.body).command;
   const next: TaskState = { ...cur, lease: null }; // approving or revoking also clears any lease
@@ -963,11 +905,6 @@ export function approveTask(
   return taskFromNote(note, store);
 }
 
-/** The single-use nonce inside a note's approval tag ("" when none). */
-export function approvalNonce(n: NoteRecord): string {
-  return APPROVAL_RE.exec(stateOf(n).approval ?? "")?.[1] ?? "";
-}
-
 /**
  * Runner side: queued command tasks in one namespace that carry an approval
  * tag (approval is verified by the caller). Filtered in SQL and paged until
@@ -983,113 +920,6 @@ export function queuedCommandTasks(store: Store, namespace: string, maxTotal = 2
     if (r.notes.length < page) break;
   }
   return out;
-}
-
-/** One queued command task whose approval is still waiting for the runner, or has lapsed. */
-export interface WaitingCommand {
-  id: number;
-  namespace: string;
-  /** "waiting" = valid, unexpired approval; "expired" = an approval that lapsed before the runner took it. */
-  state: "waiting" | "expired";
-  /** When the approval stops (or stopped) being valid, ms since epoch. */
-  expires_ms: number;
-  /** When the task last changed; for a waiting task that is when it was approved. */
-  since: string;
-}
-
-/** The runner an approved command is addressed to: its machine name and the one task namespace it serves ("" = command tasks off). */
-export interface RunnerIdentity {
-  me: string;
-  namespace: string;
-}
-
-/**
- * This machine's runner name from the environment. Same rule as the runner's
- * own runnerId() (kept here, outside the runner files, so the server side can
- * use it: the runner is not part of the npm package).
- */
-export function envRunnerId(): string {
-  return process.env.ONEMEMORY_RUNNER_ID || process.env.COMPUTERNAME || process.env.HOSTNAME || "default";
-}
-
-/** The namespace whose command tasks the runner executes, from the environment ("" = off). */
-export function envRunnerTaskNamespace(): string {
-  return process.env.ONEMEMORY_RUNNER_TASK_NAMESPACE || "";
-}
-
-export type QueuedVerdict =
-  /** The runner may run it now (approval valid, unexpired, addressed to it, not leased). */
-  | { kind: "runnable"; expires_ms: number; command: { action: string; params: Record<string, string>; target: string } }
-  /** A genuine approval (MAC verifies) that lapsed before the runner took the task: an admin must re-approve. */
-  | { kind: "expired"; expires_ms: number }
-  /** Never runs on this runner: why, for tests and diagnostics. */
-  | { kind: "skip"; why: "not_command" | "other_namespace" | "other_target" | "unapproved" | "leased" };
-
-/**
- * THE one rule for "would this runner run this queued task?", used by the
- * runner's pollTasks and by the waiting-commands status, so they cannot
- * drift: it must be a command task in the runner's task namespace, addressed
- * to this runner, carrying an approval whose MAC verifies, with no live lease.
- * (The runner's rate window is a runtime limit, not a property of the task.)
- * An approval that is past its time is reported "expired" only if its MAC
- * would have verified -- a forged or edited tag is "unapproved", so it can
- * neither run nor inflate the expired count.
- */
-export function classifyQueuedCommand(store: Store, n: NoteRecord, who: RunnerIdentity, now: number): QueuedVerdict {
-  const cmd = parseBody(n.body).command;
-  if (!cmd) return { kind: "skip", why: "not_command" };
-  if (!who.namespace || n.namespace !== who.namespace) return { kind: "skip", why: "other_namespace" };
-  if (cmd.target !== who.me) return { kind: "skip", why: "other_target" };
-  const m = APPROVAL_RE.exec(stateOf(n).approval ?? "");
-  if (!m) return { kind: "skip", why: "unapproved" };
-  const expMs = Number(m[2]);
-  if (!Number.isSafeInteger(expMs)) return { kind: "skip", why: "unapproved" };
-  if (expMs <= now) {
-    // verifyApproval treats "now" as the instant it is checked: ask it one
-    // millisecond before the deadline to test the MAC itself.
-    return verifyApproval(store, n, expMs - 1) === "approved" ? { kind: "expired", expires_ms: expMs } : { kind: "skip", why: "unapproved" };
-  }
-  if (verifyApproval(store, n, now) !== "approved") return { kind: "skip", why: "unapproved" };
-  const lease = stateOf(n).lease;
-  if (lease && lease.expMs > now) return { kind: "skip", why: "leased" };
-  return { kind: "runnable", expires_ms: expMs, command: cmd };
-}
-
-/**
- * Read-only: queued command tasks this runner would run (or whose real
- * approval lapsed), in `namespaces` (undefined = whole store, [] = nothing),
- * classified by the same rule the runner uses. Command text and params are NOT
- * returned -- only ids, namespaces and timing. `truncated` = the scan stopped at
- * `maxTotal` matches, so the real count may be higher ("at least").
- */
-export function scanWaitingCommands(
-  store: Store,
-  who: RunnerIdentity,
-  namespaces?: string[],
-  now = Date.now(),
-  maxTotal = 2_000
-): { items: WaitingCommand[]; truncated: boolean } {
-  const items: WaitingCommand[] = [];
-  if (!who.namespace) return { items, truncated: false };
-  if (namespaces && !namespaces.includes(who.namespace)) return { items, truncated: false };
-  const page = Math.min(200, Math.max(1, maxTotal));
-  let seen = 0;
-  for (let offset = 0; ; offset += page) {
-    const r = store.list({ namespace: who.namespace, limit: page, offset, withTags: [TASK_TAG, "status:queued"], withTagPrefix: TAG_APPROVAL });
-    for (const n of r.notes) {
-      const v = classifyQueuedCommand(store, n, who, now);
-      if (v.kind === "runnable") items.push({ id: n.id, namespace: n.namespace, state: "waiting", expires_ms: v.expires_ms, since: n.updated_at });
-      else if (v.kind === "expired") items.push({ id: n.id, namespace: n.namespace, state: "expired", expires_ms: v.expires_ms, since: n.updated_at });
-    }
-    seen += r.notes.length;
-    if (r.notes.length < page) return { items, truncated: false };
-    if (seen >= maxTotal) return { items, truncated: seen < r.total };
-  }
-}
-
-/** Back-compat wrapper: the waiting list only. */
-export function waitingCommandTasks(store: Store, who: RunnerIdentity, namespaces?: string[], now = Date.now(), maxTotal = 2_000): WaitingCommand[] {
-  return scanWaitingCommands(store, who, namespaces, now, maxTotal).items;
 }
 
 /**
@@ -1169,6 +999,10 @@ export interface Handoff {
   decisions: string[];
   /** Server-stamped writer of this handoff (token label / stdio / cli / server); "" = unknown. `surface` is only the writer's claim. */
   written_by: string;
+  /** `<server_id>/<written_by>` ("" = unknown). Always set by the server. */
+  writer_id?: string;
+  /** True only when a read opted in with include_distrusted and the writer is on the distrust list. */
+  distrusted?: true;
 }
 
 function items(v: unknown, name: string): string[] {
@@ -1209,6 +1043,8 @@ export function handoffFromNote(n: NoteRecord): Handoff {
     pending: [],
     decisions: [],
     written_by: n.written_by,
+    writer_id: n.writer_id ?? "",
+    ...(n.distrusted ? { distrusted: true as const } : {}),
   };
   let section: "done" | "pending" | "decisions" | null = null;
   for (const raw of n.body.split("\n")) {
@@ -1266,7 +1102,7 @@ export function writeHandoff(
   }
   let replay = false;
   const note = inTransaction(store, () => {
-    const hit = store.list({ namespace, limit: 1, withTags: [HANDOFF_TAG, `${TAG_CKEY}${ck}`] }).notes[0];
+    const hit = store.list({ namespace, limit: 1, withTags: [HANDOFF_TAG, `${TAG_CKEY}${ck}`], includeDistrusted: true }).notes[0];
     if (hit) {
       replay = true;
       return hit;
@@ -1278,13 +1114,29 @@ export function writeHandoff(
 
 export function listHandoffs(
   store: Store,
-  opts: { namespaces?: string[]; surface?: string; limit?: number } = {}
+  opts: {
+    namespaces?: string[];
+    surface?: string;
+    limit?: number;
+    writtenBy?: string;
+    notWrittenBy?: string;
+    /** Also list handoffs from distrusted writers (marked `distrusted`). Default: left out. */
+    includeDistrusted?: boolean;
+  } = {}
 ): Handoff[] {
   const withTags = [HANDOFF_TAG];
   const surface = label(opts.surface, "surface");
   if (surface) withTags.push(`surface:${surface}`);
   const limit = Math.min(50, Math.max(1, Math.floor(opts.limit ?? 3) || 3));
-  return store.list({ namespaces: opts.namespaces, limit, withTags }).notes.map(handoffFromNote);
+  const { notes } = store.list({
+    namespaces: opts.namespaces,
+    limit,
+    withTags,
+    writtenBy: opts.writtenBy,
+    notWrittenBy: opts.notWrittenBy,
+    includeDistrusted: opts.includeDistrusted,
+  });
+  return (opts.includeDistrusted ? store.markDistrusted(notes) : notes).map(handoffFromNote);
 }
 
 // ---- Catch-up ---------------------------------------------------------------
@@ -1301,6 +1153,15 @@ export interface CatchUpOpts {
   ackMode?: "auto" | "manual";
   ackToken?: string;
   excludeSelf?: boolean;
+  /** Only changes / tasks / handoffs whose writer is exactly this (changes: the change's own writer). */
+  writtenBy?: string;
+  /** Skip those written by this writer (changes: the change's own writer; also notes it touched via merge / attestation). */
+  notWrittenBy?: string;
+  /** Changes only: filter on the note's CURRENT writer (tasks and handoffs are notes, so their `writtenBy` already is that). */
+  noteWrittenBy?: string;
+  notNoteWrittenBy?: string;
+  /** Include changes, tasks and handoffs from writers on the distrust list (marked `distrusted`). Default: left out. */
+  includeDistrusted?: boolean;
 }
 
 export const CATCH_UP_SHOWN_CHANGES = 30;
@@ -1345,6 +1206,11 @@ export function catchUp(store: Store, opts: CatchUpOpts = {}): CatchUp {
       ackMode: opts.ackMode,
       ackToken: opts.ackToken,
       excludeSelf: opts.excludeSelf,
+      writtenBy: opts.writtenBy,
+      notWrittenBy: opts.notWrittenBy,
+      noteWrittenBy: opts.noteWrittenBy,
+      notNoteWrittenBy: opts.notNoteWrittenBy,
+      includeDistrusted: opts.includeDistrusted,
     });
     out.changes = {
       consumer: r.consumer ?? "default",
@@ -1361,9 +1227,12 @@ export function catchUp(store: Store, opts: CatchUpOpts = {}): CatchUp {
   } else if (opts.ackToken) {
     throw new ValidationError("ack_token needs the changes part (include_changes) so the consumer's marker can be read");
   }
-  const t = listTasks(store, { namespaces: opts.namespaces, limit: opts.tasks ?? 20 });
+  const wf = { writtenBy: opts.writtenBy, notWrittenBy: opts.notWrittenBy, includeDistrusted: opts.includeDistrusted };
+  const t = listTasks(store, { namespaces: opts.namespaces, limit: opts.tasks ?? 20, ...wf });
   out.tasks = { open: t.tasks.map(compactTask), total: t.total };
-  out.handoffs = listHandoffs(store, { namespaces: opts.namespaces, limit: opts.handoffs ?? 3 });
+  out.handoffs = listHandoffs(store, { namespaces: opts.namespaces, limit: opts.handoffs ?? 3, ...wf });
+  // Returns at once when no approved command is queued (see runnerNotice): the
+  // common case costs one cheap probe, not a heartbeat read and a classifier pass.
   const notice = runnerNotice(store, opts.namespaces);
   if (notice) out.runner_notice = notice;
   return out;

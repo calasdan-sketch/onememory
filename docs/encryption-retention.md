@@ -60,6 +60,9 @@ in addition to, not instead of, this.
   notes.
 - **The key sits beside the database**, so a backup of the whole data
   directory carries both. Back the key up separately from database backups.
+- **The attestation signing key** (`.attest-key`, 1.4.0; [trust.md](./trust.md)) is a separate Ed25519 file beside
+  the database. It does not encrypt anything, is not copied by `onememory backup`, and is not needed to read
+  your data; losing it only changes the identity your exports are signed with.
 - **Losing the key file loses the bodies.** Back it up. There is no
   recovery path, by design.
 - A corrupt (wrong-size) key file is a **hard error at startup**, not a

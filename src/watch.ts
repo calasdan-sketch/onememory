@@ -19,6 +19,8 @@ export interface WatchOpts {
   consumer: string;
   waitSeconds: number;
   namespaces?: string[];
+  /** Writer / trust filters (same meaning as on memory_since). */
+  filter?: { writtenBy?: string; notWrittenBy?: string; noteWrittenBy?: string; notNoteWrittenBy?: string; includeDistrusted?: boolean };
   /** Program + args to run per batch (no shell). */
   exec?: string[];
   signal?: AbortSignal;
@@ -73,7 +75,7 @@ async function watchLoopInner(store: Store, opts: WatchOpts): Promise<number> {
     try {
       out = await waitForChanges(
         store,
-        { since: "last", consumer: opts.consumer, namespaces: opts.namespaces, ackMode: "manual", excludeSelf: true },
+        { since: "last", consumer: opts.consumer, namespaces: opts.namespaces, ackMode: "manual", excludeSelf: true, ...(opts.filter ?? {}) },
         { waitSeconds: opts.waitSeconds, signal: opts.signal, key: "cli-watch" }
       );
     } catch (e) {
@@ -83,7 +85,7 @@ async function watchLoopInner(store: Store, opts: WatchOpts): Promise<number> {
     }
     if (out.changes.length === 0) {
       // Nothing for us, but the window moved: keep the marker current.
-      if (out.ack_token) ackChanges(store, { ackToken: out.ack_token, consumer: opts.consumer, namespaces: opts.namespaces });
+      if (out.ack_token) ackChanges(store, { ackToken: out.ack_token, consumer: opts.consumer, namespaces: opts.namespaces, ...(opts.filter ?? {}) });
       continue;
     }
     for (const c of out.changes) {
@@ -106,7 +108,7 @@ async function watchLoopInner(store: Store, opts: WatchOpts): Promise<number> {
       }
       if (!ok) log(`watch: handler exited ${code}; the same changes will be delivered again`);
     }
-    if (ok && out.ack_token) ackChanges(store, { ackToken: out.ack_token, consumer: opts.consumer, namespaces: opts.namespaces });
+    if (ok && out.ack_token) ackChanges(store, { ackToken: out.ack_token, consumer: opts.consumer, namespaces: opts.namespaces, ...(opts.filter ?? {}) });
     batches++;
     if (!ok) await sleep(opts.retryMs ?? 5000, opts.signal);
   }

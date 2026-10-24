@@ -161,11 +161,13 @@ describe("runner status", () => {
     assert.equal(runnerStatus(store, ["gamma"]).waiting_total, 0);
   });
 
-  test("the status never contains command text, params, target or heartbeat host", () => {
+  test("the status never contains command text, params or heartbeat host (a runner's NAME is shown, per target, since 1.4.0)", () => {
     heartbeat(store, 5 * 3600);
     approvedTask(store, "tasks");
-    const all = JSON.stringify(runnerStatus(store)) + runnerNotice(store);
-    for (const leak of [SECRET_WORD, "hello", "pc-1", "SECRET-HOST", "4242", "runner_serves"]) assert.ok(!all.includes(leak), `leaked ${leak}`);
+    const st = runnerStatus(store);
+    const all = JSON.stringify(st) + runnerNotice(store);
+    for (const leak of [SECRET_WORD, "hello", "SECRET-HOST", "4242", "runner_serves"]) assert.ok(!all.includes(leak), `leaked ${leak}`);
+    assert.deepEqual(st.targets.map((t) => t.target), ["pc-1"], "the runner's name is the one thing the per-target view adds");
   });
 
   test("catch_up: backward compatible shape and the notice", () => {
@@ -312,9 +314,21 @@ describe("runner status: trust and correctness", () => {
     assert.equal(runnerStatus(store).runner.state, "online");
   });
 
-  test("a legacy heartbeat (written_by empty, from a runner before 1.3.4) still counts", () => {
+  test("a legacy heartbeat (written_by empty, from a runner before 1.3.4) is NOT believed by default (1.4.0)", () => {
     heartbeat(store, 20, { writer: "" });
-    assert.equal(runnerStatus(store).runner.state, "online");
+    assert.equal(runnerStatus(store).runner.state, "never_seen");
+  });
+
+  test("ONEMEMORY_RUNNER_ACCEPT_LEGACY=1 lets a pre-1.3.4 heartbeat count again", () => {
+    process.env.ONEMEMORY_RUNNER_ACCEPT_LEGACY = "1";
+    try {
+      heartbeat(store, 20, { writer: "" });
+      assert.equal(runnerStatus(store).runner.state, "online");
+    } finally {
+      delete process.env.ONEMEMORY_RUNNER_ACCEPT_LEGACY;
+      clearRunnerStatusCache(store);
+    }
+    assert.equal(runnerStatus(store).runner.state, "never_seen", "off again");
   });
 
   test("tasks for another machine or another namespace are not 'waiting' and raise no offline notice", () => {
@@ -454,7 +468,7 @@ describe("runner status: recall hook, CLI, dashboard", () => {
       const out = JSON.parse(await runRecall({ dbPath: db }));
       assert.equal(out.hookSpecificOutput.additionalContext, "");
       assert.equal(Store.peekSchemaVersion(db), 12, "still v12: the hook did not migrate it");
-      assert.ok(!existsSync(db + ".pre-v13-backup"));
+      assert.ok(!existsSync(db + ".pre-v14-backup"));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

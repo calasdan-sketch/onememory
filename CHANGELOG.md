@@ -6,6 +6,60 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-24
+
+Trust. A server can now say whom not to believe, name writers across servers, and vouch for
+the writers it exports; the runner liveness signal is per machine. **Schema v14** (was v13): read
+[docs/trust.md](./docs/trust.md) before upgrading.
+
+### Added
+- **Stable writer identity.** Each database has a `server_id` (random UUID, kept in the file). Notes,
+  tasks, handoffs and feed entries return `writer_id` = `<server_id>/<label>` beside `written_by`
+  (additive). Filters and rules accept a label or a writer id. `server_id` is in every export.
+- **`distrust_writers`**: an admin-managed per-namespace (or `*`) list, honoured by every read path
+  (store list/search/semantic/neighbours/feed/stats, search and relevant services, tasks, handoffs,
+  catch-up, MCP, REST, CLI `recall`/`relevant`/`changes`/`watch`, dashboard). Hidden by default with
+  exact totals; `include_distrusted` opts in and marks `distrusted`. `task_claim`/`task_approve` refuse
+  distrusted tasks and the runner never runs a distrusted command task (even one approved earlier). Matches
+  current `written_by`, a verified `attested_writer`, and `merged_from_writers`. New: `trust_policy` MCP tool
+  (admin, 22 tools now), `GET/POST/DELETE /trust*` (admin), `onememory trust ...`. Changes are logged
+  (`trust_log`, audit).
+- **Signed writer attestations.** Per-database Ed25519 key (`.attest-key` beside the database, mode 0600,
+  never exported, not in `onememory backup`). `GET /export` and `export --format json` carry a header
+  (`server_id`, `key_id`, public key) and a detached attestation per note (`?attest=0` / `--no-attest`
+  off). Import verifies against the admin's attester list plus `ONEMEMORY_TRUSTED_ATTESTERS`; a verified
+  note keeps `attested_writer` / `attested_by`, anything else imports exactly as before. Tamper tests cover
+  content, writer, namespace, timestamp and id. `onememory import --file backup.json` is new.
+- **Per-runner heartbeats and status.** Heartbeat note `runner heartbeat: <machine>`; `runner_status`,
+  `GET /runner/status` and `onememory runner-status` gain a `targets` list (backward compatible totals
+  and `runner` summary).
+- **Feed and recall filters.** `written_by` / `not_written_by` / `include_distrusted` on `catch_up`,
+  `state_relevant`/`POST /relevant`, handoffs and CLI; explicit `note_written_by` / `not_note_written_by`
+  on the feed (event versus current-writer semantics, documented). Index `idx_change_log_writer`.
+- **Durable authorship.** A delete records the original author (`note_written_by`); consolidation stores
+  `merged_from_writers`, so `not_written_by` and distrust treat the merged note as touched by every source.
+- File sync writes `origin_writer` in front matter (an unverified claim, shown as `imported_written_by`).
+- Dashboard: runner banner per target, "distrusted" toggle with a DISTRUSTED badge, import result shows
+  attestation counts.
+
+### Changed
+- **Breaking-ish: legacy runner heartbeats.** A heartbeat with no writer marker (runner older than 1.3.4) is
+  no longer believed. Update the runner, or set `ONEMEMORY_RUNNER_ACCEPT_LEGACY=1` on the server meanwhile.
+- `GET /export` JSON is now `{"export": {...header}, "notes": [...]}` (still streamed). Use `?attest=0` for
+  the header with unsigned notes. `onememory import --file` and `POST /import` read both shapes.
+- `catch_up` and the recall notice return early (no work) when no command task is queued.
+- Removed the `tasks.ts` <-> `liveness.ts` import cycle (shared rule now in `task-core.ts`).
+
+### Upgrade and rollback
+First open of a v1 to v13 database copies it to `<db>.pre-v14-backup` (never overwritten), then upgrades in one
+transaction. Roll back by stopping every process and putting the copy back (docs/trust.md). Tested from v11,
+v12 and v13, plain and encrypted. Restoring a database file keeps its `server_id`, not its `.attest-key`.
+
+### Not covered (stated plainly)
+Attestations prove who signed what, not that content is true; they have no revocation or freshness.
+The distrust list is a policy on labels, not a boundary against the operator. Cost of `not_written_by` and
+`note_*` filters grows with the feed window (measured 110 to 580 ms on 300,000 events).
+
 ## [1.3.4] - 2026-10-24
 
 "Runner offline, N commands waiting." An approved command task used to wait

@@ -752,6 +752,10 @@ export function consolidateNotes(
       {
         skipEdges: true,
         lint: "trusted",
+        // The sources are about to be deleted; their writers are kept on the
+        // merged note for good, so not_written_by and the distrust list still
+        // see whose text it was made from.
+        mergedFromWriters: sourceWriters(notes),
         // Retention: the merged note keeps a TTL only when EVERY source had
         // one (then the latest deadline, so nothing is forgotten earlier than
         // intended). If any source was meant to be kept forever, so is the merge.
@@ -775,11 +779,29 @@ export function consolidateNotes(
         }
       }
     }
-    // The merged note is stamped with whoever ran the merge; say whose text it
-    // was made from (reported, not stored).
-    const writers = [...new Set(notes.map((n) => n.written_by))].sort();
-    return { ...merged, merged_from_writers: writers };
+    // The merged note is stamped with whoever ran the merge; whose text it was
+    // made from is stored in merged_from_writers (and returned here).
+    return merged;
   });
+}
+
+/**
+ * The writers whose text a merge is made of: every source's content writer, the
+ * original author a verified attestation vouched for (as a label and as a
+ * `<server_id>/<label>` id), and whatever those sources were themselves merged
+ * from. Unknown writers ("") are not names and are left out.
+ */
+export function sourceWriters(notes: NoteRecord[]): string[] {
+  const out = new Set<string>();
+  for (const n of notes) {
+    if (n.written_by) out.add(n.written_by);
+    if (n.attested_writer && n.attested_by) {
+      out.add(n.attested_writer);
+      out.add(`${n.attested_by}/${n.attested_writer}`);
+    }
+    for (const w of n.merged_from_writers ?? []) out.add(w);
+  }
+  return [...out].sort();
 }
 
 /**

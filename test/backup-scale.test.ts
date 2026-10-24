@@ -118,7 +118,8 @@ describe("backup: streaming export shape", () => {
     const server = makeServer(store);
     const base = await listen(server);
     try {
-      const res = await call(base, "GET", "/export");
+      // ?attest=0 is the pre-1.4.0 envelope; the default adds a header and signatures (tested in trust.test.ts).
+      const res = await call(base, "GET", "/export?attest=0");
       assert.equal(res.status, 200);
       const text = await res.text();
 
@@ -139,8 +140,11 @@ describe("backup: streaming export shape", () => {
     const server = makeServer(store);
     const base = await listen(server);
     try {
-      const text = await (await call(base, "GET", "/export")).text();
+      const text = await (await call(base, "GET", "/export?attest=0")).text();
       assert.deepEqual(JSON.parse(text), { notes: [] });
+      const withHeader = JSON.parse(await (await call(base, "GET", "/export")).text());
+      assert.deepEqual(withHeader.notes, []);
+      assert.equal(withHeader.export.format, "onememory-export");
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
       store.close();

@@ -78,6 +78,12 @@ export interface ChangesRequest {
   writtenBy?: string;
   /** Only changes NOT made by this server-stamped writer. */
   notWrittenBy?: string;
+  /** NOTE semantics: only notes whose CURRENT writer is this (a deleted note: its writer when deleted). */
+  noteWrittenBy?: string;
+  /** NOTE semantics: skip notes whose current writer is this. */
+  notNoteWrittenBy?: string;
+  /** Include changes to notes whose writer is on the distrust list (marked `distrusted`). Default: left out. */
+  includeDistrusted?: boolean;
   limit?: number;
   consumer?: string;
   /**
@@ -111,7 +117,17 @@ const ACK_DOMAIN = "onememory-ack-v1";
  */
 export function ackChanges(
   store: Store,
-  req: { ackToken: string; consumer?: string; namespaces?: string[]; source?: string; writtenBy?: string; notWrittenBy?: string }
+  req: {
+    ackToken: string;
+    consumer?: string;
+    namespaces?: string[];
+    source?: string;
+    writtenBy?: string;
+    notWrittenBy?: string;
+    noteWrittenBy?: string;
+    notNoteWrittenBy?: string;
+    includeDistrusted?: boolean;
+  }
 ): { consumer: string; seq: number } {
   const consumer = consumerKey(req.consumer);
   const t = store.openToken(ACK_DOMAIN, req.ackToken);
@@ -151,7 +167,17 @@ export type ChangesResponse = Omit<ChangesPage, "consumer" | "seq"> & {
 export function runChanges(store: Store, req: ChangesRequest): ChangesResponse {
   let acked = false;
   if (req.ackToken) {
-    ackChanges(store, { ackToken: req.ackToken, consumer: req.consumer, namespaces: req.namespaces, source: req.source, writtenBy: req.writtenBy, notWrittenBy: req.notWrittenBy });
+    ackChanges(store, {
+      ackToken: req.ackToken,
+      consumer: req.consumer,
+      namespaces: req.namespaces,
+      source: req.source,
+      writtenBy: req.writtenBy,
+      notWrittenBy: req.notWrittenBy,
+      noteWrittenBy: req.noteWrittenBy,
+      notNoteWrittenBy: req.notNoteWrittenBy,
+      includeDistrusted: req.includeDistrusted,
+    });
     acked = true;
   }
   const out = runChangesInner(store, req);
@@ -160,7 +186,18 @@ export function runChanges(store: Store, req: ChangesRequest): ChangesResponse {
 
 function runChangesInner(store: Store, req: ChangesRequest): ChangesResponse {
   const excludeSource = req.excludeSelf ? consumerKey(req.consumer) : undefined;
-  const filter = { namespaces: req.namespaces, source: req.source, writtenBy: req.writtenBy, notWrittenBy: req.notWrittenBy, limit: req.limit, excludeSource, tail: req.tail };
+  const filter = {
+    namespaces: req.namespaces,
+    source: req.source,
+    writtenBy: req.writtenBy,
+    notWrittenBy: req.notWrittenBy,
+    noteWrittenBy: req.noteWrittenBy,
+    notNoteWrittenBy: req.notNoteWrittenBy,
+    includeDistrusted: req.includeDistrusted,
+    limit: req.limit,
+    excludeSource,
+    tail: req.tail,
+  };
   let page: ChangesPage;
   let markerReset = false;
   if (req.cursor) {

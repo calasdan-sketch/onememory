@@ -40,6 +40,35 @@ import { isStale, stalenessConfig, annotateStaleness } from "./staleness.js";
 // only node: builtins, never store.ts.
 import { encrypt, decryptIfEncrypted, loadKey, keyPath, noteAad } from "./crypto.js";
 import { currentActor, currentWriter, cleanWriter } from "./actor.js";
+import {
+  ALL_NAMESPACES,
+  MAX_DISTRUST_RULES,
+  NOTE_COLUMNS,
+  distrustSql,
+  makeWriterId,
+  matchesDistrust,
+  mergedToStorage,
+  parseMerged,
+  parseWriterRef,
+  writerFilterSql,
+  writerTaintFilterSql,
+  type DistrustRule,
+  type WriterFacts,
+} from "./trust.js";
+import {
+  contentHash,
+  ephemeralKey,
+  isPublicKey,
+  keyIdOf,
+  loadOrCreateSigningKey,
+  parseTrustedAttestersEnv,
+  signRecord,
+  verifyRecord,
+  type Attestation,
+  type SigningKey,
+  type TrustedAttester,
+  type VerifyReason,
+} from "./attest.js";
 
 /**
  * A caller-input error (bad/oversized/secret-bearing data, empty title, stale
@@ -210,6 +239,8 @@ export interface NoteInput {
  * revision counter) instead of looking brand new.
  */
 export type ImportNote = NoteInput & {
+  /** The note's id on the exporting server (part of what its attestation signs). */
+  id?: number;
   updated_at?: string;
   rev?: number;
   /** Retention state carried by an export; kept on restore (ISO-8601). */
@@ -223,7 +254,36 @@ export type ImportNote = NoteInput & {
   written_by?: string;
   created_by?: string;
   imported_written_by?: string;
+  imported_created_by?: string;
+  /** What a previous hop attested / merged (carried through an export; signed). */
+  attested_writer?: string;
+  attested_by?: string;
+  merged_from_writers?: string[];
+  /** Detached signature of the exporting server over this note (see attest.ts). Verified, never trusted. */
+  attestation?: Attestation;
 };
+
+/** What an import made of the attestations it met. */
+export interface AttestationReport {
+  /** Notes whose attestation verified against a trusted key: the original writer is kept in `attested_writer`. */
+  verified: number;
+  /** Notes imported WITHOUT attestation credit (none, tampered, or an untrusted key): stamped with the importer. */
+  unverified: number;
+  /** Why notes were unverified, with counts. */
+  reasons: Record<string, number>;
+  /** Attester keys seen but not trusted: a person decides whether to add one (`onememory trust attester-add`). */
+  untrusted_keys: Array<{ key_id: string; server_id: string; notes: number }>;
+}
+
+/**
+ * Should an import response mention attestations? Only when some note carried
+ * one: an import of a plain (pre-1.4.0 or hand-made) backup keeps its old,
+ * unchanged result shape.
+ */
+export function attestationsToShow(a: AttestationReport | undefined): AttestationReport | undefined {
+  if (!a) return undefined;
+  return a.verified > 0 || a.unverified > (a.reasons["no attestation"] ?? 0) ? a : undefined;
+}
 
 /** Per-note outcome of importNotes() for writes that did not become notes. */
 export interface ImportReport {
@@ -231,6 +291,8 @@ export interface ImportReport {
   rejected: Array<{ title: string; error: string }>;
   /** Set by importNotes({ dedupe: true }): notes skipped as already present. */
   skipped?: number;
+  /** Set by importNotes: how many notes carried a verifiable attestation. */
+  attestations?: AttestationReport;
 }
 
 /** One entry of the change feed (Store.changes). No bodies: titles only. */
@@ -253,12 +315,21 @@ export interface ChangeEntry {
    * not_written_by feed filters match THIS (event) value.
    */
   written_by: string;
+  /** `<server_id>/<written_by>`: the event writer's stable id ("" = unknown). */
+  writer_id: string;
   /**
    * The note's CURRENT last content writer (what state_list / state_read
    * show), which can differ from `written_by` when the note changed after
-   * this event. Absent for a deleted note.
+   * this event. For a deleted note: its last content writer at deletion.
    */
   note_written_by?: string;
+  /** `<server_id>/<note_written_by>`. */
+  note_writer_id?: string;
+  /**
+   * Set (true) only when `include_distrusted` let a note through whose writer
+   * is on the namespace's distrust list. Absent otherwise.
+   */
+  distrusted?: true;
 }
 
 export interface ChangeCounts {
@@ -306,7 +377,7 @@ export interface QuarantineEntry {
 export const CHANGE_LOG_RETENTION_DAYS = 90;
 
 /** Current schema version (PRAGMA user_version). See Store.migrate. */
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 
 /**
  * Notes fetched per page by exportBatch(), which both streaming export
@@ -380,16 +451,42 @@ export interface NoteRecord {
   /** Server-stamped identity of the FIRST writer; never changes on update. "" = unknown. */
   created_by: string;
   /**
+   * Stable id of the last content writer: `<server_id>/<written_by>`. The
+   * server id is random, minted once per database and never changes, so this
+   * stays unambiguous when notes move between servers. "" = unknown writer.
+   * Always set on records the store returns (optional in the type only so
+   * hand-built records, such as test fixtures, stay valid).
+   */
+  writer_id?: string;
+  /**
    * Set only on a note restored via import: the writer the import payload
    * CLAIMED (unverified). written_by / created_by are the importing admin.
    */
   imported_written_by?: string;
+  /** Set only on a restored note: the first writer the payload claimed (unverified). */
+  imported_created_by?: string;
   /**
-   * Only on the result of a consolidate (merge), never stored: the distinct
-   * `written_by` values of the source notes. The merged note itself is
+   * Set only on a note imported with a VERIFIED attestation: the writer the
+   * attesting server vouches for (its own `written_by` for the note). The
+   * importing admin is still `written_by`. Cleared when the content is edited.
+   */
+  attested_writer?: string;
+  /** server_id of the server that signed `attested_writer`. */
+  attested_by?: string;
+  /** `<attested_by>/<attested_writer>` (set with the two above). */
+  attested_writer_id?: string;
+  /**
+   * Set on a note made by merging others (consolidate): the writers of the
+   * source notes, kept for good. `not_written_by` and the distrust list treat
+   * the merged note as touched by every one of them. The merged note itself is
    * stamped with whoever ran the merge.
    */
   merged_from_writers?: string[];
+  /**
+   * Present (true) only when a read opted in with include_distrusted and the
+   * note's writer is on the distrust list. Never stored.
+   */
+  distrusted?: true;
   created_at: string;
   updated_at: string;
   /** Read-importance tracking: total user-facing reads of this note. */
@@ -427,6 +524,10 @@ interface NoteRow {
   written_by: string | null;
   created_by: string | null;
   imported_written_by: string | null;
+  imported_created_by: string | null;
+  attested_writer: string | null;
+  attested_by: string | null;
+  merged_from_writers: string | null;
   created_at: string;
   updated_at: string;
   access_count: number;
@@ -444,7 +545,10 @@ function quarantineAad(col: string, namespace: string): string {
   return `quarantine|${col}|${namespace}`;
 }
 
-function rowToRecord(row: NoteRow): NoteRecord {
+function rowToRecord(row: NoteRow, serverId = ""): NoteRecord {
+  const attW = row.attested_writer ?? "";
+  const attBy = row.attested_by ?? "";
+  const merged = parseMerged(row.merged_from_writers);
   return {
     id: row.id,
     namespace: row.namespace,
@@ -458,7 +562,11 @@ function rowToRecord(row: NoteRow): NoteRecord {
     source: row.source ?? "",
     written_by: row.written_by ?? "",
     created_by: row.created_by ?? "",
+    writer_id: makeWriterId(serverId, row.written_by ?? ""),
     ...(row.imported_written_by ? { imported_written_by: row.imported_written_by } : {}),
+    ...(row.imported_created_by ? { imported_created_by: row.imported_created_by } : {}),
+    ...(attW && attBy ? { attested_writer: attW, attested_by: attBy, attested_writer_id: `${attBy}/${attW}` } : {}),
+    ...(merged.length ? { merged_from_writers: merged } : {}),
     created_at: row.created_at,
     updated_at: row.updated_at,
     access_count: row.access_count ?? 0,
@@ -689,6 +797,8 @@ export interface ReadOpts {
   trackAccess?: boolean;
   /** When true, attach up to EDGE_NEIGHBOR_LIMIT same-namespace neighbors. */
   withNeighbors?: boolean;
+  /** Neighbors from distrusted writers are left out unless this is set. */
+  includeDistrusted?: boolean;
 }
 
 export interface RebuildEdgesResult {
@@ -804,6 +914,11 @@ export interface RangeOpts {
   writtenBy?: string;
   /** Only notes whose last writer is NOT this (e.g. skip my own writes, or distrust a client). */
   notWrittenBy?: string;
+  /**
+   * Show notes whose writer is on the namespace's distrust list. Default
+   * (false): they are left out of every read. See trust.ts and docs/trust.md.
+   */
+  includeDistrusted?: boolean;
 }
 
 /**
@@ -852,7 +967,7 @@ function tagsMatch(rawTags: string, withTags?: string[], withoutTags?: string[],
   return (withTags ?? []).every((t) => have.includes(t)) && !(withoutTags ?? []).some((t) => have.includes(t));
 }
 
-function rangeClause(opts: RangeOpts): { sql: string; params: string[] } {
+function rangeClause(opts: RangeOpts, localId: string): { sql: string; params: string[] } {
   const clauses: string[] = [];
   const params: string[] = [];
   if (opts.startISO) {
@@ -864,12 +979,14 @@ function rangeClause(opts: RangeOpts): { sql: string; params: string[] } {
     params.push(opts.endISO);
   }
   if (opts.writtenBy !== undefined) {
-    clauses.push("notes.written_by = ?");
-    params.push(cleanWriter(opts.writtenBy));
+    const f = writerFilterSql(NOTE_COLUMNS, opts.writtenBy, "is", localId);
+    clauses.push(f.sql);
+    params.push(...f.params);
   }
   if (opts.notWrittenBy !== undefined) {
-    clauses.push("notes.written_by <> ?");
-    params.push(cleanWriter(opts.notWrittenBy));
+    const f = writerFilterSql(NOTE_COLUMNS, opts.notWrittenBy, "not", localId);
+    clauses.push(f.sql);
+    params.push(...f.params);
   }
   return { sql: clauses.length ? " AND " + clauses.join(" AND ") : "", params };
 }
@@ -920,6 +1037,10 @@ export class Store {
   private keyChecked = "";
   /** Directory the key file resolves against (single resolver: beside the DB). */
   private readonly keyDir: string;
+  /** This database's server_id (the `store_uuid` in _meta); filled in by the constructor. */
+  private serverIdValue = "";
+  /** The attestation signing key, loaded (or created) on first use. */
+  private signingKey: SigningKey | null = null;
 
   /**
    * How long a statement waits on a contended SQLite lock before giving up
@@ -951,6 +1072,7 @@ export class Store {
       this.init();
       this.ensureLogTriggers();
       this.installActorStamp();
+      this.serverIdValue = this.storeId();
       this.upgradeV1Envelopes();
     } catch (e) {
       // A constructor that throws never hands the caller a Store to close();
@@ -995,7 +1117,7 @@ export class Store {
       );
     }
     if (found >= SCHEMA_VERSION) return;
-    if (found >= 1 && found < 13) this.preMigrationBackup(found);
+    if (found >= 1) this.preMigrationBackup(found);
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const v = version();
@@ -1015,24 +1137,25 @@ export class Store {
   }
 
   /**
-   * Before the first v12 -> v13 upgrade of a non-empty file, keep one copy of
-   * the pre-upgrade database next to it: `<db>.pre-v13-backup`. It is a
-   * consistent snapshot (VACUUM INTO) still at the old schema version, so an
+   * Before the first upgrade of a non-empty file (v1..v13 -> v14), keep one
+   * copy of the pre-upgrade database next to it: `<db>.pre-v14-backup`. It is a
+   * consistent snapshot (VACUUM INTO) still at the OLD schema version, so an
    * older onememory can open it (rollback = stop everything, put this file
    * back as the database, install the older version). Never overwrites an
    * existing copy, so a second attempt cannot replace the real original.
+   * 1.3.x named its copy `.pre-v13-backup`; that file is left alone.
    * Best effort: a failure is reported and the upgrade continues.
    */
   private preMigrationBackup(from: number): void {
     if (this.dbPath === ":memory:") return;
-    const dest = this.dbPath + ".pre-v13-backup";
+    const dest = this.dbPath + `.pre-v${SCHEMA_VERSION}-backup`;
     try {
       if (existsSync(dest)) return;
       if (!this.db.prepare("SELECT 1 FROM notes LIMIT 1").get()) return;
       this.db.exec(`VACUUM INTO '${dest.replace(/'/g, "''")}'`);
       chmodQuiet(dest, 0o600);
       console.error(
-        `[onememory] upgrading the database from schema v${from} to v13; the original was copied to ${dest} ` +
+        `[onememory] upgrading the database from schema v${from} to v${SCHEMA_VERSION}; the original was copied to ${dest} ` +
           "(to roll back: stop every onememory process, put that file back as the database, install the older version)."
       );
     } catch (e) {
@@ -1375,6 +1498,72 @@ export class Store {
       this.db.exec("DROP INDEX IF EXISTS idx_notes_written_by");
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_notes_ns_writer ON notes(namespace, written_by, updated_at DESC)");
     }
+    if (v < 14) {
+      // v14: the trust layer.
+      //  - notes: imported_created_by (the payload's unverified first-writer
+      //    claim), attested_writer / attested_by (a writer a TRUSTED server
+      //    vouched for, see attest.ts) and merged_from_writers (a JSON array of
+      //    the writers whose notes a consolidation merged: kept for good).
+      //  - change_log: a delete row remembers who wrote the note it deleted
+      //    (note_written_by, plus the attested / merged writers), so the feed can
+      //    filter on a note's author even after the note is gone.
+      //  - trust_distrust: the admin-managed per-namespace list of distrusted
+      //    writers. trust_attesters: public keys whose export attestations the
+      //    admin trusts. Both live in the database, never in a note, so a write
+      //    token cannot touch them.
+      //  - a stable per-database server_id (the existing `store_uuid` in _meta),
+      //    minted here so it exists before anything asks for it.
+      this.addColumn("notes", "imported_created_by", "TEXT NOT NULL DEFAULT ''");
+      this.addColumn("notes", "attested_writer", "TEXT NOT NULL DEFAULT ''");
+      this.addColumn("notes", "attested_by", "TEXT NOT NULL DEFAULT ''");
+      this.addColumn("notes", "merged_from_writers", "TEXT NOT NULL DEFAULT ''");
+      this.addColumn("change_log", "note_written_by", "TEXT NOT NULL DEFAULT ''");
+      this.addColumn("change_log", "note_attested_writer", "TEXT NOT NULL DEFAULT ''");
+      this.addColumn("change_log", "note_attested_by", "TEXT NOT NULL DEFAULT ''");
+      this.addColumn("change_log", "note_merged_from", "TEXT NOT NULL DEFAULT ''");
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS trust_distrust (
+          namespace TEXT NOT NULL,
+          writer TEXT NOT NULL,
+          added_at TEXT NOT NULL,
+          added_by TEXT NOT NULL DEFAULT '',
+          PRIMARY KEY (namespace, writer)
+        );
+        CREATE TABLE IF NOT EXISTS trust_attesters (
+          key_id TEXT PRIMARY KEY,
+          public_key TEXT NOT NULL,
+          server_id TEXT NOT NULL DEFAULT '',
+          label TEXT NOT NULL DEFAULT '',
+          added_at TEXT NOT NULL,
+          added_by TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS trust_log (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          at TEXT NOT NULL,
+          actor TEXT NOT NULL DEFAULT '',
+          action TEXT NOT NULL,
+          namespace TEXT NOT NULL DEFAULT '',
+          subject TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_change_log_writer ON change_log(written_by, seq);
+      `);
+      this.createDeleteTrigger();
+      this.db.prepare("INSERT OR IGNORE INTO _meta (key, value) VALUES ('store_uuid', ?)").run(randomUUID());
+    }
+  }
+
+  /** The delete log row also remembers the deleted note's writers (v14). Caller holds the write lock. */
+  private createDeleteTrigger(): void {
+    this.db.exec(`
+      DROP TRIGGER IF EXISTS notes_log_ad;
+      CREATE TRIGGER notes_log_ad AFTER DELETE ON notes BEGIN
+        UPDATE change_log SET title = '' WHERE note_id = old.id AND title <> '';
+        INSERT INTO change_log (note_id, kind, namespace, title, source, rev, changed_at,
+                                note_written_by, note_attested_writer, note_attested_by, note_merged_from)
+        VALUES (old.id, 'deleted', old.namespace, '', old.source, NULL, ${SQL_NOW},
+                old.written_by, old.attested_writer, old.attested_by, old.merged_from_writers);
+      END;
+    `);
   }
 
   /** (Re)create the created / updated change_log triggers with the writer column. Caller holds the write lock. */
@@ -1491,6 +1680,14 @@ export class Store {
       writtenBy?: string;
       /** Restore path: the writer an import payload CLAIMED (unverified). */
       importedWrittenBy?: string;
+      /** Restore path: the first writer an import payload CLAIMED (unverified). */
+      importedCreatedBy?: string;
+      /** Restore path, verified attestation only: the writer the attesting server vouches for ... */
+      attestedWriter?: string;
+      /** ... and that server's id. */
+      attestedBy?: string;
+      /** Consolidation / verified import: writers whose notes this one derives from (kept for good). */
+      mergedFromWriters?: Iterable<string>;
     } & LintOpts = {}
   ): NoteRecord {
     if (!input.title || !input.title.trim()) {
@@ -1529,6 +1726,10 @@ export class Store {
     // Server-stamped, never from the request: who is writing right now.
     const writer = opts.writtenBy !== undefined ? cleanWriter(opts.writtenBy) : currentWriter();
     const claim = cleanWriter(opts.importedWrittenBy);
+    const claimCreator = cleanWriter(opts.importedCreatedBy);
+    const attWriter = opts.attestedWriter && opts.attestedBy ? cleanWriter(opts.attestedWriter) : "";
+    const attBy = attWriter ? cleanWriter(opts.attestedBy) : "";
+    const merged = mergedToStorage(opts.mergedFromWriters ?? []);
     // At-rest encryption: seal the body for storage. `body` (plaintext) stays
     // the value used below for embedding/edge scoring and audit byte counts
     // -- those need the real text. Only the SQL INSERT gets sealed values.
@@ -1563,8 +1764,9 @@ export class Store {
       const result = this.db
         .prepare(
           `INSERT INTO notes (namespace, title, body, tags, source, written_by, created_by, imported_written_by,
+                              imported_created_by, attested_writer, attested_by, merged_from_writers,
                               created_at, updated_at, rev, body_enc, expires_at, archived_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
         )
         .run(
           namespace,
@@ -1575,6 +1777,10 @@ export class Store {
           writer,
           writer,
           claim,
+          claimCreator,
+          attWriter,
+          attBy,
+          merged,
           createdAt,
           updatedAt,
           startRev,
@@ -1624,7 +1830,7 @@ export class Store {
     if (!opts.withNeighbors) return record;
     // The `neighbors` key is only present when requested: existing callers
     // (and their deepEqual assertions) see a byte-identical shape otherwise.
-    return { ...record, neighbors: this.annotatedNeighbors(id) };
+    return { ...record, neighbors: this.annotatedNeighbors(id, opts.includeDistrusted === true) };
   }
 
   /**
@@ -1633,8 +1839,8 @@ export class Store {
    * access counters); only the staleness annotation is kept, so the payload
    * stays the small NeighborEntry shape.
    */
-  private annotatedNeighbors(id: number): NeighborEntry[] {
-    return this.listNeighbors(id, EDGE_NEIGHBOR_LIMIT).map((n) => {
+  private annotatedNeighbors(id: number, includeDistrusted: boolean): NeighborEntry[] {
+    return this.listNeighbors(id, EDGE_NEIGHBOR_LIMIT, includeDistrusted).map((n) => {
       const full = this.read(n.id);
       const ann = full ? annotateStaleness(full) : null;
       return {
@@ -1770,7 +1976,7 @@ export class Store {
    * and never need to know encryption is on.
    */
   private rec(row: NoteRow): NoteRecord {
-    const r = rowToRecord(row);
+    const r = rowToRecord(row, this.serverIdValue);
     if (row.body_enc) {
       // DecryptIfEncrypted throws on auth failure (wrong/tampered key) --
       // deliberately not swallowed: handing an agent corrupted memory is
@@ -1975,12 +2181,14 @@ export class Store {
          FROM notes ${where}`
       )
       .get(...params) as { n: number; accesses: number; never: number };
+    // Titles are note content: a distrusted writer's notes are not listed (counts above still include them).
+    const dis = this.distrustFragment(NOTE_COLUMNS, namespaces && namespaces.length > 0 ? namespaces : undefined);
     const top = this.db
       .prepare(
-        `SELECT id, title, access_count FROM notes ${where}
+        `SELECT id, title, access_count FROM notes ${where}${dis.sql}
          ORDER BY access_count DESC, id ASC LIMIT 10`
       )
-      .all(...params) as Array<{ id: number; title: string; access_count: number }>;
+      .all(...params, ...dis.params) as Array<{ id: number; title: string; access_count: number }>;
     return {
       totalNotes: Number(totals.n),
       totalAccesses: Number(totals.accesses),
@@ -2098,6 +2306,10 @@ export class Store {
     // created_by is not touched, and a client-sent written_by/created_by never
     // reaches here.
     const contentChanged = title !== existing.title || body !== existing.body;
+    // A new author takes over the content, so a verified attestation (which
+    // vouched for the OLD content) no longer applies. Taint carried in
+    // merged_from_writers stays.
+    const restamp = contentChanged && !opts.keepWriter;
     const writer =
       contentChanged && !opts.keepWriter
         ? opts.writtenBy !== undefined
@@ -2133,10 +2345,12 @@ export class Store {
       const res = this.db
         .prepare(
           `UPDATE notes SET namespace = ?, title = ?, body = ?, tags = ?, source = ?, rev = ?, updated_at = ?,
-                            body_enc = ?, expires_at = ?, written_by = ?
+                            body_enc = ?, expires_at = ?, written_by = ?,
+                            attested_writer = CASE WHEN ? = 1 THEN '' ELSE attested_writer END,
+                            attested_by = CASE WHEN ? = 1 THEN '' ELSE attested_by END
            WHERE id = ? AND (? IS NULL OR rev = ?)`
         )
-        .run(namespace, title, sealed.body, tags, source, rev, now, sealed.bodyEnc, expiresAt, writer, id, want, want);
+        .run(namespace, title, sealed.body, tags, source, rev, now, sealed.bodyEnc, expiresAt, writer, restamp ? 1 : 0, restamp ? 1 : 0, id, want, want);
 
       if (Number(res.changes) === 0) {
         // The row either vanished or its rev moved since we read it.
@@ -2555,7 +2769,7 @@ export class Store {
   } {
     const limit = clampInt(opts.limit, 50, 1, 500);
     const offset = clampInt(opts.offset, 0, 0, Number.MAX_SAFE_INTEGER);
-    const range = rangeClause(opts);
+    const range = this.rangeFor(opts, opts.namespaces ?? (opts.namespace ? [opts.namespace] : undefined));
     const tagF = tagClause(opts.withTags, opts.withoutTags, opts.withTagPrefix);
     // Archived filter: default hides archived; archivedOnly inverts it.
     const archSql = archivedClause(opts.includeArchived, opts.archivedOnly);
@@ -2602,7 +2816,27 @@ export class Store {
       ).c;
     }
 
-    return { notes: rows.filter(exact).map((r) => this.rec(r)), total };
+    const out = rows.filter(exact).map((r) => this.rec(r));
+    return { notes: opts.includeDistrusted ? this.markDistrusted(out) : out, total };
+  }
+
+  /**
+   * Is there at least one live note carrying all `withTags` and a tag that
+   * starts with `withTagPrefix`, in `namespaces` (undefined = every namespace,
+   * [] = none)? One cheap LIMIT 1 probe: lets a caller skip a heavier scan when
+   * the answer is "nothing". Notes from distrusted writers are not counted
+   * unless `includeDistrusted`. (A true can still be a false alarm for an
+   * unusual tag, never a false false.)
+   */
+  hasTagged(opts: { namespaces?: string[]; withTags?: string[]; withTagPrefix?: string; includeDistrusted?: boolean }): boolean {
+    if (opts.namespaces && opts.namespaces.length === 0) return false;
+    const tagF = tagClause(opts.withTags, undefined, opts.withTagPrefix);
+    const range = this.rangeFor({ includeDistrusted: opts.includeDistrusted }, opts.namespaces);
+    const nsSql = opts.namespaces ? ` AND namespace IN (${opts.namespaces.map(() => "?").join(",")})` : "";
+    const row = this.db
+      .prepare(`SELECT 1 AS x FROM notes WHERE archived_at IS NULL${nsSql}${range.sql}${tagF.sql} LIMIT 1`)
+      .get(...(opts.namespaces ?? []), ...range.params, ...tagF.params);
+    return row !== undefined;
   }
 
   search(
@@ -2627,7 +2861,7 @@ export class Store {
     const limit = clampInt(opts.limit, 20, 1, 200);
     const matchQuery = buildMatchQuery(query);
     if (!matchQuery) return []; // query was all punctuation/stopwords
-    const range = rangeClause(opts);
+    const range = this.rangeFor(opts, opts.namespace ? [opts.namespace] : undefined);
 
     try {
       let rows: Array<NoteRow & { score: number }>;
@@ -2694,8 +2928,10 @@ export class Store {
       namespaces?: string[];
       /** A row that cannot be decrypted is emitted body-less with `unreadable: true` instead of throwing. */
       skipUnreadable?: boolean;
+      /** Add each note's detached attestation (signed by this server's key; see attest.ts). */
+      attest?: boolean;
     } = {}
-  ): NoteRecord[] {
+  ): Array<NoteRecord & { attestation?: Attestation }> {
     const lim = clampInt(limit, 500, 1, 5_000);
     const ns = opts.namespaces;
     if (ns && ns.length === 0) return [];
@@ -2703,13 +2939,17 @@ export class Store {
     const rows = this.db
       .prepare(`SELECT * FROM notes WHERE id > ?${nsSql} ORDER BY id ASC LIMIT ?`)
       .all(afterId, ...(ns ?? []), lim) as unknown as NoteRow[];
+    const key = opts.attest ? this.signing() : null;
+    const sid = key ? this.serverId() : "";
+    const sealed = (n: NoteRecord): NoteRecord & { attestation?: Attestation } =>
+      key ? { ...n, attestation: signRecord(key, sid, n) } : n;
     return rows.map((r) => {
-      if (!opts.skipUnreadable) return this.rec(r);
+      if (!opts.skipUnreadable) return sealed(this.rec(r));
       try {
-        return this.rec(r);
+        return sealed(this.rec(r));
       } catch (e) {
         if (!(e instanceof NoteUnreadableError)) throw e;
-        const marker = { ...annotateRetention(r, rowToRecord(r)), unreadable: true as const } as Partial<NoteRecord>;
+        const marker = { ...annotateRetention(r, rowToRecord(r, this.serverIdValue)), unreadable: true as const } as Partial<NoteRecord>;
         delete marker.body; // never emit a body for an unreadable row
         return marker as NoteRecord;
       }
@@ -2756,6 +2996,21 @@ export class Store {
     } = {}
   ): Promise<NoteRecord[]> {
     const created: NoteRecord[] = [];
+    // Attestations: checked against the keys the admin trusts (plus this
+    // server's own key for its own server id). Counted into the report.
+    const trusted = this.trustedAttesters();
+    let ownCache: { keyId: string; publicKey: string; serverId: string } | null = null;
+    const ownKey = (): { keyId: string; publicKey: string; serverId: string } => {
+      // Only built (and the key file only created) when a note actually carries an attestation.
+      if (!ownCache) {
+        const i = this.identity();
+        ownCache = { keyId: i.key_id, publicKey: i.public_key, serverId: i.server_id };
+      }
+      return ownCache;
+    };
+    const att: AttestationReport = { verified: 0, unverified: 0, reasons: {}, untrusted_keys: [] };
+    if (opts.report) opts.report.attestations = att;
+    const untrustedSeen = new Map<string, { key_id: string; server_id: string; notes: number }>();
     // Batched inserts: one write transaction per IMPORT_INSERT_BATCH notes
     // instead of one per note. Inside the batch create() nests as a
     // SAVEPOINT (see create), so each note stays individually all-or-nothing
@@ -2784,6 +3039,10 @@ export class Store {
             continue;
           }
           try {
+            // A verified attestation lets the original writer be kept as
+            // `attested_writer`; anything else is imported exactly as before.
+            const verdict = this.verifyImported(note, trusted, ownKey);
+            const carried = verdict.ok ? this.attestedProvenance(note, verdict.attester.server_id) : null;
             created.push(
               this.create(
                 {
@@ -2800,6 +3059,8 @@ export class Store {
                   // its own clearly-labelled field, as an unverified claim.
                   importedWrittenBy:
                     cleanWriter(note.imported_written_by) || cleanWriter(note.written_by) || undefined,
+                  importedCreatedBy: cleanWriter(note.imported_created_by) || cleanWriter(note.created_by) || undefined,
+                  ...(carried ? { attestedWriter: carried.writer, attestedBy: carried.by, mergedFromWriters: carried.merged } : {}),
                   skipEdges: true,
                   updatedAt: note.updated_at,
                   startRev: note.rev,
@@ -2812,6 +3073,17 @@ export class Store {
                 }
               )
             );
+            if (verdict.ok) att.verified++;
+            else {
+              att.unverified++;
+              att.reasons[verdict.reason] = (att.reasons[verdict.reason] ?? 0) + 1;
+              if (verdict.reason === "attester key not trusted" && verdict.key_id) {
+                const k = `${verdict.key_id}|${verdict.server_id ?? ""}`;
+                const seen = untrustedSeen.get(k) ?? { key_id: verdict.key_id, server_id: verdict.server_id ?? "", notes: 0 };
+                seen.notes++;
+                untrustedSeen.set(k, seen);
+              }
+            }
           } catch (e) {
             // Skip a note that fails validation (oversized / looks like a secret)
             // rather than aborting the whole restore and leaving earlier notes
@@ -2843,7 +3115,58 @@ export class Store {
     // afterwards. Small/one-at-a-time imports keep inline linking so the
     // graph is never silently missing for the common case.
     if (!opts.deferEdges) await this.linkNotes(created);
+    att.untrusted_keys = [...untrustedSeen.values()];
     return created;
+  }
+
+  /** Check one imported note's attestation (against the payload as received). */
+  private verifyImported(
+    note: ImportNote,
+    trusted: ReadonlyMap<string, TrustedAttester>,
+    own: () => { keyId: string; publicKey: string; serverId: string }
+  ): ReturnType<typeof verifyRecord> {
+    const tags = Array.isArray(note.tags) ? note.tags : [];
+    if (note.attestation === undefined || note.attestation === null) return { ok: false, reason: "no attestation" };
+    if (typeof note.id !== "number" || typeof note.title !== "string") return { ok: false, reason: "malformed attestation" };
+    return verifyRecord(
+      note.attestation,
+      {
+        id: note.id,
+        namespace: typeof note.namespace === "string" ? note.namespace : "",
+        title: note.title,
+        body: typeof note.body === "string" ? note.body : "",
+        tags,
+        written_by: typeof note.written_by === "string" ? note.written_by : "",
+        created_by: typeof note.created_by === "string" ? note.created_by : "",
+        updated_at: typeof note.updated_at === "string" ? note.updated_at : "",
+        attested_writer: typeof note.attested_writer === "string" ? note.attested_writer : "",
+        attested_by: typeof note.attested_by === "string" ? note.attested_by : "",
+        merged_from_writers: Array.isArray(note.merged_from_writers) ? note.merged_from_writers.filter((x) => typeof x === "string") : [],
+      },
+      trusted,
+      own()
+    );
+  }
+
+  /**
+   * What a verified attestation lets the import keep: the attester's own
+   * `written_by` for the note becomes `attested_writer`, and everything the
+   * attester said about earlier hops (its own attested writer, its merged
+   * sources) is kept as merged_from_writers, so distrust still follows the
+   * content through a chain of servers.
+   */
+  private attestedProvenance(note: ImportNote, attesterId: string): { writer: string; by: string; merged: string[] } | null {
+    const writer = cleanWriter(note.written_by);
+    const merged = new Set<string>(Array.isArray(note.merged_from_writers) ? note.merged_from_writers.map((x) => cleanWriter(x)) : []);
+    const prevW = cleanWriter(note.attested_writer);
+    const prevBy = cleanWriter(note.attested_by);
+    if (prevW && prevBy) {
+      merged.add(prevW);
+      merged.add(`${prevBy}/${prevW}`);
+    }
+    merged.delete("");
+    if (!writer) return merged.size ? { writer: "", by: "", merged: [...merged] } : null;
+    return { writer, by: attesterId, merged: [...merged] };
   }
 
   /** True when an identical note (namespace, title, created_at, body) already exists. */
@@ -2946,7 +3269,7 @@ export class Store {
   ): SemanticHit[] {
     if (!queryVec || queryVec.length === 0) return [];
     const limit = clampInt(opts.limit, 20, 1, 200);
-    const range = rangeClause(opts);
+    const range = this.rangeFor(opts, opts.namespace ? [opts.namespace] : undefined);
 
     const rows = (
       opts.namespace
@@ -3249,7 +3572,15 @@ export class Store {
    * moved between namespaces by a concurrent writer can't leak through a
    * stale edge).
    */
-  listNeighbors(id: number, limit = EDGE_NEIGHBOR_LIMIT): NeighborEntry[] {
+  listNeighbors(id: number, limit = EDGE_NEIGHBOR_LIMIT, includeDistrusted = true): NeighborEntry[] {
+    // A neighbor is in the same namespace as the note, so only that namespace's rules matter.
+    const ns = (this.db.prepare("SELECT namespace FROM notes WHERE id = ?").get(id) as { namespace: string } | undefined)?.namespace;
+    const dis = includeDistrusted || ns === undefined
+      ? { sql: "", params: [] as string[] }
+      : this.distrustFragment(
+          { ns: "n.namespace", writer: "n.written_by", attWriter: "n.attested_writer", attBy: "n.attested_by", merged: "n.merged_from_writers" },
+          [ns]
+        );
     const rows = this.db
       .prepare(
         `SELECT e.neighbor_id AS id, n.title AS title, e.score AS score
@@ -3257,11 +3588,11 @@ export class Store {
          JOIN notes n ON n.id = e.neighbor_id
          WHERE e.note_id = ?
            AND n.archived_at IS NULL
-           AND n.namespace = (SELECT namespace FROM notes WHERE id = ?)
+           AND n.namespace = (SELECT namespace FROM notes WHERE id = ?)${dis.sql}
          ORDER BY e.score DESC, e.neighbor_id ASC
          LIMIT ?`
       )
-      .all(id, id, clampInt(limit, EDGE_NEIGHBOR_LIMIT, 1, 100)) as Array<{
+      .all(id, id, ...dis.params, clampInt(limit, EDGE_NEIGHBOR_LIMIT, 1, 100)) as Array<{
       id: number;
       title: string;
       score: number;
@@ -3808,10 +4139,19 @@ export class Store {
     cursor?: string;
     namespaces?: string[];
     source?: string;
-    /** Only changes made by this server-stamped writer. */
+    /** EVENT semantics: only changes made by this server-stamped writer (matches each change's own writer). */
     writtenBy?: string;
-    /** Only changes NOT made by this server-stamped writer. */
+    /** EVENT semantics: only changes NOT made by this server-stamped writer. */
     notWrittenBy?: string;
+    /**
+     * NOTE semantics: only notes whose CURRENT last content writer is this
+     * (for a deleted note: the writer it had when it was deleted).
+     */
+    noteWrittenBy?: string;
+    /** NOTE semantics: skip notes whose current writer is this. */
+    notNoteWrittenBy?: string;
+    /** Also show changes to notes whose writer is on the distrust list (marked `distrusted`). */
+    includeDistrusted?: boolean;
     limit?: number;
     /** "last"-marker consumer, carried (signed) through the cursor. */
     consumer?: string;
@@ -3874,18 +4214,54 @@ export class Store {
     const nsParams = opts.namespaces ?? [];
     const srcSql = opts.source !== undefined ? " AND source = ?" : "";
     const srcParams = opts.source !== undefined ? [opts.source] : [];
-    const wbSql =
-      (opts.writtenBy !== undefined ? " AND written_by = ?" : "") +
-      (opts.notWrittenBy !== undefined ? " AND written_by <> ?" : "");
-    const wbParams = [
-      ...(opts.writtenBy !== undefined ? [cleanWriter(opts.writtenBy)] : []),
-      ...(opts.notWrittenBy !== undefined ? [cleanWriter(opts.notWrittenBy)] : []),
-    ];
+    // EVENT filters: each change_log row carries the writer of that event. A
+    // foreign writer_id never wrote a local event: "is" matches nothing, "not" nothing.
+    const localId = this.serverId();
+    let wbSql = "";
+    const wbParams: string[] = [];
+    if (opts.writtenBy !== undefined) {
+      const r = parseWriterRef(opts.writtenBy);
+      if (r.serverId && r.serverId !== localId.toLowerCase()) wbSql += " AND 0";
+      else {
+        wbSql += " AND written_by = ?";
+        wbParams.push(r.label);
+      }
+    }
+    if (opts.notWrittenBy !== undefined) {
+      const r = parseWriterRef(opts.notWrittenBy);
+      if (!r.serverId || r.serverId === localId.toLowerCase()) {
+        wbSql += " AND written_by <> ?";
+        wbParams.push(r.label);
+      }
+    }
     const exSql = c.x ? " AND (CASE WHEN actor <> '' THEN actor ELSE source END) <> ?" : "";
     const exParams = c.x ? [c.x] : [];
     // One entry per note: its LAST event in the window, kind "deleted" if
     // that event is the delete, else "created" if the note was born in the
     // window, else "updated".
+    // The note's CURRENT writer facts: the notes row while the note lives, the
+    // delete log row's copy once it is gone. NOTE-semantics filters and the
+    // distrust list read these, on the window's LAST event of each note.
+    const cur = {
+      writer: "COALESCE(n.written_by, e.note_written_by)",
+      attWriter: "COALESCE(n.attested_writer, e.note_attested_writer)",
+      attBy: "COALESCE(n.attested_by, e.note_attested_by)",
+      merged: "COALESCE(n.merged_from_writers, e.note_merged_from)",
+    };
+    const curCols = { ns: "e.namespace", ...cur };
+    const noteParts = [
+      ...(opts.noteWrittenBy !== undefined ? [writerFilterSql(curCols, opts.noteWrittenBy, "is", this.serverId())] : []),
+      ...(opts.notNoteWrittenBy !== undefined ? [writerFilterSql(curCols, opts.notNoteWrittenBy, "not", this.serverId())] : []),
+      // not_written_by on the feed is an EVENT filter (below); a note that the
+      // excluded writer merged into or had attested still counts as touched by them.
+      ...(opts.notWrittenBy !== undefined ? [writerTaintFilterSql(curCols, opts.notWrittenBy, this.serverId())] : []),
+    ];
+    const noteSql = noteParts.map((p) => ` AND ${p.sql}`).join("");
+    const noteParams = noteParts.flatMap((p) => p.params);
+    const rules = this.distrustRules();
+    const dis = opts.includeDistrusted
+      ? { sql: "", params: [] as string[] }
+      : distrustSql(rules, this.serverId(), { ns: "e.namespace", ...cur }, opts.namespaces);
     const eventsSql = `
       WITH ev AS (SELECT seq, note_id, kind FROM change_log
                    WHERE seq > ? AND seq <= ?${nsSql}${srcSql}${wbSql}${exSql}),
@@ -3893,9 +4269,13 @@ export class Store {
       SELECT e.seq AS seq,
              CASE WHEN e.kind = 'deleted' THEN 'deleted' WHEN g.born THEN 'created' ELSE 'updated' END AS kind,
              e.note_id AS id, e.namespace AS namespace, e.title AS title, e.source AS source,
-             e.changed_at AS at, e.rev AS rev, e.written_by AS written_by
-        FROM g JOIN change_log e ON e.seq = g.last`;
-    const eventParams = [c.f, c.t, ...nsParams, ...srcParams, ...wbParams, ...exParams];
+             e.changed_at AS at, e.rev AS rev, e.written_by AS written_by,
+             ${cur.writer} AS cur_writer, (n.id IS NOT NULL) AS live,
+             ${cur.attWriter} AS cur_att_writer, ${cur.attBy} AS cur_att_by, ${cur.merged} AS cur_merged
+        FROM g JOIN change_log e ON e.seq = g.last
+        LEFT JOIN notes n ON n.id = e.note_id
+       WHERE 1 = 1${noteSql}${dis.sql}`;
+    const eventParams = [c.f, c.t, ...nsParams, ...srcParams, ...wbParams, ...exParams, ...noteParams, ...dis.params];
 
     const tail = opts.tail !== undefined ? clampInt(opts.tail, 30, 1, CHANGES_MAX_LIMIT) : 0;
     const rowsRaw = this.db
@@ -3914,32 +4294,44 @@ export class Store {
       at: string;
       rev: number | null;
       written_by: string | null;
+      cur_writer: string | null;
+      live: number;
+      cur_att_writer: string | null;
+      cur_att_by: string | null;
+      cur_merged: string | null;
     }>;
     const rows = tail ? rowsRaw.slice(0, tail).reverse() : rowsRaw;
     const more = tail ? false : rows.length > limit;
     const pageRows = rows.slice(0, tail || limit);
-    const current = new Map<number, string>();
-    if (pageRows.length) {
-      const ids = [...new Set(pageRows.map((r) => Number(r.id)))];
-      for (let i = 0; i < ids.length; i += 500) {
-        const part = ids.slice(i, i + 500);
-        const got = this.db
-          .prepare(`SELECT id, written_by FROM notes WHERE id IN (${part.map(() => "?").join(",")})`)
-          .all(...part) as Array<{ id: number; written_by: string | null }>;
-        for (const g of got) current.set(Number(g.id), g.written_by ?? "");
-      }
-    }
-    const page = pageRows.map((r): ChangeEntry => ({
-      kind: r.kind,
-      id: Number(r.id),
-      namespace: r.namespace,
-      title: r.title,
-      source: r.source ?? "",
-      written_by: r.written_by ?? "",
-      ...(current.has(Number(r.id)) ? { note_written_by: current.get(Number(r.id))! } : {}),
-      at: r.at,
-      ...(r.rev === null || r.rev === undefined || r.kind === "deleted" ? {} : { rev: Number(r.rev) }),
-    }));
+    const sid = this.serverId();
+    const page = pageRows.map((r): ChangeEntry => {
+      const live = Number(r.live) === 1;
+      const noteWriter = r.cur_writer ?? "";
+      const flagged =
+        opts.includeDistrusted === true &&
+        rules.length > 0 &&
+        matchesDistrust(
+          rules,
+          { namespace: r.namespace, written_by: noteWriter, attested_writer: r.cur_att_writer ?? "", attested_by: r.cur_att_by ?? "", merged_from_writers: parseMerged(r.cur_merged) },
+          sid
+        );
+      return {
+        kind: r.kind,
+        id: Number(r.id),
+        namespace: r.namespace,
+        title: r.title,
+        source: r.source ?? "",
+        written_by: r.written_by ?? "",
+        writer_id: makeWriterId(sid, r.written_by ?? ""),
+        // A live note always reports its writer ("" = unknown); a deleted note
+        // reports the author recorded when it was deleted (absent for rows
+        // deleted before schema v14, which did not record it).
+        ...(live || noteWriter ? { note_written_by: noteWriter, note_writer_id: makeWriterId(sid, noteWriter) } : {}),
+        ...(flagged ? { distrusted: true as const } : {}),
+        at: r.at,
+        ...(r.rev === null || r.rev === undefined || r.kind === "deleted" ? {} : { rev: Number(r.rev) }),
+      };
+    });
 
     const grouped = this.db
       .prepare(`SELECT source, kind, COUNT(*) AS n FROM (${eventsSql}) GROUP BY source, kind`)
@@ -4041,6 +4433,199 @@ export class Store {
       this.db.exec("DELETE FROM _meta WHERE key LIKE 'changes\\_seen:%' ESCAPE '\\'");
       return n;
     });
+  }
+
+  // --- Trust layer (v14) -----------------------------------------------------
+
+  /**
+   * This database's stable random id: minted once (when the schema is created
+   * or upgraded), stored in _meta, copied by a backup, never changed. It is in
+   * every export header and in each attestation, and is the first half of a
+   * `writer_id`.
+   */
+  serverId(): string {
+    return this.serverIdValue || (this.serverIdValue = this.storeId());
+  }
+
+  /** `<server_id>/<label>`: the stable id of a writer on this server ("" for an unknown writer). */
+  writerId(label: string): string {
+    return makeWriterId(this.serverId(), label);
+  }
+
+  /** Who is changing the trust configuration right now, for the log. */
+  private trustActor(): string {
+    return currentWriter() || currentActor() || "unknown";
+  }
+
+  private logTrust(action: string, namespace: string, subject: string): void {
+    const actor = this.trustActor();
+    this.db
+      .prepare("INSERT INTO trust_log (at, actor, action, namespace, subject) VALUES (?, ?, ?, ?, ?)")
+      .run(new Date().toISOString(), actor, action, namespace, subject);
+    audit({ op: `trust.${action}`, namespace, label: actor, kind: "trust", detail: subject.slice(0, 200) });
+  }
+
+  /** The distrust list (every namespace). Cheap: a tiny table read per query, so a change elsewhere is seen at once. */
+  distrustRules(): DistrustRule[] {
+    return this.db
+      .prepare("SELECT namespace, writer, added_at, added_by FROM trust_distrust ORDER BY namespace, writer")
+      .all() as unknown as DistrustRule[];
+  }
+
+  /**
+   * Put a writer on a namespace's distrust list (`"*"` = every namespace). The
+   * writer is a label (`alice`) or a writer_id (`<server_id>/alice`). Admin
+   * scope is checked by the caller; the change is logged. Returns the rule.
+   */
+  distrustAdd(namespace: string, writer: string): DistrustRule {
+    const ns = typeof namespace === "string" ? namespace.trim() : "";
+    if (!ns) throw new ValidationError('namespace is required (use "*" for every namespace)');
+    if (ns.length > 200) throw new ValidationError("namespace is too long");
+    const ref = parseWriterRef(writer);
+    if (!ref.label) throw new ValidationError("writer is required: a token label or a writer_id (<server_id>/<label>)");
+    const canonical = ref.serverId ? `${ref.serverId}/${ref.label}` : ref.label;
+    const addedBy = this.trustActor();
+    const at = new Date().toISOString();
+    this.transaction(() => {
+      const have = this.db.prepare("SELECT 1 FROM trust_distrust WHERE namespace = ? AND writer = ?").get(ns, canonical);
+      if (have) return;
+      const n = Number((this.db.prepare("SELECT COUNT(*) AS c FROM trust_distrust").get() as { c: number }).c);
+      if (n >= MAX_DISTRUST_RULES) throw new ValidationError(`the distrust list is full (${MAX_DISTRUST_RULES} entries); remove one first`);
+      this.db.prepare("INSERT INTO trust_distrust (namespace, writer, added_at, added_by) VALUES (?, ?, ?, ?)").run(ns, canonical, at, addedBy);
+      this.logTrust("distrust", ns, canonical);
+    });
+    return (this.db.prepare("SELECT namespace, writer, added_at, added_by FROM trust_distrust WHERE namespace = ? AND writer = ?").get(ns, canonical) as unknown) as DistrustRule;
+  }
+
+  /** Take a writer off the list. True if it was there. */
+  distrustRemove(namespace: string, writer: string): boolean {
+    const ns = typeof namespace === "string" ? namespace.trim() : "";
+    const ref = parseWriterRef(writer);
+    if (!ns || !ref.label) throw new ValidationError("namespace and writer are required");
+    const canonical = ref.serverId ? `${ref.serverId}/${ref.label}` : ref.label;
+    let removed = false;
+    this.transaction(() => {
+      removed = Number(this.db.prepare("DELETE FROM trust_distrust WHERE namespace = ? AND writer = ?").run(ns, canonical).changes) > 0;
+      if (removed) this.logTrust("undistrust", ns, canonical);
+    });
+    return removed;
+  }
+
+  /** Recent trust-configuration changes (who changed what), newest first. */
+  trustLog(limit = 20): Array<{ at: string; actor: string; action: string; namespace: string; subject: string }> {
+    return this.db
+      .prepare("SELECT at, actor, action, namespace, subject FROM trust_log ORDER BY seq DESC LIMIT ?")
+      .all(clampInt(limit, 20, 1, 200)) as unknown as Array<{ at: string; actor: string; action: string; namespace: string; subject: string }>;
+  }
+
+  /** Does the distrust list name a writer that touched this note (current writer, attested original, merged sources)? */
+  isDistrusted(n: WriterFacts): boolean {
+    return matchesDistrust(this.distrustRules(), n, this.serverId());
+  }
+
+  /** isDistrusted against rules the caller already loaded (hot loops). */
+  isDistrustedWith(rules: readonly DistrustRule[], serverId: string, n: WriterFacts): boolean {
+    return matchesDistrust(rules, n, serverId);
+  }
+
+  /** Flag (distrusted: true) the notes whose writer is on the list. Used where a read opted in with include_distrusted. */
+  markDistrusted<T extends NoteRecord>(notes: T[]): T[] {
+    const rules = this.distrustRules();
+    if (rules.length === 0) return notes;
+    const id = this.serverId();
+    return notes.map((n) => (matchesDistrust(rules, n, id) ? { ...n, distrusted: true as const } : n));
+  }
+
+  /** The query fragment hiding distrusted rows (empty when the list is empty). */
+  private distrustFragment(cols = NOTE_COLUMNS, namespaces?: readonly string[]): { sql: string; params: string[] } {
+    return distrustSql(this.distrustRules(), this.serverId(), cols, namespaces);
+  }
+
+  /** rangeClause + the distrust exclusion, unless the caller opted in. */
+  private rangeFor(opts: RangeOpts, namespaces?: readonly string[]): { sql: string; params: string[] } {
+    const r = rangeClause(opts, this.serverId());
+    if (opts.includeDistrusted) return r;
+    const d = this.distrustFragment(NOTE_COLUMNS, namespaces);
+    return d.sql ? { sql: r.sql + d.sql, params: [...r.params, ...d.params] } : r;
+  }
+
+  /** The attestation signing key of this database (created on first use; in memory only for `:memory:`). */
+  private signing(): SigningKey {
+    if (!this.signingKey) this.signingKey = this.dbPath === ":memory:" ? ephemeralKey() : loadOrCreateSigningKey(this.keyDir);
+    return this.signingKey;
+  }
+
+  /** server_id + public key + key id: what a peer needs to trust this server's attestations. Never the private key. */
+  identity(): { server_id: string; key_id: string; public_key: string; algorithm: "ed25519" } {
+    const k = this.signing();
+    return { server_id: this.serverId(), key_id: k.keyId, public_key: k.publicKey, algorithm: "ed25519" };
+  }
+
+  /** Header of an export: format, the exporting server and its public key. Throws if the key cannot be created. */
+  exportHeader(): { format: "onememory-export"; format_version: 2; exported_at: string; server_id: string; key_id: string; public_key: string; algorithm: "ed25519" } {
+    return { format: "onememory-export", format_version: 2, exported_at: new Date().toISOString(), ...this.identity() };
+  }
+
+  /** Public keys whose attestations an import will accept: the admin's list plus ONEMEMORY_TRUSTED_ATTESTERS. */
+  trustedAttesters(): Map<string, TrustedAttester> {
+    const out = new Map<string, TrustedAttester>();
+    for (const t of parseTrustedAttestersEnv(process.env.ONEMEMORY_TRUSTED_ATTESTERS)) out.set(keyIdOf(t.public_key), t);
+    const rows = this.db.prepare("SELECT key_id, public_key, server_id, label FROM trust_attesters").all() as unknown as Array<{
+      key_id: string;
+      public_key: string;
+      server_id: string;
+      label: string;
+    }>;
+    for (const r of rows) out.set(r.key_id, { public_key: r.public_key, server_id: r.server_id, label: r.label });
+    return out;
+  }
+
+  /** The admin-managed trusted attesters (plus the env ones, marked), for listing. */
+  attesterList(): Array<{ key_id: string; public_key: string; server_id: string; label: string; source: "admin" | "env"; added_at?: string; added_by?: string }> {
+    const rows = this.db
+      .prepare("SELECT key_id, public_key, server_id, label, added_at, added_by FROM trust_attesters ORDER BY added_at")
+      .all() as unknown as Array<{ key_id: string; public_key: string; server_id: string; label: string; added_at: string; added_by: string }>;
+    const out: Array<{ key_id: string; public_key: string; server_id: string; label: string; source: "admin" | "env"; added_at?: string; added_by?: string }> = rows.map((r) => ({ ...r, source: "admin" as const }));
+    const have = new Set(rows.map((r) => r.key_id));
+    for (const t of parseTrustedAttestersEnv(process.env.ONEMEMORY_TRUSTED_ATTESTERS)) {
+      const key_id = keyIdOf(t.public_key);
+      if (!have.has(key_id)) out.push({ key_id, public_key: t.public_key, server_id: t.server_id, label: t.label, source: "env" });
+    }
+    return out;
+  }
+
+  /** Trust a peer's attestation key. `serverId` pins the key to that server (recommended). */
+  attesterAdd(input: { public_key: string; server_id?: string; label?: string }): { key_id: string; public_key: string; server_id: string; label: string } {
+    const key = typeof input.public_key === "string" ? input.public_key.trim() : "";
+    if (!isPublicKey(key)) throw new ValidationError("public_key must be the 43-character base64url key printed by `onememory trust identity` on the other server");
+    const sid = (input.server_id ?? "").trim().toLowerCase();
+    if (sid && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(sid)) throw new ValidationError("server_id must be a UUID");
+    if (sid && sid === this.serverId()) throw new ValidationError("server_id is this server's own id: a peer cannot speak for this server");
+    const key_id = keyIdOf(key);
+    if (key_id === this.identity().key_id) throw new ValidationError("that is this server's own key: it is always trusted for this server's own exports");
+    const label = cleanWriter(input.label ?? "").slice(0, 100);
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO trust_attesters (key_id, public_key, server_id, label, added_at, added_by) VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(key_id) DO UPDATE SET server_id = excluded.server_id, label = excluded.label`
+        )
+        .run(key_id, key, sid, label, new Date().toISOString(), this.trustActor());
+      this.logTrust("attester-add", "*", `${key_id}${sid ? ` server=${sid}` : ""}${label ? ` label=${label}` : ""}`);
+    });
+    return { key_id, public_key: key, server_id: sid, label };
+  }
+
+  /** Stop trusting a key (by key id). True if it was in the admin list. */
+  attesterRemove(keyId: string): boolean {
+    const id = typeof keyId === "string" ? keyId.trim().toLowerCase() : "";
+    if (!/^[0-9a-f]{16}$/.test(id)) throw new ValidationError("key_id must be the 16-hex-digit key id");
+    let removed = false;
+    this.transaction(() => {
+      removed = Number(this.db.prepare("DELETE FROM trust_attesters WHERE key_id = ?").run(id).changes) > 0;
+      if (removed) this.logTrust("attester-remove", "*", id);
+    });
+    return removed;
   }
 
   /** Read a _meta value (null when unset or unreadable). */
@@ -4266,9 +4851,10 @@ export class Store {
   storeId(): string {
     const existing = this.getMeta("store_uuid");
     if (existing) return existing;
-    const id = randomUUID();
-    this.setMeta("store_uuid", id);
-    return id;
+    // INSERT OR IGNORE then read back: two processes minting at once end up
+    // with ONE id (the first writer's), and it never changes afterwards.
+    this.db.prepare("INSERT OR IGNORE INTO _meta (key, value) VALUES ('store_uuid', ?)").run(randomUUID());
+    return this.getMeta("store_uuid") ?? randomUUID();
   }
 
   /** Local note id for a note first exported by another store, or null. */
@@ -4393,14 +4979,29 @@ const CONSUMER_RE = /^[A-Za-z0-9._@-]{1,64}$/;
 export function feedScopeKey(
   namespaces: string[] | undefined,
   source: string | undefined,
-  writer?: { writtenBy?: string; notWrittenBy?: string }
+  writer?: {
+    writtenBy?: string;
+    notWrittenBy?: string;
+    noteWrittenBy?: string;
+    notNoteWrittenBy?: string;
+    includeDistrusted?: boolean;
+  }
 ): string {
-  // The writer filter extends the key only when set, so every pre-1.3.3
-  // marker / cursor / ack_token (no writer filter) keeps its exact scope key.
+  // Each filter extends the key only when set, so every marker / cursor /
+  // ack_token made without it keeps its exact scope key (pre-1.3.3 ones, and
+  // 1.3.3 ones that used only the event writer filters).
   const base: unknown[] = [namespaces ? [...namespaces].sort() : null, source ?? null];
   if (writer?.writtenBy !== undefined || writer?.notWrittenBy !== undefined) {
     base.push([writer.writtenBy === undefined ? null : cleanWriter(writer.writtenBy), writer.notWrittenBy === undefined ? null : cleanWriter(writer.notWrittenBy)]);
   }
+  if (writer?.noteWrittenBy !== undefined || writer?.notNoteWrittenBy !== undefined) {
+    base.push([
+      "note",
+      writer.noteWrittenBy === undefined ? null : cleanWriter(writer.noteWrittenBy),
+      writer.notNoteWrittenBy === undefined ? null : cleanWriter(writer.notNoteWrittenBy),
+    ]);
+  }
+  if (writer?.includeDistrusted) base.push(["distrusted"]);
   return createHash("sha256")
     .update(JSON.stringify(base))
     .digest("hex")

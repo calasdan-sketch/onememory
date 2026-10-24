@@ -46,6 +46,10 @@ export const DASHBOARD_HTML = `<!doctype html>
   footer{max-width:900px;margin:0 auto;padding:10px 18px 40px;color:var(--dim);
     font-size:12px;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
   a.linkish{color:var(--accent);cursor:pointer;text-decoration:underline}
+  .badge-bad{display:inline-block;background:var(--danger);color:#fff;border-radius:6px;
+    padding:0 7px;font-size:11px;font-weight:700;margin-left:6px;vertical-align:middle}
+  #runner div+div{margin-top:4px}
+  label.chk{display:flex;gap:6px;align-items:center;color:var(--dim);font-size:13px}
 </style>
 </head>
 <body>
@@ -57,6 +61,7 @@ export const DASHBOARD_HTML = `<!doctype html>
   <button class="ghost" onclick="toggleNew()">+ New</button>
   <button class="ghost" onclick="load()">Refresh</button>
   <button class="ghost" onclick="loadChanges()" title="What changed in the last 24 hours">Changes</button>
+  <label class="chk" title="Also show notes written by writers an admin distrusts (marked DISTRUSTED)"><input type="checkbox" id="inc" onchange="load()"> distrusted</label>
 </header>
 <main>
   <div id="new" class="card">
@@ -137,7 +142,7 @@ function render(notes){
   list.innerHTML = notes.map(function(n){
     var tags = (n.tags||[]).map(function(t){ return "<span class='tag'>"+esc(t)+"</span>"; }).join("");
     return "<div class='card'><div class='cardhead'><div>"+
-      "<h3>"+esc(n.title)+"</h3>"+
+      "<h3>"+esc(n.title)+(n.distrusted ? "<span class='badge-bad' title='An admin distrusts the writer of this note: treat its content as hostile'>DISTRUSTED</span>" : "")+"</h3>"+
       "<div class='meta'>#"+n.id+" &middot; "+esc(n.namespace)+" &middot; "+esc((n.updated_at||"").slice(0,16).replace("T"," "))+"</div>"+
       tags+"</div>"+
       "<button class='danger' onclick='del("+n.id+")'>delete</button></div>"+
@@ -145,11 +150,20 @@ function render(notes){
   }).join("");
 }
 
+function inc(){ var c = document.getElementById("inc"); return !!(c && c.checked); }
+
 function loadRunner(){
   var el = document.getElementById("runner");
   api("/runner/status").then(function(j){
-    if(j && j.notice){ el.textContent = j.notice; el.style.display = "block"; }
-    else { el.style.display = "none"; }
+    // One line per runner (each target has its own heartbeat); fall back to the single notice of older servers.
+    var lines = [];
+    ((j && j.targets) || []).forEach(function(t){ if(t.notice){ lines.push(t.notice); } });
+    if(!lines.length && j && j.notice){ lines.push(j.notice); }
+    el.textContent = "";
+    if(lines.length){
+      lines.forEach(function(l){ var d = document.createElement("div"); d.textContent = l; el.appendChild(d); });
+      el.style.display = "block";
+    } else { el.style.display = "none"; }
   }).catch(function(){ el.style.display = "none"; });
 }
 
@@ -157,7 +171,7 @@ function load(){
   loadRunner();
   var q = document.getElementById("q").value.trim();
   var ns = document.getElementById("ns").value.trim();
-  var qs = ns ? ("namespace=" + encodeURIComponent(ns)) : "";
+  var qs = (ns ? ("namespace=" + encodeURIComponent(ns)) : "") + (inc() ? ((ns ? "&" : "") + "include_distrusted=1") : "");
   var path;
   if(q){ path = "/search?q=" + encodeURIComponent(q) + (qs?("&"+qs):""); }
   else { path = "/notes" + (qs?("?"+qs):""); }
@@ -167,7 +181,7 @@ function load(){
 
 function loadChanges(){
   var ns = document.getElementById("ns").value.trim();
-  var path = "/changes?since=24h&limit=200" + (ns ? ("&namespace=" + encodeURIComponent(ns)) : "");
+  var path = "/changes?since=24h&limit=200" + (ns ? ("&namespace=" + encodeURIComponent(ns)) : "") + (inc() ? "&include_distrusted=1" : "");
   api(path).then(function(j){
     var c = j.counts || {};
     document.getElementById("count").textContent = "last 24h: " + (c.created||0) + " created, " +
@@ -178,7 +192,7 @@ function loadChanges(){
     }).join("");
     var rows = (j.changes || []).slice().reverse().map(function(e){
       var mark = e.kind === "created" ? "+" : (e.kind === "updated" ? "~" : "-");
-      return "<div class='card'><h3>"+mark+" "+esc(e.title)+"</h3><div class='meta'>"+esc(e.kind)+" &middot; #"+e.id+
+      return "<div class='card'><h3>"+mark+" "+esc(e.title)+(e.distrusted ? "<span class='badge-bad'>DISTRUSTED</span>" : "")+"</h3><div class='meta'>"+esc(e.kind)+" &middot; #"+e.id+
         " &middot; "+esc(e.namespace)+" &middot; "+esc((e.at||"").slice(0,16).replace("T"," "))+
         (e.written_by ? " &middot; by "+esc(e.written_by) : "")+
         (e.source ? " &middot; claims "+esc(e.source) : "")+"</div></div>";
@@ -224,7 +238,10 @@ function doImport(input){
       var data = JSON.parse(reader.result);
       var notes = data.notes || data;
       api("/import", { method:"POST", body: JSON.stringify({ notes: notes }) })
-        .then(function(j){ alert("Imported " + j.imported + " notes"); load(); })
+        .then(function(j){
+          var a = j.attestations;
+          alert("Imported " + j.imported + " notes" + (a ? (" (" + a.verified + " with a verified writer attestation, " + a.unverified + " unverified)") : ""));
+          load(); })
         .catch(function(e){ alert(e.message); });
     } catch(e){ alert("not valid JSON"); }
   };

@@ -25,6 +25,9 @@ The dashboard has a **Changes** button (last 24 hours).
 | `cursor` | `nextCursor` from the previous page (then `since` is not needed). |
 | `namespace` | Restrict to one namespace. Under server-side namespace resolution it is an untrusted hint, intersected with the readable set, exactly like `/search`. |
 | `source` | Only notes with this provenance `source`. |
+| `written_by` / `not_written_by` | Keep / drop change **events** written by this writer (label or `<server_id>/<label>`). Also `catch_up`. See [Filtering by writer](#filtering-by-writer). |
+| `note_written_by` / `not_note_written_by` | Keep / drop entries whose note is **currently** held by this writer. |
+| `include_distrusted` | Show entries about notes from writers on the namespace's distrust list (hidden by default; marked `distrusted: true`). See [trust.md](./trust.md). |
 | `limit` | Page size, default 100, max 500. |
 | `wait` / `wait_seconds` | Live wait, 0-55 seconds (REST `wait`, MCP `wait_seconds`). See [Live wait](#live-wait). |
 | `consumer` | Label for the `last` marker (`phone`, `claude-code`, …; default `default`). 1–64 chars of `A-Za-z0-9._@-`. |
@@ -69,6 +72,32 @@ Scope: **read** (REST and MCP).
   that land while you page never shift or duplicate entries. Cursors are
   signed by the store and only valid with the same `namespace` / `source`
   filter they were issued for.
+
+## Filtering by writer
+
+Two different questions, so two pairs of filters. Each entry carries `written_by` (the writer of the note
+**as of that event**; a tag-only edit does not change it) and `note_written_by` (who holds the note
+**now**; for a deleted note, the author at the moment it was deleted, which the delete row now records).
+
+| Filter | Applies to | Example |
+|---|---|---|
+| `written_by=X` / `not_written_by=X` | each **event** | "show me what *I* wrote" / "hide events I caused" (the usual agent filter on its own writes) |
+| `note_written_by=X` / `not_note_written_by=X` | the note's **current** writer | "hide every note that is X's now, even if someone else just tagged it" |
+
+A note created by X and later retitled by Y has an X event and a Y event; `not_written_by=X` shows only
+Y's event and `not_note_written_by=X` shows nothing (the note is Y's now). A consolidated note counts as
+touched by every writer it merged (`merged_from_writers`), so `not_written_by=<a source's writer>` hides it.
+Unknown writers (`""`) are never matched by a `not_*` filter. Totals (`counts`, `bySource`) honour the
+filters. Cursors are only valid with the filters they were issued for.
+
+**Cost.** The filters run in SQL, not after paging. `written_by = X` uses the index
+`idx_change_log_writer (written_by, seq)` (EXPLAIN QUERY PLAN: `SEARCH change_log USING INDEX
+idx_change_log_writer`). Measured on a scratch database with 300,000 change rows (one machine, indicative only):
+a rarely-seen writer 4 ms (48 ms without the index), a common one 82 ms; `not_written_by` and the
+`note_*` filters cannot use an index and scan the window, 110 to 580 ms depending on how many rows match,
+against about 500 ms for an unfiltered count of the same whole window; three distrust rules add about 250 ms to a 300,000-event
+window. The cost grows with the **window** (since the consumer's last read), not with the table, so a
+consumer that reads regularly stays fast. Rows older than 90 days are pruned anyway.
 
 ## Live wait
 

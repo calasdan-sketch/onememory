@@ -75,6 +75,9 @@ docker compose up -d     # dashboard at http://localhost:8790
 onememory backup --out ~/om-backup     # consistent hot copy; safe while the server runs
 ```
 
+(The attestation signing key `.attest-key` is not copied; see [docs/trust.md](./docs/trust.md#setting-it-up-between-two-servers).)
+
+
 `onememory backup` writes `state.db` (via SQLite `VACUUM INTO`) plus, if
 at-rest encryption is on, a copy of the `.key` file. **Keep the key apart from
 the backup**: a backup without its key is unreadable, and one stored next to it
@@ -227,6 +230,7 @@ encryption of note bodies. See [SECURITY.md](./SECURITY.md) for what it does
 | `memory_ack` | read | confirm a manual-ack change-feed page |
 | `memory_stats` | read | totals, most-read, never-read, stale |
 | `memory_quarantine` | admin | review linter-held writes |
+| `trust_policy` | admin | list / change the per-namespace distrust list and the trusted attester keys ([docs/trust.md](./docs/trust.md)) |
 | `memory_consolidation_candidates` / `memory_consolidate` / `memory_rebuild_edges` | admin | dedup and similarity-graph maintenance |
 
 REST mirrors them (`/notes`, `/search`, `/relevant`, `/changes`, `/tasks`, `/handoffs`, `/catch-up`, `/stats`,
@@ -237,7 +241,8 @@ REST mirrors them (`/notes`, `/search`, `/relevant`, `/changes`, `/tasks`, `/han
 ```
 onememory start | mcp | doctor | init
 onememory changes --since last --consumer laptop
-onememory runner-status                           # is the PC's runner listening? commands waiting?
+onememory runner-status                           # is each PC's runner listening? commands waiting?
+onememory trust [list | distrust <w> | undistrust <w> | identity | attester-add <key> | attester-remove <id>]
 onememory watch --consumer pc [--exec program args...]     # react to changes as they land
 onememory backup [--out dir] [--include-approval-key]       # hot copy of the database (+ key)
 onememory export --format md --dir ~/memory     onememory import --dir ~/memory
@@ -265,6 +270,14 @@ banner, the session-start recall names the writer, and `state_list`, `state_sear
 `memory_since` take `written_by` / `not_written_by` (REST: `?written_by=`) so an agent can
 ignore its own writes or distrust a client. Rows from before 1.3.3 read `""` (unknown).
 Details and limits: [docs/provenance.md](./docs/provenance.md).
+
+**Trust (1.4.0).** `writer_id` (`<server_id>/<label>`) says which server a label came from. An admin can put a
+writer on a per-namespace **distrust list** (`onememory trust distrust <writer> --namespace work`, the
+`trust_policy` MCP tool, `/trust` REST): its notes, tasks, handoffs and feed entries are then left out of every
+read path unless a reader passes `include_distrusted`, and a distrusted command task is never run. A JSON
+export carries a per-note Ed25519 **attestation**; an import that trusts the exporting server's key keeps the
+original author as `attested_writer`, otherwise it flattens provenance as before. What that proves and what it
+does not: [docs/trust.md](./docs/trust.md).
 
 ## Security in one paragraph
 
@@ -305,6 +318,7 @@ recall@1 on it. See [docs/encryption-retention.md](./docs/encryption-retention.m
 | [docs/sessionstart-hook.md](./docs/sessionstart-hook.md) | automatic recall at Claude Code session start |
 | [docs/encryption-retention.md](./docs/encryption-retention.md) | at-rest encryption, retention (TTL + archive), retrieval visibility |
 | [docs/provenance.md](./docs/provenance.md) | who wrote a note: server-stamped `written_by`, filters, what is and is not trusted |
+| [docs/trust.md](./docs/trust.md) | distrust list, writer ids, signed attestations: what each does and does not prove, upgrade and rollback |
 | [docs/token-namespaces.md](./docs/token-namespaces.md) | per-token namespace permissions — one shared bridge, isolated agents |
 | [docs/architecture.md](./docs/architecture.md) | modules, tools, REST API, schema |
 | [SKILL.md](./SKILL.md) | when and how an agent should use the memory |

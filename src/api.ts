@@ -19,6 +19,7 @@ import {
   RebuildBusyError,
   NoteUnreadableError,
   type ImportReport,
+  attestationsToShow,
   clampInt,
   resolveEdgeThreshold,
   REBUILD_CONFIRM_NOTE_COUNT,
@@ -101,6 +102,9 @@ import type { LintFinding } from "./lint.js";
 function requiredScope(method: string | undefined, path: string): Scope {
   if (method === "DELETE") return "admin";
   if (method === "POST" && path === "/import") return "admin";
+  // The trust policy (distrusted writers, trusted attesters) is admin-only,
+  // reads included: it names who an operator does not trust.
+  if (path === "/trust" || path.startsWith("/trust/")) return "admin";
   // A full-store dump is admin-only; a read token can still page /notes.
   if (method === "GET" && path === "/export") return "admin";
   // /relevant is a read despite the POST method (the message is a JSON body,
@@ -176,14 +180,30 @@ function ackModeParam(url: URL): "auto" | "manual" | undefined {
   return v;
 }
 
-/** `?written_by=` / `?not_written_by=`: filter on the server-stamped last writer. */
-type WriterFilter = { writtenBy?: string; notWrittenBy?: string };
+/**
+ * `?written_by=` / `?not_written_by=` (the server-stamped last writer; a bare
+ * label or a `<server_id>/<label>` writer id) and `?include_distrusted=1`
+ * (show notes whose writer an admin distrusted, clearly marked).
+ */
+type WriterFilter = { writtenBy?: string; notWrittenBy?: string; includeDistrusted?: boolean };
 function writerFilter(url: URL): WriterFilter {
   const is = url.searchParams.get("written_by");
   const not = url.searchParams.get("not_written_by");
   return {
     ...(is !== null && is !== "" ? { writtenBy: is } : {}),
     ...(not !== null && not !== "" ? { notWrittenBy: not } : {}),
+    ...(flagParam(url, "include_distrusted") ? { includeDistrusted: true } : {}),
+  };
+}
+
+/** The change feed adds filters on the note's CURRENT writer (`note_written_by`). */
+function feedWriterFilter(url: URL): WriterFilter & { noteWrittenBy?: string; notNoteWrittenBy?: string } {
+  const is = url.searchParams.get("note_written_by");
+  const not = url.searchParams.get("not_note_written_by");
+  return {
+    ...writerFilter(url),
+    ...(is !== null && is !== "" ? { noteWrittenBy: is } : {}),
+    ...(not !== null && not !== "" ? { notNoteWrittenBy: not } : {}),
   };
 }
 
@@ -461,9 +481,16 @@ export function createApiServer(
         // just a 404 check (denyUnreadable's canRead gate would 404 every
         // read when nsCtx.ownNamespace is "").
         const probe = store.read(id);
+        // A note whose writer an admin distrusts reads as "not found" unless
+        // the caller opts in with ?include_distrusted=1 (then it is marked).
+        const wantDistrusted = flagParam(url, "include_distrusted");
         if (nsCtx.active) {
           if (!denyUnreadable(nsCtx, res, probe)) return;
         } else if (!probe) {
+          sendJson(res, 404, { error: "not found" });
+          return;
+        }
+        if (probe && !wantDistrusted && store.isDistrusted(probe)) {
           sendJson(res, 404, { error: "not found" });
           return;
         }
@@ -473,7 +500,8 @@ export function createApiServer(
         // with similarity scores (and their staleness fields), mirroring
         // the MCP state_read neighbors:true option.
         const withNeighbors = url.searchParams.get("neighbors") === "true";
-        const note = store.read(id, { trackAccess: true, withNeighbors });
+        const read = store.read(id, { trackAccess: true, withNeighbors, includeDistrusted: wantDistrusted });
+        const note = read ? store.markDistrusted([read])[0] : null;
         if (!note) {
           // Unreachable single-threaded (the probe just saw it); the type
           // checker can't know that after the second read.
@@ -805,7 +833,7 @@ export function createApiServer(
       // search. Namespace gating matches GET /search exactly.
       if (req.method === "POST" && path === "/relevant") {
         const raw = await readBody(req);
-        let parsed: { message?: unknown; limit?: unknown; namespace?: unknown };
+        let parsed: { message?: unknown; limit?: unknown; namespace?: unknown; written_by?: unknown; not_written_by?: unknown; include_distrusted?: unknown };
         try {
           parsed = JSON.parse(raw || "{}");
         } catch {
@@ -827,6 +855,18 @@ export function createApiServer(
         // of notes, not a page.
         const relLimit = typeof parsed.limit === "number" ? parsed.limit : 5;
         const relNs = typeof parsed.namespace === "string" ? parsed.namespace : undefined;
+        // Writer / trust filters: in the JSON body, or (like /search) in the query string.
+        const bodyStr = (k: string): string | undefined => {
+          const v = (parsed as Record<string, unknown>)[k];
+          return typeof v === "string" && v !== "" ? v : undefined;
+        };
+        const urlWf = writerFilter(url);
+        const rwf: WriterFilter = {
+          ...urlWf,
+          ...(bodyStr("written_by") ? { writtenBy: bodyStr("written_by") } : {}),
+          ...(bodyStr("not_written_by") ? { notWrittenBy: bodyStr("not_written_by") } : {}),
+          ...(["1", "true", "yes"].includes(String((parsed as Record<string, unknown>).include_distrusted ?? "").toLowerCase()) ? { includeDistrusted: true } : {}),
+        };
         // Results carry the same staleness fields as /search (the
         // vague-message path is the most likely to act on outdated facts).
         const withStaleness = (r: { keywords: string[]; results: NoteRecord[] }) => ({
@@ -844,6 +884,7 @@ export function createApiServer(
             const out = await runRelevantSearch(store, parsed.message, {
               namespace: hint,
               limit: relLimit,
+              ...rwf,
             });
             sendJson(res, 200, {
               ...withStaleness(out),
@@ -857,6 +898,7 @@ export function createApiServer(
             const r = await runRelevantSearch(store, parsed.message, {
               namespace: ns,
               limit: relLimit,
+              ...rwf,
             });
             keywords = r.keywords; // identical per namespace (from the message)
             lists.push(r.results);
@@ -872,6 +914,7 @@ export function createApiServer(
         const out = await runRelevantSearch(store, parsed.message, {
           namespace: relNs,
           limit: relLimit,
+          ...rwf,
         });
         sendJson(res, 200, {
           ...withStaleness(out),
@@ -996,7 +1039,7 @@ export function createApiServer(
               cursor: url.searchParams.get("cursor") ?? undefined,
               namespaces,
               source: url.searchParams.get("source") ?? undefined,
-              ...writerFilter(url),
+              ...feedWriterFilter(url),
               limit: limitRaw !== null ? Number(limitRaw) : undefined,
               consumer: url.searchParams.get("consumer") ?? undefined,
               ackMode: ackModeParam(url),
@@ -1074,7 +1117,8 @@ export function createApiServer(
           if (req.method === "GET" && getId) {
             const namespaces = readNs();
             try {
-              sendJson(res, 200, { task: getTask(store, Number(getId[1]), namespaces) });
+              const wantDistrusted = flagParam(url, "include_distrusted");
+              sendJson(res, 200, { task: getTask(store, Number(getId[1]), namespaces, { includeDistrusted: wantDistrusted }) });
             } catch (e) {
               if (e instanceof TaskNotFoundError) sendJson(res, 404, { error: "not found" });
               else throw e;
@@ -1122,6 +1166,9 @@ export function createApiServer(
               source: typeof body.source === "string" ? body.source : undefined,
               ...(typeof body.written_by === "string" && body.written_by ? { writtenBy: body.written_by } : {}),
               ...(typeof body.not_written_by === "string" && body.not_written_by ? { notWrittenBy: body.not_written_by } : {}),
+              ...(typeof body.note_written_by === "string" && body.note_written_by ? { noteWrittenBy: body.note_written_by } : {}),
+              ...(typeof body.not_note_written_by === "string" && body.not_note_written_by ? { notNoteWrittenBy: body.not_note_written_by } : {}),
+              ...(body.include_distrusted === true ? { includeDistrusted: true } : {}),
             });
             audit({ op: "changes.ack", label: principal.label, kind: "changes", detail: `consumer=${r.consumer} seq=${r.seq}` });
             sendJson(res, 200, { acked: true, ...r });
@@ -1198,6 +1245,7 @@ export function createApiServer(
               namespaces,
               surface: url.searchParams.get("surface") ?? undefined,
               limit: intParam(url, "limit", 1),
+              ...writerFilter(url),
             });
             sendJson(res, 200, { handoffs, searchedNamespaces: namespaces ?? [] });
             return;
@@ -1218,6 +1266,7 @@ export function createApiServer(
               ackMode: ackModeParam(url),
               ackToken: url.searchParams.get("ack_token") ?? undefined,
               excludeSelf: flagParam(url, "exclude_self"),
+              ...feedWriterFilter(url),
             });
             if (out.changes) {
               audit({
@@ -1263,12 +1312,26 @@ export function createApiServer(
           // Node falls back to chunked transfer-encoding, which every HTTP/1.1
           // client handles.
         });
-        res.write('{"notes":[');
+        // Attestations (default on; ?attest=0 turns them off): a header naming this
+        // server and its public key, then one signed attestation per note. If the
+        // signing key cannot be created (read-only data dir) the export is still
+        // written, just without them -- a backup must not fail over a signature.
+        let attest = !["0", "false", "no"].includes((url.searchParams.get("attest") ?? "").toLowerCase());
+        let header = "";
+        if (attest) {
+          try {
+            header = `"export":${JSON.stringify(store.exportHeader())},`;
+          } catch (e) {
+            attest = false;
+            console.error("[onememory] export without attestations:", (e as Error).message);
+          }
+        }
+        res.write(`{${header}"notes":[`);
         let afterId = 0;
         let first = true;
         try {
           for (;;) {
-            const page = store.exportBatch(afterId, EXPORT_PAGE_SIZE, { namespaces: exportNs, skipUnreadable });
+            const page = store.exportBatch(afterId, EXPORT_PAGE_SIZE, { namespaces: exportNs, skipUnreadable, attest });
             if (page.length === 0) break;
             afterId = page[page.length - 1].id;
             for (const note of page) {
@@ -1355,9 +1418,98 @@ export function createApiServer(
                 }
               : {}),
             ...(report.skipped ? { skipped: report.skipped } : {}),
+            ...(attestationsToShow(report.attestations) ? { attestations: report.attestations } : {}),
             ...(report.quarantined.length ? { quarantined: report.quarantined } : {}),
             ...(report.rejected.length ? { rejected: report.rejected } : {}),
           });
+        } catch (e) {
+          sendError(res, e);
+        }
+        return;
+      }
+
+      // --- Trust policy (admin scope; see docs/trust.md) ---
+      // GET    /trust                      identity, distrusted writers, trusted attesters, recent log
+      // POST   /trust/distrust             { namespace, writer }   distrust a writer label or writer_id
+      // DELETE /trust/distrust             ?namespace=&writer=     (or the same JSON body)
+      // POST   /trust/attesters            { public_key, server_id?, label? }
+      // DELETE /trust/attesters/:key_id
+      // A token pinned to a namespace can only manage that namespace's rules (never "*"),
+      // and cannot change the server-wide attester list.
+      if (path === "/trust" || path.startsWith("/trust/")) {
+        try {
+          const pinned = nsCtx.active;
+          const body = async (): Promise<Record<string, unknown> | null> => {
+            const raw = await readBody(req);
+            try {
+              const v = JSON.parse(raw || "{}");
+              if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, unknown>;
+            } catch {
+              /* fall through */
+            }
+            sendJson(res, 400, { error: "invalid JSON body (expected an object)" });
+            return null;
+          };
+          const ruleScope = (ns: unknown): string | null => {
+            const v = typeof ns === "string" ? ns.trim() : "";
+            if (pinned) {
+              if (v && v !== nsCtx.ownNamespace) {
+                sendJson(res, 403, { error: "this token is pinned to its own namespace" });
+                return null;
+              }
+              return nsCtx.ownNamespace;
+            }
+            return v;
+          };
+          if (req.method === "GET" && path === "/trust") {
+            let identity: { server_id: string; key_id?: string; public_key?: string; algorithm?: string } = { server_id: store.serverId() };
+            try {
+              identity = store.identity();
+            } catch {
+              /* no signing key available: report the server id alone */
+            }
+            const rules = store.distrustRules().filter((r) => !pinned || r.namespace === nsCtx.ownNamespace || r.namespace === "*");
+            sendJson(res, 200, { ...identity, distrust: rules, attesters: store.attesterList(), log: store.trustLog(20) });
+            return;
+          }
+          if (path === "/trust/distrust" && (req.method === "POST" || req.method === "DELETE")) {
+            const b = req.method === "POST" ? await body() : ((await body()) ?? null);
+            if (!b) return;
+            const ns = ruleScope(url.searchParams.get("namespace") ?? b.namespace);
+            if (ns === null) return;
+            const writer = url.searchParams.get("writer") ?? b.writer;
+            if (req.method === "POST") {
+              sendJson(res, 200, { distrust: store.distrustAdd(ns, writer as string), rules: store.distrustRules() });
+            } else {
+              sendJson(res, 200, { removed: store.distrustRemove(ns, writer as string), rules: store.distrustRules() });
+            }
+            return;
+          }
+          if (path === "/trust/attesters" && req.method === "POST") {
+            if (pinned) {
+              sendJson(res, 403, { error: "the attester list is server-wide: use an admin token that is not pinned to a namespace" });
+              return;
+            }
+            const b = await body();
+            if (!b) return;
+            const added = store.attesterAdd({
+              public_key: b.public_key as string,
+              server_id: typeof b.server_id === "string" ? b.server_id : undefined,
+              label: typeof b.label === "string" ? b.label : undefined,
+            });
+            sendJson(res, 200, { attester: added, attesters: store.attesterList() });
+            return;
+          }
+          const attDel = /^\/trust\/attesters\/([0-9a-fA-F]{16})$/.exec(path);
+          if (attDel && req.method === "DELETE") {
+            if (pinned) {
+              sendJson(res, 403, { error: "the attester list is server-wide: use an admin token that is not pinned to a namespace" });
+              return;
+            }
+            sendJson(res, 200, { removed: store.attesterRemove(attDel[1]), attesters: store.attesterList() });
+            return;
+          }
+          sendJson(res, 404, { error: "no such route" });
         } catch (e) {
           sendError(res, e);
         }

@@ -16,6 +16,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Store, SCHEMA_VERSION } from "../src/store.js";
 import { ensureKey } from "../src/crypto.js";
+import { downgradeTo } from "./legacy-db.js";
 import { actorStore, currentWriter, setProcessWriter, cleanWriter } from "../src/actor.js";
 import { putTask, approveTask, markCommandRunning, finishCommandTask } from "../src/tasks.js";
 import { consolidateNotes } from "../src/consolidate.js";
@@ -39,31 +40,7 @@ describe("schema v13 migration", () => {
     s.create({ title: "old note one", body: "from before", source: "claude-code" });
     s.create({ title: "old note two", body: "also before" });
     s.close();
-    // Downgrade the file to what 1.3.x wrote: drop the v13 (and for v11, v12) columns.
-    const raw = new DatabaseSync(path);
-    // v12 had no writer column anywhere, so the log triggers did not mention it either.
-    raw.exec("DROP INDEX idx_notes_ns_writer; DROP TRIGGER notes_log_ai; DROP TRIGGER notes_log_au;");
-    for (const c of ["written_by", "created_by", "imported_written_by"]) raw.exec(`ALTER TABLE notes DROP COLUMN ${c}`);
-    raw.exec("ALTER TABLE change_log DROP COLUMN written_by");
-    raw.exec("ALTER TABLE quarantine DROP COLUMN written_by");
-    if (version === 11) raw.exec("ALTER TABLE change_log DROP COLUMN actor");
-    const now = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
-    raw.exec(`
-      CREATE TRIGGER notes_log_ai AFTER INSERT ON notes BEGIN
-        INSERT INTO change_log (note_id, kind, namespace, title, source, rev, changed_at)
-        VALUES (new.id, 'created', new.namespace, new.title, new.source, new.rev, ${now});
-      END;
-      CREATE TRIGGER notes_log_au AFTER UPDATE ON notes
-      WHEN (old.rev IS NOT new.rev OR old.title IS NOT new.title OR old.body IS NOT new.body
-            OR old.tags IS NOT new.tags OR old.namespace IS NOT new.namespace
-            OR old.source IS NOT new.source OR old.archived_at IS NOT new.archived_at)
-      BEGIN
-        INSERT INTO change_log (note_id, kind, namespace, title, source, rev, changed_at)
-        VALUES (new.id, 'updated', new.namespace, new.title, new.source, new.rev, ${now});
-      END;
-    `);
-    raw.exec(`PRAGMA user_version = ${version}`);
-    raw.close();
+    downgradeTo(path, version);
     return { dir, path };
   }
 
@@ -607,7 +584,7 @@ describe("written_by means: who last changed the content", () => {
     const del = s.changes({ since: HOUR_AGO() }).changes[0];
     assert.equal(del.kind, "deleted");
     assert.equal(del.written_by, "carol", "a delete is attributed to whoever deleted");
-    assert.equal(del.note_written_by, undefined);
+    assert.equal(del.note_written_by, "bob", "the delete row remembers the note's author (1.4.0)");
     s.close();
   });
 
@@ -640,7 +617,7 @@ describe("written_by means: who last changed the content", () => {
     const merged = as("admin", () => consolidateNotes(s, [a.id, b.id]));
     assert.equal(merged.written_by, "admin");
     assert.deepEqual(merged.merged_from_writers, ["evil-agent", "good-agent"]);
-    assert.equal(s.read(merged.id)!.merged_from_writers, undefined, "reported, not stored");
+    assert.deepEqual(s.read(merged.id)!.merged_from_writers, ["evil-agent", "good-agent"], "kept for good (1.4.0)");
     s.close();
   });
 });
@@ -699,16 +676,11 @@ describe("upgrade safety", () => {
     const s = new Store(path);
     s.create({ title: "keep me", body: "precious" });
     s.close();
-    const raw = new DatabaseSync(path);
-    raw.exec("DROP INDEX idx_notes_ns_writer; DROP TRIGGER notes_log_ai; DROP TRIGGER notes_log_au;");
-    for (const c of ["written_by", "created_by", "imported_written_by"]) raw.exec(`ALTER TABLE notes DROP COLUMN ${c}`);
-    raw.exec("ALTER TABLE change_log DROP COLUMN written_by; ALTER TABLE quarantine DROP COLUMN written_by;");
-    raw.exec("PRAGMA user_version = 12");
-    raw.close();
+    downgradeTo(path, 12);
     return path;
   }
 
-  test("the first v12 -> v13 upgrade leaves one backup copy, never overwrites it, and the copy is still v12", () => {
+  test("the first v12 -> v14 upgrade leaves one backup copy, never overwrites it, and the copy is still v12", () => {
     const dir = mkdtempSync(join(tmpdir(), "om-prov-bak-"));
     const realError = console.error;
     const logged: string[] = [];
@@ -716,7 +688,7 @@ describe("upgrade safety", () => {
     try {
       const path = makeV12(dir);
       new Store(path).close();
-      const bak = path + ".pre-v13-backup";
+      const bak = path + ".pre-v14-backup";
       assert.ok(existsSync(bak), "backup exists");
       assert.equal(Store.peekSchemaVersion(bak), 12);
       assert.equal(Store.peekSchemaVersion(path), SCHEMA_VERSION);
@@ -726,11 +698,7 @@ describe("upgrade safety", () => {
       copy.close();
       // a second upgrade must not replace the original copy
       writeFileSync(bak, "SENTINEL");
-      const raw = new DatabaseSync(path);
-      raw.exec("DROP INDEX idx_notes_ns_writer; DROP TRIGGER notes_log_ai; DROP TRIGGER notes_log_au;");
-      for (const c of ["written_by", "created_by", "imported_written_by"]) raw.exec(`ALTER TABLE notes DROP COLUMN ${c}`);
-      raw.exec("ALTER TABLE change_log DROP COLUMN written_by; ALTER TABLE quarantine DROP COLUMN written_by; PRAGMA user_version = 12;");
-      raw.close();
+      downgradeTo(path, 12);
       new Store(path).close();
       assert.equal(readFileSync(bak, "utf8"), "SENTINEL");
     } finally {
@@ -744,7 +712,7 @@ describe("upgrade safety", () => {
     try {
       const p = join(dir, "fresh.db");
       new Store(p).close();
-      assert.ok(!existsSync(p + ".pre-v13-backup"));
+      assert.ok(!existsSync(p + ".pre-v14-backup"));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -37,7 +37,7 @@ describe("MCP tool wrappers", () => {
     store.close();
   });
 
-  test("server advertises exactly the twenty-one tools", async () => {
+  test("server advertises exactly the twenty-two tools", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     assert.deepEqual(names, [
@@ -62,6 +62,7 @@ describe("MCP tool wrappers", () => {
       "task_get",
       "task_list",
       "task_put",
+      "trust_policy",
     ]);
   });
 

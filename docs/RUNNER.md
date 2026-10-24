@@ -206,8 +206,9 @@ note stays on `running` forever — so you can tell "it is still working" from
 
 ## Knowing it's actually listening
 
-The runner keeps one note in the `runner` namespace called **runner
-heartbeat**, updated every few minutes with the time, the host and the
+Each runner keeps its own note in the `runner` namespace called **runner
+heartbeat: <machine name>** (since 1.4.0; one per runner, so a dead PC is never hidden by another PC
+that is still beating), updated every few minutes with the time, the host and the
 process id. If the heartbeat is stale, the PC is not listening — that is
 different from a command being refused, and you can tell the two apart from
 across an ocean.
@@ -229,7 +230,9 @@ GET /runner/status[?namespace=ns]     # REST, read token
 onememory runner-status [--json]      # CLI on the machine holding the store
 ```
 
-It returns the runner's state (`online`, `stale` or `never_seen`) and, for each namespace you
+It returns the runner's state (`online`, `stale` or `never_seen`), a `targets` list with the same
+state and the waiting / expiring / expired counts **for each runner separately** (a command is judged
+against the runner it is addressed to, by its `target`), and, for each namespace you
 can read: `waiting` (approved, not started), `expiring_soon` (approval ends within an hour),
 `expired` (a genuine approval that lapsed before the runner took the task), and the age and id
 of the oldest waiting task. Only counts, ages and ids: never command text, parameters, targets or
@@ -257,7 +260,8 @@ signature inside the heartbeat. Instead the time is the server's own timestamp o
 `alive_at` in the body is ignored, so a wrong clock or a forged body cannot make the runner look alive),
 a time in the future is not believed, and only a note stamped `written_by: runner` by the server counts
 (a token holder's note carries their token label; a token named `runner` is stored as `token:runner`).
-A runner older than 1.3.4 stamps no marker and is accepted as before. This is a strong hint, not a proof:
+A runner older than 1.3.4 stamps no marker; since 1.4.0 that heartbeat is **not believed** (see
+"Upgrading the runner" below). This is a strong hint, not a proof:
 someone who can write the database file can still fake it; to prove a heartbeat, use the sign page's
 "Check a result" with the word `heartbeat`. It is shown to any caller who can read a namespace, because
 one runner serves the whole store; only its age and state are shown.
@@ -266,6 +270,26 @@ The runner counts as stale after `ONEMEMORY_RUNNER_STALE_SECONDS` without a hear
 and never less than three of its own beat intervals, so setting `ONEMEMORY_RUNNER_HEARTBEAT_MS` above
 200000 does not cause a permanent false "offline". Results are cached for 5 seconds while nothing in the
 store changes.
+
+### Per-runner status (1.4.0)
+
+With more than one PC, `runner_status`, `GET /runner/status` and `onememory runner-status` report each
+runner on its own line. The top-level `runner`, `waiting_total`, `expiring_soon_total` and
+`expired_total` fields keep their old meaning for older clients: `runner` describes the most worrying
+runner that has commands waiting (a stale or never-seen one beats an online one), else the freshest.
+A command addressed to a PC that has never beaten is reported under that PC as `never_seen`, not
+silently counted against another machine. The offline notice names each affected PC when there is more
+than one.
+
+### Upgrading the runner (needed once, for runners older than 1.3.4)
+
+A runner older than 1.3.4 writes its heartbeat with no writer marker, and one shared note. 1.4.0 does
+not believe a heartbeat that cannot show it came from the runner process, so such a PC would read as
+offline. The fix is only to update the runner on that PC (`npm install` the new version and restart it;
+no setting changes, and its approved tasks are untouched). As a stopgap while you roll that out, set
+`ONEMEMORY_RUNNER_ACCEPT_LEGACY=1` on the **server**: marker-less heartbeats then count again, with
+the old caveat that anyone able to write a note with an empty writer could forge one (library callers
+and rows from before schema v13 have no writer). Remove it once every runner is current.
 
 ## Which commands have been handled
 

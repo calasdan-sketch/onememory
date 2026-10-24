@@ -42,6 +42,7 @@ import { PROJECT_ROOT } from "./config.js";
 import { audit } from "./security.js";
 import { Store, ValidationError, type NoteRecord } from "./store.js";
 import { pollTasks } from "./runner-tasks.js";
+import { heartbeatTitle } from "./liveness.js";
 
 // ---- Tunables (all overridable by env; defaults are the safe end) ----------
 export const RUNNER = {
@@ -856,6 +857,8 @@ export function pruneOld(store: Store, days: number = RUNNER.retentionDays, now 
         namespace: ns,
         limit: pageSize,
         offset: page * pageSize,
+        // Cleanup, not execution: a distrusted writer's old notes are pruned like any other.
+        includeDistrusted: true,
       });
       if (notes.length === 0) break;
       for (const n of notes) {
@@ -1085,13 +1088,16 @@ export async function pollOnce(deps: RunnerDeps): Promise<number> {
 }
 
 /**
- * Heartbeat: a single note, updated in place, saying the loop is alive. This
- * is what lets the operator tell "PC ignored me" from "PC isn't listening".
+ * Heartbeat: one note PER RUNNER ("runner heartbeat: <runner id>"), updated in
+ * place, saying this loop is alive. This is what lets the operator tell "PC
+ * ignored me" from "PC isn't listening" -- and, with several PCs, which one.
+ * (Before 1.4.0 every runner shared one note titled "runner heartbeat", so one
+ * live PC hid another dead one; that title is no longer written.)
  */
 let heartbeatId: number | null = null;
 
 export function beat(store: Store, secret: string, startedAt: string): void {
-  const title = "runner heartbeat";
+  const title = heartbeatTitle(runnerId());
   // Signed, so a token holder cannot keep a dead PC looking alive. They can
   // still replay an OLD signed beat, which only ever makes it look staler.
   const body = signedBody(secret, "heartbeat", {
@@ -1113,7 +1119,7 @@ export function beat(store: Store, secret: string, startedAt: string): void {
     // which one to trust.
     if (heartbeatId !== null && store.update(heartbeatId, { body }) !== null) return;
     const existing = store
-      .list({ namespace: "runner", limit: 200 })
+      .list({ namespace: "runner", limit: 200, withTags: ["heartbeat"], includeDistrusted: true })
       .notes.find((n) => n.title === title);
     if (existing) {
       heartbeatId = existing.id;

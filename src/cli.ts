@@ -25,7 +25,9 @@ function usage(): void {
       "            When: first-time setup of a new agent client.",
       "  reindex   Backfill semantic embeddings for notes missing them.",
       "            When: after enabling embeddings, or after changing the embedding model.",
-      "  recall    SessionStart hook: print recent memory as hook JSON (fail-silent).",
+      "  recall [--limit 10] [--written-by w] [--not-written-by w] [--include-distrusted]",
+      "            SessionStart hook: print recent memory as hook JSON (fail-silent).",
+      "            Notes from writers on the distrust list are left out unless --include-distrusted.",
       "            When: wired into Claude Code settings.json. See:",
       "            https://github.com/calasdan-sketch/onememory/blob/main/docs/sessionstart-hook.md",
       "  consolidate [--dry-run] [--yes] [--threshold 0.95] [--namespace ns]",
@@ -42,11 +44,12 @@ function usage(): void {
       "            progress to stderr. Reports {created, removed} edge",
       "            counts. O(n^2) — maintenance, not interactive.",
       "            When: after a bulk import, or after changing the threshold.",
-      "  relevant \"some natural language message\" [--limit 5] [--namespace ns]",
+      "  relevant \"some natural language message\" [--limit 5] [--namespace ns] [--written-by w] [--not-written-by w] [--include-distrusted]",
       "            Extract keywords from a message and show the relevant notes.",
       "            Prints the keywords used alongside the results.",
       "            When: you have a vague message and want the memory it touches.",
       "  changes [--since 24h|ISO|last] [--consumer name] [--namespace ns] [--source s] [--limit 100]",
+      "          [--written-by w] [--not-written-by w] [--note-written-by w] [--not-note-written-by w] [--include-distrusted]",
       "  changes --purge             delete the whole change log (titles of past changes) and all markers",
       "            What changed while you were away: created/updated/deleted notes",
       "            grouped by source. --since last uses (and advances) a per-consumer marker.",
@@ -62,7 +65,7 @@ function usage(): void {
       "            waiting for it (and how many approvals expire soon or already did)?",
       "            Reads the local store; never prints command text.",
       "            When: an approved phone command has not run yet.",
-      "  watch [--consumer name] [--wait 25] [--namespace ns] [--exec <program> [args...]]",
+      "  watch [--consumer name] [--wait 25] [--namespace ns] [--written-by w] [--not-written-by w] [--include-distrusted] [--exec <program> [args...]]",
       "            Long-poll loop on this store: prints each new change as it happens.",
       "            With --exec, runs <program> (no shell) per batch with the changes as",
       "            JSON on stdin and ONEMEMORY_CHANGE_COUNT in the environment.",
@@ -71,8 +74,16 @@ function usage(): void {
       "            Write one Markdown file per note (YAML front-matter) into",
       "            namespace folders. Deterministic and git-friendly; prunes",
       "            files of deleted notes it wrote earlier (--no-prune keeps them).",
-      "  export --format json [--out file]",
-      "            Full JSON backup (same shape as GET /export) to stdout or a file.",
+      "  export --format json [--out file] [--no-attest]",
+      "            Full JSON backup (same shape as GET /export) to stdout or a file, with this",
+      "            server's signed per-note attestations (--no-attest leaves them out).",
+      "  import --file backup.json [--dedupe]",
+      "            Restore a JSON backup. Notes whose attestation verifies against a trusted key",
+      "            keep their original writer; everything else is stamped as imported by 'cli'.",
+      "  trust [list | identity | distrust <writer> [--namespace ns|*] | undistrust <writer> [--namespace ns|*]",
+      "         | attester-add <public-key> [--server-id id] [--label text] | attester-remove <key-id>] [--json]",
+      "            The trust policy: writers whose notes are left out of every read (and never run),",
+      "            and the other servers whose signed exports an import will believe. See docs/trust.md.",
       "  import --dir <path> [--dry-run] [--allow-move]",
       "            Merge Markdown files back: newer side wins, conflicts are",
       "            reported and the losing version is saved under <dir>/.conflicts/.",
@@ -361,7 +372,10 @@ async function recall(): Promise<void> {
     if (
       a.startsWith("-") &&
       !a.startsWith("--budget-ms") &&
-      !a.startsWith("--limit")
+      !a.startsWith("--limit") &&
+      !a.startsWith("--written-by") &&
+      !a.startsWith("--not-written-by") &&
+      a !== "--include-distrusted"
     ) {
       console.error(`onememory recall: unknown option "${a}" ignored`);
     }
@@ -383,6 +397,9 @@ async function recall(): Promise<void> {
     await recallMod.runRecall({
       budgetMs: numFlag("--budget-ms", 800),
       limit: numFlag("--limit", 10),
+      writtenBy: flag("--written-by"),
+      notWrittenBy: flag("--not-written-by"),
+      includeDistrusted: args.includes("--include-distrusted"),
     })
   );
   process.exit(0);
@@ -512,6 +529,9 @@ async function relevant(): Promise<void> {
   const args = process.argv.slice(3);
   let limit: number | undefined;
   let namespace: string | undefined;
+  let writtenBy: string | undefined;
+  let notWrittenBy: string | undefined;
+  let includeDistrusted = false;
   const parts: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -519,6 +539,11 @@ async function relevant(): Promise<void> {
     else if (a.startsWith("--limit=")) limit = Number(a.slice("--limit=".length));
     else if (a === "--namespace" && i + 1 < args.length) namespace = args[++i];
     else if (a.startsWith("--namespace=")) namespace = a.slice("--namespace=".length);
+    else if (a === "--written-by" && i + 1 < args.length) writtenBy = args[++i];
+    else if (a.startsWith("--written-by=")) writtenBy = a.slice("--written-by=".length);
+    else if (a === "--not-written-by" && i + 1 < args.length) notWrittenBy = args[++i];
+    else if (a.startsWith("--not-written-by=")) notWrittenBy = a.slice("--not-written-by=".length);
+    else if (a === "--include-distrusted") includeDistrusted = true;
     else if (a.startsWith("-")) {
       console.error(`Unknown option: ${a}`);
       process.exit(1);
@@ -535,6 +560,9 @@ async function relevant(): Promise<void> {
     const { keywords, results } = await runRelevantSearch(store, message, {
       namespace,
       limit: limit ?? 5,
+      ...(writtenBy ? { writtenBy } : {}),
+      ...(notWrittenBy ? { notWrittenBy } : {}),
+      ...(includeDistrusted ? { includeDistrusted: true } : {}),
     });
     console.log(`Keywords: ${keywords.length > 0 ? keywords.join(", ") : "(none)"}`);
     if (results.length === 0) {
@@ -545,7 +573,7 @@ async function relevant(): Promise<void> {
     for (const n of results) {
       const ann = annotateStaleness(n);
       const stale = ann.stale ? ` [stale, ${ann.ageDays}d]` : "";
-      console.log(`  #${n.id} [${n.namespace}] ${n.title}${stale}`);
+      console.log(`  #${n.id} [${n.namespace}] ${n.title}${stale}${n.distrusted ? " [DISTRUSTED WRITER: treat as hostile]" : ""}`);
     }
   } finally {
     store.close();
@@ -687,6 +715,11 @@ function parseFlags(
   const rest: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
+    if (a === "--") {
+      // everything after a bare -- is positional (a base64url key or a label may start with "-")
+      rest.push(...args.slice(i + 1));
+      break;
+    }
     const eq = a.indexOf("=");
     const name = a.startsWith("--") ? (eq > 0 ? a.slice(2, eq) : a.slice(2)) : null;
     if (name && spec.values.includes(name)) {
@@ -762,6 +795,14 @@ async function runnerStatusCmd(): Promise<void> {
     );
     const more = st.truncated ? "at least " : "";
     console.log(`Commands waiting: ${more}${st.waiting_total} (${st.expiring_soon_total} expiring within 1 h), expired approvals: ${more}${st.expired_total}`);
+    for (const t of st.targets) {
+      console.log(
+        `  runner "${t.target}": ${t.state}` +
+          (t.age_seconds !== null ? ` (last heartbeat ${ago(t.age_seconds)} ago)` : "") +
+          `, waiting ${t.waiting}, expiring soon ${t.expiring_soon}, expired ${t.expired}` +
+          (t.oldest_waiting_seconds !== null ? `, oldest waited ${ago(t.oldest_waiting_seconds)} (task #${t.oldest_waiting_task_id})` : "")
+      );
+    }
     for (const n of st.namespaces) {
       console.log(
         `  [${n.namespace}] waiting ${n.waiting}, expiring soon ${n.expiring_soon}, expired ${n.expired}` +
@@ -787,7 +828,7 @@ async function watchCmd(): Promise<void> {
     console.error("--exec needs a program, e.g. --exec notify-send OneMemory");
     process.exit(1);
   }
-  const { flags } = parseFlags(at >= 0 ? argv.slice(0, at) : argv, { values: ["consumer", "wait", "namespace"], bools: [] });
+  const { flags } = parseFlags(at >= 0 ? argv.slice(0, at) : argv, { values: ["consumer", "wait", "namespace", "written-by", "not-written-by"], bools: ["include-distrusted"] });
   const wait = str(flags.wait) !== undefined ? Number(flags.wait) : 25;
   if (!Number.isInteger(wait) || wait < 1 || wait > 55) {
     console.error("--wait must be a whole number of seconds from 1 to 55 (25 recommended)");
@@ -808,6 +849,11 @@ async function watchCmd(): Promise<void> {
       consumer: str(flags.consumer) ?? "watch",
       waitSeconds: wait,
       namespaces: str(flags.namespace) ? [str(flags.namespace)!] : undefined,
+      filter: {
+        ...(str(flags["written-by"]) ? { writtenBy: str(flags["written-by"])! } : {}),
+        ...(str(flags["not-written-by"]) ? { notWrittenBy: str(flags["not-written-by"])! } : {}),
+        ...(flags["include-distrusted"] ? { includeDistrusted: true } : {}),
+      },
       exec,
       signal: abort.signal,
     });
@@ -823,8 +869,8 @@ async function changes(): Promise<void> {
   const { Store, ValidationError } = await import("./store.js");
   const { runChanges } = await import("./changes.js");
   const { flags } = parseFlags(process.argv.slice(3), {
-    values: ["since", "consumer", "namespace", "source", "limit"],
-    bools: ["json", "purge"],
+    values: ["since", "consumer", "namespace", "source", "limit", "written-by", "not-written-by", "note-written-by", "not-note-written-by"],
+    bools: ["json", "purge", "include-distrusted"],
   });
   const store = new Store(DB_PATH);
   try {
@@ -837,6 +883,11 @@ async function changes(): Promise<void> {
       namespaces: str(flags.namespace) ? [str(flags.namespace)!] : undefined,
       source: str(flags.source),
       limit: str(flags.limit) ? Number(flags.limit) : undefined,
+      ...(str(flags["written-by"]) ? { writtenBy: str(flags["written-by"])! } : {}),
+      ...(str(flags["not-written-by"]) ? { notWrittenBy: str(flags["not-written-by"])! } : {}),
+      ...(str(flags["note-written-by"]) ? { noteWrittenBy: str(flags["note-written-by"])! } : {}),
+      ...(str(flags["not-note-written-by"]) ? { notNoteWrittenBy: str(flags["not-note-written-by"])! } : {}),
+      ...(flags["include-distrusted"] ? { includeDistrusted: true } : {}),
     };
     let page = runChanges(store, {
       ...base,
@@ -863,7 +914,7 @@ async function changes(): Promise<void> {
     for (;;) {
       for (const e of page.changes) {
         const mark = e.kind === "created" ? "+" : e.kind === "updated" ? "~" : "-";
-        console.log(`${mark} #${e.id} [${e.namespace}] ${e.title}  (${e.at}${e.source ? `, ${e.source}` : ""})`);
+        console.log(`${mark} #${e.id} [${e.namespace}] ${e.title}  (${e.at}${e.source ? `, ${e.source}` : ""})${e.distrusted ? " [DISTRUSTED WRITER]" : ""}`);
       }
       if (!page.nextCursor) break;
       page = runChanges(store, { ...base, cursor: page.nextCursor });
@@ -885,7 +936,7 @@ async function exportCmd(): Promise<void> {
   const { Store } = await import("./store.js");
   const { flags } = parseFlags(process.argv.slice(3), {
     values: ["format", "dir", "namespace", "out"],
-    bools: ["no-prune", "force"],
+    bools: ["no-prune", "force", "no-attest"],
   });
   const format = str(flags.format) ?? (str(flags.dir) ? "md" : undefined);
   const { EXPORT_PAGE_SIZE } = await import("./store.js");
@@ -914,12 +965,25 @@ async function exportCmd(): Promise<void> {
       const write = (s: string): Promise<void> =>
         out.write(s) ? Promise.resolve() : new Promise((r) => out.once("drain", r));
 
-      await write('{\n  "notes": [\n');
+      // Header + attestations (see attest.ts). If the signing key cannot be
+      // created the backup is still written, without them: a backup must not
+      // fail over a signature.
+      let attest = flags["no-attest"] !== true;
+      let header = "";
+      if (attest) {
+        try {
+          header = `  "export": ${JSON.stringify(store.exportHeader())},\n`;
+        } catch (e) {
+          attest = false;
+          console.error(`Exporting without attestations: ${(e as Error).message}`);
+        }
+      }
+      await write(`{\n${header}  "notes": [\n`);
       let afterId = 0;
       let first = true;
       let count = 0;
       for (;;) {
-        const page = store.exportBatch(afterId, EXPORT_PAGE_SIZE);
+        const page = store.exportBatch(afterId, EXPORT_PAGE_SIZE, { attest });
         if (page.length === 0) break;
         afterId = page[page.length - 1].id;
         for (const note of page) {
@@ -973,11 +1037,16 @@ async function importCmd(): Promise<void> {
   const { Store, ValidationError } = await import("./store.js");
   const { importMarkdown } = await import("./sync.js");
   const { flags } = parseFlags(process.argv.slice(3), {
-    values: ["dir"],
-    bools: ["dry-run", "json", "allow-move"],
+    values: ["dir", "file"],
+    bools: ["dry-run", "json", "allow-move", "dedupe"],
   });
+  if (str(flags.file)) {
+    await importJsonFile(str(flags.file)!, flags["dedupe"] === true, flags.json === true);
+    return;
+  }
   if (!str(flags.dir)) {
     console.error("Usage: onememory import --dir <path> [--dry-run] [--allow-move]");
+    console.error("       onememory import --file backup.json [--dedupe] [--json]");
     process.exit(1);
   }
   const store = new Store(DB_PATH);
@@ -1003,6 +1072,155 @@ async function importCmd(): Promise<void> {
         `\n!!! ${c.rejected} FILE(S) WERE REJECTED AND NOT IMPORTED (see the "rejected" lines above). ` +
           `Nothing was dropped silently; fix those files and import again. Exit status 1.`
       );
+    }
+  } catch (e) {
+    if (e instanceof ValidationError) {
+      console.error(`Error: ${e.message}`);
+      process.exit(1);
+    }
+    throw e;
+  } finally {
+    store.close();
+  }
+}
+
+// `onememory import --file backup.json`: restore a JSON backup (the shape of
+// `export --format json` / GET /export). Attestations in it are checked
+// against the trusted attesters; see docs/trust.md.
+async function importJsonFile(file: string, dedupe: boolean, json: boolean): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store, ValidationError, attestationsToShow } = await import("./store.js");
+  const { readFileSync } = await import("node:fs");
+  let parsed: { notes?: unknown };
+  try {
+    parsed = JSON.parse(readFileSync(file, "utf8"));
+  } catch (e) {
+    console.error(`Cannot read ${file}: ${(e as Error).message}`);
+    process.exit(1);
+  }
+  if (!parsed || !Array.isArray(parsed.notes)) {
+    console.error("Expected a JSON file shaped like { \"notes\": [...] }");
+    process.exit(1);
+  }
+  const store = new Store(DB_PATH);
+  try {
+    const report: import("./store.js").ImportReport = { quarantined: [], rejected: [] };
+    const created = await store.importNotes(parsed.notes as import("./store.js").ImportNote[], { report, dedupe });
+    if (json) {
+      console.log(JSON.stringify({ imported: created.length, ...report, attestations: attestationsToShow(report.attestations) }, null, 2));
+      return;
+    }
+    console.log(`Imported ${created.length} note(s)${report.skipped ? `, skipped ${report.skipped} already present` : ""}.`);
+    const a = attestationsToShow(report.attestations);
+    if (a) {
+      console.log(`Attestations: ${a.verified} verified, ${a.unverified} unverified (stamped as imported by this command).`);
+      for (const [why, n] of Object.entries(a.reasons)) console.log(`  ${n} x ${why}`);
+      for (const k of a.untrusted_keys) {
+        console.log(`  key ${k.key_id} (server ${k.server_id}) signed ${k.notes} note(s) but is not trusted. If you know it: onememory trust attester-add --public-key <public-key> --server-id ${k.server_id}`);
+      }
+    }
+    if (report.quarantined.length) console.log(`${report.quarantined.length} note(s) held by the linter (onememory quarantine).`);
+    if (report.rejected.length) {
+      console.error(`${report.rejected.length} note(s) rejected:`);
+      for (const r of report.rejected) console.error(`  ${r.title}: ${r.error}`);
+      process.exitCode = 1;
+    }
+  } catch (e) {
+    if (e instanceof ValidationError) {
+      console.error(`Error: ${e.message}`);
+      process.exit(1);
+    }
+    throw e;
+  } finally {
+    store.close();
+  }
+}
+
+// `onememory trust ...`: the trust policy (docs/trust.md). Local, like every CLI command.
+async function trustCmd(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store, ValidationError } = await import("./store.js");
+  const { flags, rest } = parseFlags(process.argv.slice(3), {
+    values: ["namespace", "server-id", "label", "public-key", "writer", "key-id"],
+    bools: ["json"],
+  });
+  const action = rest[0] ?? "list";
+  const store = new Store(DB_PATH);
+  const show = (v: unknown, text: string): void => console.log(flags.json ? JSON.stringify(v, null, 2) : text);
+  try {
+    switch (action) {
+      case "list": {
+        let identity: { server_id: string; key_id?: string; public_key?: string } = { server_id: store.serverId() };
+        try {
+          identity = store.identity();
+        } catch (e) {
+          console.error(`(no signing key: ${(e as Error).message})`);
+        }
+        const out = { ...identity, distrust: store.distrustRules(), attesters: store.attesterList(), log: store.trustLog(20) };
+        if (flags.json) {
+          console.log(JSON.stringify(out, null, 2));
+          return;
+        }
+        console.log(`This server: ${identity.server_id}`);
+        console.log(`Distrusted writers (${out.distrust.length}):`);
+        for (const r of out.distrust) console.log(`  [${r.namespace}] ${r.writer}  (added ${r.added_at} by ${r.added_by})`);
+        console.log(`Trusted attesters (${out.attesters.length}):`);
+        for (const a of out.attesters) console.log(`  ${a.key_id} server=${a.server_id || "(any)"} ${a.label ? `"${a.label}" ` : ""}[${a.source}]`);
+        if (out.log.length) {
+          console.log("Recent changes:");
+          for (const l of out.log) console.log(`  ${l.at} ${l.actor} ${l.action} [${l.namespace}] ${l.subject}`);
+        }
+        return;
+      }
+      case "identity": {
+        const i = store.identity();
+        show(i, `server_id:  ${i.server_id}\nkey_id:     ${i.key_id}\npublic_key: ${i.public_key}\n\nGive the public_key (and server_id) to the admin of the server that should believe this server's exports:\n  onememory trust attester-add --public-key ${i.public_key} --server-id ${i.server_id} --label "<name>"`);
+        return;
+      }
+      case "distrust":
+      case "undistrust": {
+        const writer = str(flags.writer) ?? rest[1];
+        if (!writer) {
+          console.error(`Usage: onememory trust ${action} <writer> --namespace <ns|*>   (writer: a token label or <server_id>/<label>; --writer <w> or -- <w> if it starts with "-")`);
+          process.exit(1);
+        }
+        const ns = str(flags.namespace);
+        if (!ns) {
+          console.error('--namespace is required (use --namespace "*" for every namespace)');
+          process.exit(1);
+        }
+        if (action === "distrust") {
+          const r = store.distrustAdd(ns!, writer);
+          show(r, `Distrusting "${r.writer}" in [${r.namespace}]: its notes are now left out of every read and never run.`);
+        } else {
+          const removed = store.distrustRemove(ns!, writer);
+          show({ removed }, removed ? `No longer distrusting "${writer}" in [${ns}].` : `"${writer}" was not on the list for [${ns}].`);
+        }
+        return;
+      }
+      case "attester-add": {
+        const key = str(flags["public-key"]) ?? rest[1];
+        if (!key) {
+          console.error("Usage: onememory trust attester-add <public-key> [--server-id <id>] [--label <text>]   (a key starting with \"-\": --public-key <key>)");
+          process.exit(1);
+        }
+        const r = store.attesterAdd({ public_key: key, server_id: str(flags["server-id"]), label: str(flags.label) });
+        show(r, `Trusting key ${r.key_id}${r.server_id ? ` for server ${r.server_id}` : " (any server id)"}.`);
+        return;
+      }
+      case "attester-remove": {
+        const id = str(flags["key-id"]) ?? rest[1];
+        if (!id) {
+          console.error("Usage: onememory trust attester-remove <key-id>");
+          process.exit(1);
+        }
+        const removed = store.attesterRemove(id);
+        show({ removed }, removed ? `Removed key ${id}.` : `Key ${id} was not on the list (a key set in ONEMEMORY_TRUSTED_ATTESTERS is removed there).`);
+        return;
+      }
+      default:
+        console.error(`Unknown trust action: ${action}`);
+        process.exit(1);
     }
   } catch (e) {
     if (e instanceof ValidationError) {
@@ -1243,6 +1461,9 @@ async function main(): Promise<void> {
       break;
     case "import":
       await importCmd();
+      break;
+    case "trust":
+      await trustCmd();
       break;
     case "quarantine":
       await quarantineCmd();

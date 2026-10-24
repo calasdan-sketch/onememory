@@ -36,6 +36,7 @@ namespace: "work"
 title: "Release cadence"
 tags: ["decision"]
 source: "claude-code"
+origin_writer: "claude-code-token"
 created_at: "2026-10-14T09:00:00.000Z"
 updated_at: "2026-10-15T10:30:00.000Z"
 rev: 3
@@ -43,6 +44,10 @@ hash: "9b1f0c2a7d3e4f51"
 ---
 Ship weekly on Thursdays.
 ```
+
+`origin_writer` (1.4.0) is who wrote the note on the exporting store (its writer id when known). It is
+shown for information only: a file is stamped with whoever imports it, and the value arrives as the
+unverified `imported_written_by`; it never counts for distrust rules or `written_by` filters. Files are not signed.
 
 Values are JSON-encoded, which is valid YAML. The body is stored verbatim
 (one trailing newline is added on export and removed on import; files are

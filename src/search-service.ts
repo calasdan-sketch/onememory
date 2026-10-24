@@ -353,6 +353,8 @@ export interface SearchOpts {
   writtenBy?: string;
   /** Only notes whose server-stamped last writer is NOT this. */
   notWrittenBy?: string;
+  /** Also return notes whose writer is on the namespace's distrust list. Default: they are left out. */
+  includeDistrusted?: boolean;
 }
 
 /**
@@ -372,7 +374,7 @@ export interface SearchOpts {
  *   net; a note outside the window can never enter the fusion because it
  *   never leaves SQL.
  */
-export async function runSearch(
+async function runSearchInner(
   store: Store,
   query: string,
   opts: SearchOpts = {}
@@ -392,6 +394,7 @@ export async function runSearch(
       ? { startISO: range.start.toISOString(), endISO: range.end.toISOString() }
       : {}),
     ...writerOpts,
+    ...(opts.includeDistrusted ? { includeDistrusted: true } : {}),
   };
   const staleCfg = stalenessConfig();
 
@@ -479,7 +482,7 @@ export async function runSearch(
  * state_search tool, so an agent can see WHY a memory was recalled instead
  * of silently trusting the ranking.
  */
-export async function runSearchExplained(
+async function runSearchExplainedInner(
   store: Store,
   query: string,
   opts: SearchOpts = {}
@@ -496,6 +499,7 @@ export async function runSearchExplained(
       ? { startISO: range.start.toISOString(), endISO: range.end.toISOString() }
       : {}),
     ...writerOpts,
+    ...(opts.includeDistrusted ? { includeDistrusted: true } : {}),
   };
   const staleCfg = stalenessConfig();
 
@@ -587,6 +591,7 @@ export interface RelevantOpts {
   limit?: number;
   writtenBy?: string;
   notWrittenBy?: string;
+  includeDistrusted?: boolean;
 }
 
 /**
@@ -610,7 +615,7 @@ export interface RelevantOpts {
  * honors the same staleness contract. Callers annotate results with
  * annotateStaleness for the stale/ageDays/staleWarning fields.
  */
-export async function runRelevantSearch(
+async function runRelevantSearchInner(
   store: Store,
   message: string,
   opts: RelevantOpts = {}
@@ -633,6 +638,7 @@ export async function runRelevantSearch(
       limit: perKeyword,
       ...(opts.writtenBy !== undefined ? { writtenBy: opts.writtenBy } : {}),
       ...(opts.notWrittenBy !== undefined ? { notWrittenBy: opts.notWrittenBy } : {}),
+      ...(opts.includeDistrusted ? { includeDistrusted: true } : {}),
     });
     const ids: number[] = [];
     for (const h of ranked) {
@@ -651,4 +657,28 @@ export async function runRelevantSearch(
     keywords,
     results: finalizeResults(store, hits, limit, stalenessConfig()),
   };
+}
+
+// The public entry points. A caller that opted in with includeDistrusted gets
+// notes whose writer the admin distrusts back flagged `distrusted: true`, so no
+// surface can show one without the mark.
+export async function runSearch(store: Store, query: string, opts: SearchOpts = {}): Promise<NoteRecord[]> {
+  const r = await runSearchInner(store, query, opts);
+  return opts.includeDistrusted ? store.markDistrusted(r) : r;
+}
+
+export async function runSearchExplained(store: Store, query: string, opts: SearchOpts = {}): Promise<ExplainedHit[]> {
+  const r = await runSearchExplainedInner(store, query, opts);
+  if (!opts.includeDistrusted) return r;
+  const marked = new Map(store.markDistrusted(r.map((h) => h.note)).map((n) => [n.id, n]));
+  return r.map((h) => ({ ...h, note: marked.get(h.note.id) ?? h.note }));
+}
+
+export async function runRelevantSearch(
+  store: Store,
+  message: string,
+  opts: RelevantOpts = {}
+): Promise<{ keywords: string[]; results: NoteRecord[] }> {
+  const r = await runRelevantSearchInner(store, message, opts);
+  return opts.includeDistrusted ? { ...r, results: store.markDistrusted(r.results) } : r;
 }

@@ -63,7 +63,7 @@ immediately visible through the others:
   `rev` for compare-and-swap, a provenance `source`, tags, and namespaces.
 - **`src/api.ts`** — a small HTTP/JSON API + a built-in web dashboard, on
   plain `node:http` (no framework).
-- **`src/mcp-server-core.ts`** — the transport-agnostic MCP server with twenty-one
+- **`src/mcp-server-core.ts`** — the transport-agnostic MCP server with twenty-two
   tools, shared by both MCP transports.
 - **`src/mcp-stdio.ts`** — stdio entry point for local Claude Code / Desktop
   / editors.
@@ -75,6 +75,10 @@ immediately visible through the others:
   create/update/import.
 - **`src/changes.ts`** — the change feed service (`since` parsing, the
   per-consumer "last" marker) over `Store.changes()`.
+- **`src/trust.ts`** — the distrust policy: rule matching (SQL fragment and its JS twin), writer-id parsing.
+- **`src/attest.ts`** — the Ed25519 signing key, the canonical attestation record, sign and verify.
+- **`src/task-core.ts`** — the command-task queue rule shared by the runner and `runner_status` (no runner code,
+  so the server can use it). `src/liveness.ts` builds on it (no import cycle).
 - **`src/sync.ts`** — Markdown export / three-way import.
 - **`src/start.ts`** — boots the API/dashboard **and** the MCP-over-HTTP
   endpoint in one process on a single store (what `npm start`, the CLI, and
