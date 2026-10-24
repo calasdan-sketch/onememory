@@ -41,7 +41,14 @@ export function describeWriter(writtenBy: unknown): string {
   if (w === "stdio") return "stdio (local MCP client, no token)";
   if (w === "cli") return "cli (the local onememory command)";
   if (w === "server") return "server (OneMemory's own background job)";
+  if (w === "runner") return "runner (the command runner process on the owner's PC)";
   return `${w} (token)`;
+}
+
+/** created_by for the banner: a fixed marker as-is, a token label JSON-quoted. */
+function describeCreator(createdBy: unknown): string {
+  const w = oneLine(createdBy, 100);
+  return ["stdio", "cli", "server", "runner"].includes(w) ? w : `${JSON.stringify(w.slice(0, 60))} (token)`;
 }
 
 /**
@@ -65,12 +72,16 @@ export function provenanceBanner(payload: unknown, maxLines = 25): string {
     if (typeof o.written_by === "string" && typeof o.id === "number") {
       total++;
       if (lines.length < maxLines) {
+        // Every writer-controlled string is JSON-quoted (escapes quotes and
+        // backslashes, one line, capped) so it cannot read as the server's own
+        // wording. Fixed marker text from describeWriter() is ours.
+        const q = (v: unknown, max: number): string => JSON.stringify(oneLine(v, max));
         const src = oneLine(o.source, 60);
-        const made = typeof o.created_by === "string" && o.created_by && o.created_by !== o.written_by ? `; first written by ${oneLine(o.created_by, 60)}` : "";
-        const claim = typeof o.imported_written_by === "string" && o.imported_written_by ? `; import claimed ${oneLine(o.imported_written_by, 60)}` : "";
+        const made = typeof o.created_by === "string" && o.created_by && o.created_by !== o.written_by ? `; first written by ${describeCreator(o.created_by)}` : "";
+        const claim = typeof o.imported_written_by === "string" && o.imported_written_by ? `; import claimed ${q(o.imported_written_by, 60)} (unverified)` : "";
         lines.push(
           `- #${o.id}: written by ${describeWriter(o.written_by)}${made}${claim}` +
-            (src ? ` - claims source=${JSON.stringify(src)} (unverified)` : "")
+            (src ? ` - claims source=${q(o.source, 60)} (unverified)` : "")
         );
       }
     }

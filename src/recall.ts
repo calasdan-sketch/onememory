@@ -148,9 +148,9 @@ interface RecallData {
 
 async function fetchRecentNotes(opts: RecallOptions): Promise<RecallData> {
   const { DB_PATH } = await import("./config.js");
-  const { Store } = await import("./store.js");
+  const { Store, SCHEMA_VERSION } = await import("./store.js");
   const { listTasks, listHandoffs, buildBoardSummary, TASK_TAG, HANDOFF_TAG } = await import("./tasks.js");
-  const { runnerNotice } = await import("./runner-status.js");
+  const { runnerNotice } = await import("./liveness.js");
   const limit = clampInt(opts.limit ?? 10, 10, 1, 100);
   const resolution = await resolveRecallNamespace();
   if (resolution.kind === "unresolvable") {
@@ -167,7 +167,20 @@ async function fetchRecentNotes(opts: RecallOptions): Promise<RecallData> {
   // level); token/scope enforcement belongs on the HTTP/MCP server boundary.
   const namespace =
     resolution.kind === "resolved" ? resolution.namespace : undefined;
-  const store = new Store(opts.dbPath ?? DB_PATH);
+  // The hook runs on every session start and must never be the thing that
+  // upgrades a database (a schema migration is one-way and takes a backup copy):
+  // against a file from an older release it stays quiet until a normal
+  // onememory command or server has migrated it.
+  const dbFile = opts.dbPath ?? DB_PATH;
+  const onDisk = Store.peekSchemaVersion(dbFile);
+  if (onDisk !== null && onDisk >= 1 && onDisk < SCHEMA_VERSION) {
+    console.error(
+      `onememory recall: the database is at schema v${onDisk} (this release uses v${SCHEMA_VERSION}); ` +
+        "not upgrading it from the hook. Run any `onememory` command (for example `onememory doctor`) to upgrade it."
+    );
+    return { notes: [], board: "" };
+  }
+  const store = new Store(dbFile);
   try {
     // Tasks and handoffs get their own section (below), so they are kept
     // out of the generic recent-notes list instead of appearing twice.

@@ -14,6 +14,9 @@ All environment variables are optional:
 | `ONEMEMORY_AUDIT_MAX_BYTES` | `5000000` | Rotate audit.log when it reaches this size (`0` = never) |
 | `ONEMEMORY_AUDIT_KEEP` | `5` | Rotated audit files kept (`audit.log.1` ... `.N`) |
 | `ONEMEMORY_RUNNER_TASK_NAMESPACE` | unset | Runner only: namespace whose admin-approved command tasks the runner executes. Unset = command tasks off. See [RUNNER.md](./RUNNER.md) |
+| `ONEMEMORY_RUNNER_STALE_SECONDS` | `600` (30 s - 7 d) | API/MCP/CLI side: heartbeat age after which `runner_status` calls the runner stale. Never less than three of the runner's own beat intervals (the heartbeat publishes its interval), so a slow beat cannot read as permanently offline. See [RUNNER.md](./RUNNER.md) |
+| `ONEMEMORY_APPROVAL_TTL_SECONDS` | `86400` (60 s - 30 d) | How long an admin approval of a command task stays valid before it expires and needs approving again |
+| `ONEMEMORY_RUNNER_ID` | machine name | Server-side fallback for the runner's machine name when no heartbeat has been seen (the runner's own heartbeat wins). Counted commands are the ones whose `target` is this name |
 | `ONEMEMORY_NO_CHMOD` | unset | `1` = never tighten data-dir permissions to 0700/0600 (for deliberately shared dirs) |
 | `ONEMEMORY_TOKEN` | auto-generated → `<data dir>/.token` | Primary (admin) bearer token; required to bind a public interface |
 | `ONEMEMORY_TOKENS` | unset | Optional JSON array of extra scoped tokens: `[{"token":"…","scope":"read\|write\|admin","label":"…","namespace":"…"}]` (also readable from `<data dir>/tokens.json`). `namespace` optionally pins a token to one namespace — per-token isolation on a shared server, so several agents can share one bridge without seeing each other's notes. See [token-namespaces.md](./token-namespaces.md) |

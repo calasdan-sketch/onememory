@@ -24,7 +24,7 @@ import { createHash, timingSafeEqual, randomBytes } from "node:crypto";
 import { Store, ValidationError, QuarantinedError, DEFAULT_NAMESPACE, type NoteRecord } from "./store.js";
 import { runChanges, type ChangesResponse } from "./changes.js";
 import { RESERVED_TAG_PREFIX } from "./reserved-tags.js";
-import { runnerNotice } from "./runner-status.js";
+import { runnerNotice } from "./liveness.js";
 
 /** Update of a task that doesn't exist / isn't yours to touch (REST: 404). */
 export class TaskNotFoundError extends ValidationError {}
@@ -768,6 +768,10 @@ export interface TaskListOpts {
   owner?: string;
   parent_id?: number;
   limit?: number;
+  /** Only tasks whose server-stamped content writer is exactly this. */
+  writtenBy?: string;
+  /** Skip tasks whose server-stamped content writer is this. */
+  notWrittenBy?: string;
 }
 
 export function listTasks(store: Store, opts: TaskListOpts = {}): { tasks: Task[]; total: number } {
@@ -780,7 +784,7 @@ export function listTasks(store: Store, opts: TaskListOpts = {}): { tasks: Task[
   if (owner) withTags.push(`owner:${owner}`);
   if (opts.parent_id !== undefined) withTags.push(`${TAG_PARENT}${intOrNull(opts.parent_id, "parent_id")}`);
   const limit = Math.min(TASK_LIMITS.maxList, Math.max(1, Math.floor(opts.limit ?? 50) || 50));
-  const { notes, total } = store.list({ namespaces: opts.namespaces, limit, withTags, withoutTags });
+  const { notes, total } = store.list({ namespaces: opts.namespaces, limit, withTags, withoutTags, writtenBy: opts.writtenBy, notWrittenBy: opts.notWrittenBy });
   return { tasks: notes.map((n) => taskFromNote(n, store)), total };
 }
 
@@ -993,31 +997,99 @@ export interface WaitingCommand {
   since: string;
 }
 
+/** The runner an approved command is addressed to: its machine name and the one task namespace it serves ("" = command tasks off). */
+export interface RunnerIdentity {
+  me: string;
+  namespace: string;
+}
+
 /**
- * Read-only: queued command tasks that carry an approval, in `namespaces`
- * (undefined = whole store, [] = nothing). Command text and params are NOT
- * returned -- only ids, namespaces and timing. A tag that fails the MAC and has
- * not expired (command edited since approval, or forged) is neither waiting nor
- * expired: it can never run and is not counted.
+ * This machine's runner name from the environment. Same rule as the runner's
+ * own runnerId() (kept here, outside the runner files, so the server side can
+ * use it: the runner is not part of the npm package).
  */
-export function waitingCommandTasks(store: Store, namespaces?: string[], now = Date.now(), maxTotal = 2_000): WaitingCommand[] {
-  const out: WaitingCommand[] = [];
-  if (namespaces && namespaces.length === 0) return out;
-  const page = 200;
-  for (let offset = 0; offset < maxTotal; offset += page) {
-    const r = store.list({ namespaces, limit: page, offset, withTags: [TASK_TAG, "status:queued"], withTagPrefix: TAG_APPROVAL });
-    for (const n of r.notes) {
-      if (parseBody(n.body).command === null) continue;
-      const m = APPROVAL_RE.exec(stateOf(n).approval ?? "");
-      if (!m) continue;
-      const expMs = Number(m[2]);
-      if (!Number.isSafeInteger(expMs)) continue;
-      if (expMs <= now) out.push({ id: n.id, namespace: n.namespace, state: "expired", expires_ms: expMs, since: n.updated_at });
-      else if (verifyApproval(store, n, now) === "approved") out.push({ id: n.id, namespace: n.namespace, state: "waiting", expires_ms: expMs, since: n.updated_at });
-    }
-    if (r.notes.length < page) break;
+export function envRunnerId(): string {
+  return process.env.ONEMEMORY_RUNNER_ID || process.env.COMPUTERNAME || process.env.HOSTNAME || "default";
+}
+
+/** The namespace whose command tasks the runner executes, from the environment ("" = off). */
+export function envRunnerTaskNamespace(): string {
+  return process.env.ONEMEMORY_RUNNER_TASK_NAMESPACE || "";
+}
+
+export type QueuedVerdict =
+  /** The runner may run it now (approval valid, unexpired, addressed to it, not leased). */
+  | { kind: "runnable"; expires_ms: number; command: { action: string; params: Record<string, string>; target: string } }
+  /** A genuine approval (MAC verifies) that lapsed before the runner took the task: an admin must re-approve. */
+  | { kind: "expired"; expires_ms: number }
+  /** Never runs on this runner: why, for tests and diagnostics. */
+  | { kind: "skip"; why: "not_command" | "other_namespace" | "other_target" | "unapproved" | "leased" };
+
+/**
+ * THE one rule for "would this runner run this queued task?", used by the
+ * runner's pollTasks and by the waiting-commands status, so they cannot
+ * drift: it must be a command task in the runner's task namespace, addressed
+ * to this runner, carrying an approval whose MAC verifies, with no live lease.
+ * (The runner's rate window is a runtime limit, not a property of the task.)
+ * An approval that is past its time is reported "expired" only if its MAC
+ * would have verified -- a forged or edited tag is "unapproved", so it can
+ * neither run nor inflate the expired count.
+ */
+export function classifyQueuedCommand(store: Store, n: NoteRecord, who: RunnerIdentity, now: number): QueuedVerdict {
+  const cmd = parseBody(n.body).command;
+  if (!cmd) return { kind: "skip", why: "not_command" };
+  if (!who.namespace || n.namespace !== who.namespace) return { kind: "skip", why: "other_namespace" };
+  if (cmd.target !== who.me) return { kind: "skip", why: "other_target" };
+  const m = APPROVAL_RE.exec(stateOf(n).approval ?? "");
+  if (!m) return { kind: "skip", why: "unapproved" };
+  const expMs = Number(m[2]);
+  if (!Number.isSafeInteger(expMs)) return { kind: "skip", why: "unapproved" };
+  if (expMs <= now) {
+    // verifyApproval treats "now" as the instant it is checked: ask it one
+    // millisecond before the deadline to test the MAC itself.
+    return verifyApproval(store, n, expMs - 1) === "approved" ? { kind: "expired", expires_ms: expMs } : { kind: "skip", why: "unapproved" };
   }
-  return out;
+  if (verifyApproval(store, n, now) !== "approved") return { kind: "skip", why: "unapproved" };
+  const lease = stateOf(n).lease;
+  if (lease && lease.expMs > now) return { kind: "skip", why: "leased" };
+  return { kind: "runnable", expires_ms: expMs, command: cmd };
+}
+
+/**
+ * Read-only: queued command tasks this runner would run (or whose real
+ * approval lapsed), in `namespaces` (undefined = whole store, [] = nothing),
+ * classified by the same rule the runner uses. Command text and params are NOT
+ * returned -- only ids, namespaces and timing. `truncated` = the scan stopped at
+ * `maxTotal` matches, so the real count may be higher ("at least").
+ */
+export function scanWaitingCommands(
+  store: Store,
+  who: RunnerIdentity,
+  namespaces?: string[],
+  now = Date.now(),
+  maxTotal = 2_000
+): { items: WaitingCommand[]; truncated: boolean } {
+  const items: WaitingCommand[] = [];
+  if (!who.namespace) return { items, truncated: false };
+  if (namespaces && !namespaces.includes(who.namespace)) return { items, truncated: false };
+  const page = Math.min(200, Math.max(1, maxTotal));
+  let seen = 0;
+  for (let offset = 0; ; offset += page) {
+    const r = store.list({ namespace: who.namespace, limit: page, offset, withTags: [TASK_TAG, "status:queued"], withTagPrefix: TAG_APPROVAL });
+    for (const n of r.notes) {
+      const v = classifyQueuedCommand(store, n, who, now);
+      if (v.kind === "runnable") items.push({ id: n.id, namespace: n.namespace, state: "waiting", expires_ms: v.expires_ms, since: n.updated_at });
+      else if (v.kind === "expired") items.push({ id: n.id, namespace: n.namespace, state: "expired", expires_ms: v.expires_ms, since: n.updated_at });
+    }
+    seen += r.notes.length;
+    if (r.notes.length < page) return { items, truncated: false };
+    if (seen >= maxTotal) return { items, truncated: seen < r.total };
+  }
+}
+
+/** Back-compat wrapper: the waiting list only. */
+export function waitingCommandTasks(store: Store, who: RunnerIdentity, namespaces?: string[], now = Date.now(), maxTotal = 2_000): WaitingCommand[] {
+  return scanWaitingCommands(store, who, namespaces, now, maxTotal).items;
 }
 
 /**
@@ -1051,11 +1123,16 @@ export function finishCommandTask(
     ...(outcome.output ? { output: outcome.output.slice(0, TASK_LIMITS.resultOutput) } : {}),
   };
   const write = (r: Record<string, unknown>): void => {
-    store.update(id, {
-      body: taskBody({ ...body, result: r }),
-      // The approval is single-use: it is consumed by the run.
-      tags: tagsFromState(n.tags, { ...stateOf(n), status: outcome.ok ? "done" : "failed", approval: null }),
-    });
+    store.update(
+      id,
+      {
+        body: taskBody({ ...body, result: r }),
+        // The approval is single-use: it is consumed by the run.
+        tags: tagsFromState(n.tags, { ...stateOf(n), status: outcome.ok ? "done" : "failed", approval: null }),
+      },
+      // The outcome is bookkeeping: whoever wrote the command stays its writer.
+      { keepWriter: true }
+    );
   };
   try {
     write(result);
@@ -1245,7 +1322,7 @@ export interface CatchUp {
   /** Compact tasks: title / status / owner / next step -- fetch one with task_get. */
   tasks: { open: TaskSummary[]; total: number };
   handoffs: Handoff[];
-  /** One line, present only when approved commands are waiting and the runner looks offline (see runner-status.ts). */
+  /** One line, present only when approved commands are waiting and the runner looks offline (see liveness.ts). */
   runner_notice?: string;
 }
 

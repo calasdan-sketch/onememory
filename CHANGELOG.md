@@ -9,24 +9,60 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [1.3.4] - 2026-10-24
 
 "Runner offline, N commands waiting." An approved command task used to wait
-silently when the PC was off or asleep. Now the store says so. No schema change.
+silently when the PC was off or asleep. Now the store says so. No schema version
+change from 1.3.3 (still v13). Also tightens 1.3.3's "who wrote this" after review.
 
 ### Added
 - `runner_status` (MCP, read scope), `GET /runner/status` (REST, read token) and
   `onememory runner-status [--json]`: the runner's state (`online` / `stale` /
-  `never_seen`, from the heartbeat's age) and, per readable namespace, the approved
-  commands still waiting, those whose approval ends within an hour, approvals that
-  already expired, and the oldest waiting age. Counts, ages and ids only: never
-  command text, params or targets.
-- `ONEMEMORY_RUNNER_STALE_SECONDS` (default 600) sets when the runner counts as stale.
-- One-line notice when commands are waiting and the runner is not online: a
-  `runner_notice` field on `catch_up` (and `GET /catch-up`), a line in the
-  SessionStart recall, and a banner on the dashboard. Absent otherwise, so existing
-  result shapes are unchanged.
+  `never_seen`) and, per readable namespace, the approved commands still waiting,
+  those whose approval ends within an hour, approvals that already expired, and the
+  oldest waiting age (human durations on the command line). Counts, ages and ids
+  only: never command text, params, targets or the host name. Counts are "at least"
+  (`truncated: true`) past 2,000 queued tasks.
+- "Waiting" is decided by the runner's own selection rule, now one shared function
+  (`classifyQueuedCommand`): the runner's task namespace, `target` = this runner,
+  a valid unexpired approval, no live lease. A command for another machine or
+  namespace is not counted and never triggers the offline notice. The runner's
+  heartbeat now also publishes its task namespace and beat interval.
+- The heartbeat is judged by the note's server timestamp, not the `alive_at` in the
+  body, only when written by the runner process (new writer marker `runner`), and
+  never from the future. Forged or clock-skewed heartbeats no longer keep a dead PC
+  "online". Expired approvals are counted only when their signature verifies.
+- `ONEMEMORY_RUNNER_STALE_SECONDS` (default 600, never below three beat intervals).
+- One-line notice (waiting commands on a runner that is not online, or expired
+  approvals even when it is): a `runner_notice` field on `catch_up`, a line in the
+  SessionStart recall, and a banner on the dashboard. Absent otherwise.
+- `note_written_by` (the note's current writer) on every `/changes` and `memory_since`
+  entry; `written_by` / `not_written_by` on `task_list` and `GET /tasks`;
+  `merged_from_writers` on a consolidate result.
+- A pack smoke test: `npm pack`, unpack, run `runner-status` and the MCP stdio server
+  to `tools/list` from the tarball, and check every relative import is packed.
 
 ### Changed
-- docs/RUNNER.md: the "does not survive the PC being off or asleep" limit now
-  explains the wait, the approval expiry and the new status.
+- **Fixed before release:** the `files` list in package.json drops `dist/src/runner*`,
+  which would have stripped the new module from the npm package and crashed the MCP
+  server and `runner-status`. The module is now `src/liveness.ts`.
+- `written_by` now means who last changed the note's **content** (title or body).
+  Tag-only edits, task claim / lease / approve / status, the runner's outcome write,
+  archive / restore and `source` edits no longer take it over; the actor is still in
+  the change log. Merges are stamped with the merger and report the sources' writers.
+- Change-log triggers are permanent and copy the note's writer (a quarantined write that
+  an admin approves now shows its author in the change feed, not the approver). Existing
+  v13 files made by 1.3.3 are repaired on first open. Deletes are attributed to the deleter.
+- The "WHO WROTE THIS" block JSON-quotes `source`, `created_by` and `imported_written_by`.
+- Writer labels are normalised before the marker check (`" cli "`, `CLI`, `token:cli` can no
+  longer collide with a marker or each other); labels over 100 characters get a hash suffix and
+  the filters apply the same rule.
+- The index on `notes(written_by)` is replaced by `(namespace, written_by, updated_at DESC)`.
+- Upgrade safety: the first v12 to v13 migration of a non-empty database leaves
+  `<db>.pre-v13-backup` (never overwritten). `onememory recall` never migrates a database.
+- docs/RUNNER.md: the wait, the approval expiry and the status. docs/provenance.md: exactly what
+  `written_by` means, upgrade and rollback, limits. Tool count in docs and test corrected to 21.
+
+### Planned (not built)
+`distrust_writers` policy, signed writer attestations, stable cross-server writer ids,
+per-target runner heartbeats. See docs/provenance.md.
 
 ## [1.3.3] - 2026-10-24
 

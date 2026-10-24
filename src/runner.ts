@@ -1101,6 +1101,10 @@ export function beat(store: Store, secret: string, startedAt: string): void {
     host: process.env.COMPUTERNAME || process.env.HOSTNAME || "unknown",
     runner: runnerId(),
     poll_ms: RUNNER.pollMs,
+    // What runner_status needs to count only commands THIS runner would run,
+    // and to size its "offline" threshold from the real beat interval.
+    heartbeat_ms: RUNNER.heartbeatMs,
+    task_namespace: RUNNER.taskNamespace,
   });
   try {
     // Cache the id. Re-scanning a window each beat would silently start

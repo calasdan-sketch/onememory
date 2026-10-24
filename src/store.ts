@@ -12,7 +12,7 @@
 // app-level "remember to reindex" step to forget.
 
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, statSync, readdirSync, renameSync } from "node:fs";
+import { mkdirSync, statSync, readdirSync, renameSync, existsSync } from "node:fs";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { dirname, basename, join } from "node:path";
 import { checkSizes, audit } from "./security.js";
@@ -247,9 +247,18 @@ export interface ChangeEntry {
   /**
    * Server-stamped identity of whoever made this change (token label, or
    * stdio / cli / server); "" = unknown (old rows, foreign writers).
-   * `source` above is only what the writer claimed.
+   * `source` above is only what the writer claimed. For a create/update this
+   * is the note's writer as of that event (a metadata-only edit does not
+   * change it); for a delete it is whoever deleted. The written_by /
+   * not_written_by feed filters match THIS (event) value.
    */
   written_by: string;
+  /**
+   * The note's CURRENT last content writer (what state_list / state_read
+   * show), which can differ from `written_by` when the note changed after
+   * this event. Absent for a deleted note.
+   */
+  note_written_by?: string;
 }
 
 export interface ChangeCounts {
@@ -359,11 +368,13 @@ export interface NoteRecord {
    */
   source: string;
   /**
-   * Server-stamped identity of the LAST writer (create or update): the
-   * authenticated token's label, or `stdio` / `cli` / `server` for writers
-   * with no token. Set by the server from the connection, never from the
-   * request body, so a client cannot forge it. "" = unknown (rows written
-   * before schema v13, or a library caller with no identity).
+   * Server-stamped identity of whoever last changed the note's CONTENT (its
+   * title or body): the authenticated token's label, or `stdio` / `cli` /
+   * `server` / `runner` for writers with no token. A metadata-only change
+   * (tags, task claim / lease / approve, archive, restore) does not change it.
+   * Set by the server from the connection, never from the request body, so a
+   * client cannot forge it. "" = unknown (rows written before schema v13, or a
+   * library caller with no identity).
    */
   written_by: string;
   /** Server-stamped identity of the FIRST writer; never changes on update. "" = unknown. */
@@ -373,6 +384,12 @@ export interface NoteRecord {
    * CLAIMED (unverified). written_by / created_by are the importing admin.
    */
   imported_written_by?: string;
+  /**
+   * Only on the result of a consolidate (merge), never stored: the distinct
+   * `written_by` values of the source notes. The merged note itself is
+   * stamped with whoever ran the merge.
+   */
+  merged_from_writers?: string[];
   created_at: string;
   updated_at: string;
   /** Read-importance tracking: total user-facing reads of this note. */
@@ -848,11 +865,11 @@ function rangeClause(opts: RangeOpts): { sql: string; params: string[] } {
   }
   if (opts.writtenBy !== undefined) {
     clauses.push("notes.written_by = ?");
-    params.push(opts.writtenBy);
+    params.push(cleanWriter(opts.writtenBy));
   }
   if (opts.notWrittenBy !== undefined) {
     clauses.push("notes.written_by <> ?");
-    params.push(opts.notWrittenBy);
+    params.push(cleanWriter(opts.notWrittenBy));
   }
   return { sql: clauses.length ? " AND " + clauses.join(" AND ") : "", params };
 }
@@ -932,6 +949,7 @@ export class Store {
       if (!this.lastKey) this.recoverStrandedKey();
       this.keyStamp = this.stampOf();
       this.init();
+      this.ensureLogTriggers();
       this.installActorStamp();
       this.upgradeV1Envelopes();
     } catch (e) {
@@ -977,6 +995,7 @@ export class Store {
       );
     }
     if (found >= SCHEMA_VERSION) return;
+    if (found >= 1 && found < 13) this.preMigrationBackup(found);
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const v = version();
@@ -992,6 +1011,55 @@ export class Store {
         /* nothing to roll back */
       }
       throw e;
+    }
+  }
+
+  /**
+   * Before the first v12 -> v13 upgrade of a non-empty file, keep one copy of
+   * the pre-upgrade database next to it: `<db>.pre-v13-backup`. It is a
+   * consistent snapshot (VACUUM INTO) still at the old schema version, so an
+   * older onememory can open it (rollback = stop everything, put this file
+   * back as the database, install the older version). Never overwrites an
+   * existing copy, so a second attempt cannot replace the real original.
+   * Best effort: a failure is reported and the upgrade continues.
+   */
+  private preMigrationBackup(from: number): void {
+    if (this.dbPath === ":memory:") return;
+    const dest = this.dbPath + ".pre-v13-backup";
+    try {
+      if (existsSync(dest)) return;
+      if (!this.db.prepare("SELECT 1 FROM notes LIMIT 1").get()) return;
+      this.db.exec(`VACUUM INTO '${dest.replace(/'/g, "''")}'`);
+      chmodQuiet(dest, 0o600);
+      console.error(
+        `[onememory] upgrading the database from schema v${from} to v13; the original was copied to ${dest} ` +
+          "(to roll back: stop every onememory process, put that file back as the database, install the older version)."
+      );
+    } catch (e) {
+      console.error(`[onememory] could not copy the database before upgrading (${(e as Error).message}); continuing.`);
+    }
+  }
+
+  /** Highest change_log sequence number (0 when empty): a cheap "has anything changed?" stamp. */
+  maxChangeSeq(): number {
+    return Number((this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM change_log").get() as { m: number }).m);
+  }
+
+  /** Schema version stored in a database file, or null when it is missing / unreadable. Opens read-only; never migrates. */
+  static peekSchemaVersion(dbPath: string): number | null {
+    if (dbPath === ":memory:" || !existsSync(dbPath)) return null;
+    let db: DatabaseSync | null = null;
+    try {
+      db = new DatabaseSync(dbPath, { readOnly: true });
+      return Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
+    } catch {
+      return null;
+    } finally {
+      try {
+        db?.close();
+      } catch {
+        /* nothing to close */
+      }
     }
   }
 
@@ -1296,16 +1364,85 @@ export class Store {
       this.addColumn("notes", "imported_written_by", "TEXT NOT NULL DEFAULT ''");
       this.addColumn("change_log", "written_by", "TEXT NOT NULL DEFAULT ''");
       this.addColumn("quarantine", "written_by", "TEXT NOT NULL DEFAULT ''");
-      this.db.exec("CREATE INDEX IF NOT EXISTS idx_notes_written_by ON notes(written_by)");
+      // The permanent change_log triggers copy the NOTE's writer, so the feed
+      // can never disagree with the row (quarantine approval, imports, and
+      // writers that never register a function all stay correct).
+      this.createLogTriggers();
+      // Composite index shaped like the list / search queries (namespace +
+      // writer filter, newest first). A bare index on the writer column is
+      // very low cardinality (most rows share one value) and made the planner
+      // scan and sort nearly the whole table.
+      this.db.exec("DROP INDEX IF EXISTS idx_notes_written_by");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_notes_ns_writer ON notes(namespace, written_by, updated_at DESC)");
+    }
+  }
+
+  /** (Re)create the created / updated change_log triggers with the writer column. Caller holds the write lock. */
+  private createLogTriggers(): void {
+    this.db.exec(`
+      DROP TRIGGER IF EXISTS notes_log_ai;
+      CREATE TRIGGER notes_log_ai AFTER INSERT ON notes BEGIN
+        INSERT INTO change_log (note_id, kind, namespace, title, source, rev, changed_at, written_by)
+        VALUES (new.id, 'created', new.namespace, new.title, new.source, new.rev, ${SQL_NOW}, new.written_by);
+      END;
+      DROP TRIGGER IF EXISTS notes_log_au;
+      CREATE TRIGGER notes_log_au AFTER UPDATE ON notes
+      WHEN (old.rev IS NOT new.rev OR old.title IS NOT new.title OR old.body IS NOT new.body
+            OR old.tags IS NOT new.tags OR old.namespace IS NOT new.namespace
+            OR old.source IS NOT new.source OR old.archived_at IS NOT new.archived_at)
+      BEGIN
+        INSERT INTO change_log (note_id, kind, namespace, title, source, rev, changed_at, written_by)
+        VALUES (new.id, 'updated', new.namespace, new.title, new.source, new.rev, ${SQL_NOW}, new.written_by);
+        UPDATE change_log SET title = ''
+         WHERE old.title IS NOT new.title AND note_id = new.id AND title <> ''
+           AND seq < (SELECT max(seq) FROM change_log WHERE note_id = new.id);
+      END;
+    `);
+  }
+
+  /**
+   * A v13 file created by 1.3.3 has log triggers that do not copy the writer
+   * (a per-connection TEMP trigger stamped it instead, which got quarantine
+   * approvals wrong) and the low-cardinality writer index. Bring both up to
+   * date once, on first open.
+   * No schema version bump: the columns are unchanged.
+   */
+  private ensureLogTriggers(): void {
+    const stale = (): boolean => {
+      const rows = this.db
+        .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name IN ('notes_log_ai', 'notes_log_au')")
+        .all() as Array<{ name: string; sql: string }>;
+      const oldIdx = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_notes_written_by'").get();
+      return rows.length < 2 || rows.some((r) => !r.sql.includes("written_by")) || Boolean(oldIdx);
+    };
+    if (!stale()) return;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (stale()) {
+        this.createLogTriggers();
+        this.db.exec("DROP INDEX IF EXISTS idx_notes_written_by");
+        this.db.exec("CREATE INDEX IF NOT EXISTS idx_notes_ns_writer ON notes(namespace, written_by, updated_at DESC)");
+      }
+      this.db.exec("COMMIT");
+    } catch (e) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* nothing to roll back */
+      }
+      throw e;
     }
   }
 
   /**
-   * Stamp the writer's label on every change_log row this connection causes.
-   * A TEMP trigger lives only on this connection (nothing persists in the
-   * file, so other tools and older code are unaffected) and calls a function
-   * registered on this connection only. No actor in scope (CLI, scripts) =
-   * the trigger does nothing and the row keeps actor ''.
+   * Stamp the ACTOR (token label) on every change_log row this connection
+   * causes, and the DELETER's writer identity on delete rows (a delete has no
+   * surviving note row to copy a writer from; created / updated rows get
+   * theirs from the permanent triggers). A TEMP trigger lives only on this
+   * connection (nothing persists in the file, so other tools and older code
+   * are unaffected) and calls functions registered on this connection only.
+   * No actor in scope (CLI, scripts) = the trigger does nothing and the row
+   * keeps actor ''.
    */
   private installActorStamp(): void {
     this.db.function("om_actor", { deterministic: false }, () => currentActor());
@@ -1315,7 +1452,10 @@ export class Store {
       CREATE TEMP TRIGGER om_actor_stamp AFTER INSERT ON main.change_log
       WHEN om_actor() <> '' OR om_writer() <> ''
       BEGIN
-        UPDATE change_log SET actor = om_actor(), written_by = om_writer() WHERE seq = new.seq;
+        UPDATE change_log
+           SET actor = om_actor(),
+               written_by = CASE WHEN new.kind = 'deleted' THEN om_writer() ELSE written_by END
+         WHERE seq = new.seq;
       END;
     `);
   }
@@ -1895,7 +2035,17 @@ export class Store {
   update(
     id: number,
     patch: NotePatch,
-    opts: { ifRev?: number; /** internal: quarantine approval keeps the real author */ writtenBy?: string } & LintOpts = {}
+    opts: {
+      ifRev?: number;
+      /** internal: quarantine approval keeps the real author */
+      writtenBy?: string;
+      /**
+       * internal: a bookkeeping write (runner outcome, status) that must not
+       * take over `written_by` even though it changes the body. The actor is
+       * still recorded in change_log.actor.
+       */
+      keepWriter?: boolean;
+    } & LintOpts = {}
   ): NoteRecord | null {
     validateForgetAfter(patch.forget_after);
     const existing = this.read(id);
@@ -1942,9 +2092,18 @@ export class Store {
     const tags = patch.tags !== undefined ? tagsToStorage(patch.tags) : tagsToStorage(existing.tags);
     const source = patch.source !== undefined ? patch.source.slice(0, 200) : existing.source;
     const rev = existing.rev + 1;
-    // Last writer = whoever makes THIS update (server-stamped). created_by is
-    // not touched, and a client-sent written_by/created_by never reaches here.
-    const writer = opts.writtenBy !== undefined ? cleanWriter(opts.writtenBy) : currentWriter();
+    // written_by = who last changed the CONTENT (title or body), server-stamped.
+    // A metadata-only write (tags: task claim / lease / approve, archive, a
+    // source edit) leaves it alone; who made that change is in change_log.actor.
+    // created_by is not touched, and a client-sent written_by/created_by never
+    // reaches here.
+    const contentChanged = title !== existing.title || body !== existing.body;
+    const writer =
+      contentChanged && !opts.keepWriter
+        ? opts.writtenBy !== undefined
+          ? cleanWriter(opts.writtenBy)
+          : currentWriter()
+        : existing.written_by;
     validateSizes({ title, body, tags: patch.tags ?? existing.tags });
     const now = new Date().toISOString();
     // Re-seal: existing.body is already decrypted plaintext, so an update
@@ -3719,8 +3878,8 @@ export class Store {
       (opts.writtenBy !== undefined ? " AND written_by = ?" : "") +
       (opts.notWrittenBy !== undefined ? " AND written_by <> ?" : "");
     const wbParams = [
-      ...(opts.writtenBy !== undefined ? [opts.writtenBy] : []),
-      ...(opts.notWrittenBy !== undefined ? [opts.notWrittenBy] : []),
+      ...(opts.writtenBy !== undefined ? [cleanWriter(opts.writtenBy)] : []),
+      ...(opts.notWrittenBy !== undefined ? [cleanWriter(opts.notWrittenBy)] : []),
     ];
     const exSql = c.x ? " AND (CASE WHEN actor <> '' THEN actor ELSE source END) <> ?" : "";
     const exParams = c.x ? [c.x] : [];
@@ -3759,6 +3918,17 @@ export class Store {
     const rows = tail ? rowsRaw.slice(0, tail).reverse() : rowsRaw;
     const more = tail ? false : rows.length > limit;
     const pageRows = rows.slice(0, tail || limit);
+    const current = new Map<number, string>();
+    if (pageRows.length) {
+      const ids = [...new Set(pageRows.map((r) => Number(r.id)))];
+      for (let i = 0; i < ids.length; i += 500) {
+        const part = ids.slice(i, i + 500);
+        const got = this.db
+          .prepare(`SELECT id, written_by FROM notes WHERE id IN (${part.map(() => "?").join(",")})`)
+          .all(...part) as Array<{ id: number; written_by: string | null }>;
+        for (const g of got) current.set(Number(g.id), g.written_by ?? "");
+      }
+    }
     const page = pageRows.map((r): ChangeEntry => ({
       kind: r.kind,
       id: Number(r.id),
@@ -3766,6 +3936,7 @@ export class Store {
       title: r.title,
       source: r.source ?? "",
       written_by: r.written_by ?? "",
+      ...(current.has(Number(r.id)) ? { note_written_by: current.get(Number(r.id))! } : {}),
       at: r.at,
       ...(r.rev === null || r.rev === undefined || r.kind === "deleted" ? {} : { rev: Number(r.rev) }),
     }));
@@ -4228,7 +4399,7 @@ export function feedScopeKey(
   // marker / cursor / ack_token (no writer filter) keeps its exact scope key.
   const base: unknown[] = [namespaces ? [...namespaces].sort() : null, source ?? null];
   if (writer?.writtenBy !== undefined || writer?.notWrittenBy !== undefined) {
-    base.push([writer.writtenBy ?? null, writer.notWrittenBy ?? null]);
+    base.push([writer.writtenBy === undefined ? null : cleanWriter(writer.writtenBy), writer.notWrittenBy === undefined ? null : cleanWriter(writer.notWrittenBy)]);
   }
   return createHash("sha256")
     .update(JSON.stringify(base))

@@ -144,9 +144,14 @@ use that label as its `consumer`; devices sharing a label hide each other's writ
 Since 1.3.3 every change entry carries `written_by` (the server-stamped writer: token
 label, or `stdio` / `cli` / `server`; `""` for rows before schema v13), and the feed
 takes `written_by=` / `not_written_by=` (MCP `memory_since`, `memory_ack`; REST
-`GET /changes`, `POST /ack`) to keep or drop one writer's changes. The filter applies to
-change *events*: a note created by A and edited by B shows as A's create under
-`not_written_by=B`. A cursor, `last` marker or `ack_token` is bound to the filter it was
+`GET /changes`, `POST /ack`) to keep or drop one writer's changes. The filter matches the
+*event* writer (`written_by` on the entry: whose content the note held when that change
+was logged; for a delete, whoever deleted). A note created by A and edited by B shows as
+A's create under `not_written_by=B`, so each entry also carries `note_written_by`, who
+holds the note **now** (absent for a delete); use it when you distrust a writer. A
+metadata-only change (tags, claim, approve) keeps the note's writer on its event; the
+token that made it is in `change_log.actor`. Rows from before schema v13 have `""`, so a
+`written_by=` feed does not list them. A cursor, `last` marker or `ack_token` is bound to the filter it was
 issued for. See [provenance.md](./provenance.md).
 
 A consumer whose `last` marker is older than the change-log retention (90 days) gets

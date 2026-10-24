@@ -33,7 +33,7 @@ import {
   TASK_LIMITS,
 } from "./tasks.js";
 import { ackChanges } from "./changes.js";
-import { runnerStatus } from "./runner-status.js";
+import { runnerStatus } from "./liveness.js";
 import { assertPlainWriteTags } from "./reserved-tags.js";
 import { waitForChanges, parseWait, WAIT_MAX_SECONDS, WAIT_RECOMMENDED_SECONDS } from "./change-wait.js";
 import { type Scope, PACKAGE_VERSION } from "./config.js";
@@ -91,13 +91,13 @@ const WRITER_FILTER_SHAPE = {
     .string()
     .optional()
     .describe(
-      "Only notes whose server-stamped last writer (`written_by`: a token label, or stdio / cli / server) is exactly this."
+      "Only notes whose server-stamped last CONTENT writer (`written_by`: a token label, or stdio / cli / server / runner) is exactly this."
     ),
   not_written_by: z
     .string()
     .optional()
     .describe(
-      "Skip notes whose server-stamped last writer is this (e.g. your own label to ignore your own writes, or a client you do not trust). Rows from before schema v13 have an unknown writer ('') and are not excluded."
+      "Skip notes whose server-stamped last writer is this (e.g. your own label to ignore your own writes, or a client you do not trust). Rows from before schema v13 have an unknown writer ('') and are not excluded. On memory_since / memory_ack the filter matches each change's own writer (the note may have been changed by someone else since: see `note_written_by` on each entry)."
     ),
 };
 type WriterFilterArgs = { writtenBy?: string; notWrittenBy?: string };
@@ -1273,14 +1273,15 @@ export function createMcpServer(
         parent_id: z.number().int().optional().describe("Only subtasks of this task."),
         namespace: z.string().optional().describe(nsActive ? "Untrusted hint: restrict to this namespace." : "Restrict to this namespace."),
         limit: z.number().int().optional().describe(`Max tasks (default 50, max ${TASK_LIMITS.maxList}).`),
+        ...WRITER_FILTER_SHAPE,
       },
     },
-    async ({ status, owner, parent_id, namespace, limit }) => {
+    async ({ status, owner, parent_id, namespace, limit, written_by, not_written_by }) => {
       try {
         const denied = denyIfUnder("read");
         if (denied) return errorResult(denied);
         const namespaces = readScope(namespace);
-        const { tasks, total } = listTasks(store, { namespaces, status, owner, parent_id, limit });
+        const { tasks, total } = listTasks(store, { namespaces, status, owner, parent_id, limit, ...writerFilterArgs(written_by, not_written_by) });
         return untrustedResult({ tasks, total, searchedNamespaces: namespaces ?? [] });
       } catch (e) {
         return errorFor(e);
@@ -1299,7 +1300,9 @@ export function createMcpServer(
         "ending within 1 h, how many approvals already expired, and how long the oldest has waited. Use it when an approved " +
         "command has not run: a stale runner means the PC is off or asleep and the command will run when it wakes " +
         "(unless the approval expires first). Counts and ages only, never command text (task_get shows that). " +
-        "The heartbeat time is a hint, not proof: verify it on the sign page." +
+        "The runner's liveness comes from the server's own timestamp of its heartbeat note (only a note written by the runner process counts); " +
+        "it is a good hint, not a cryptographic proof (a human can check a signed result on the sign page). Only commands addressed to that runner, " +
+        "in the namespace it serves, are counted." +
         (nsActive ? " The `namespace` parameter is an untrusted hint: only readable namespaces are counted." : ""),
       inputSchema: {
         namespace: z.string().optional().describe(nsActive ? "Untrusted hint: restrict to this namespace." : "Restrict to this namespace."),

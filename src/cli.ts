@@ -744,7 +744,7 @@ async function backupCmd(): Promise<void> {
 async function runnerStatusCmd(): Promise<void> {
   const { DB_PATH } = await import("./config.js");
   const { Store } = await import("./store.js");
-  const { runnerStatus } = await import("./runner-status.js");
+  const { runnerStatus, ago } = await import("./liveness.js");
   const { flags } = parseFlags(process.argv.slice(3), { values: ["namespace"], bools: ["json"] });
   const store = new Store(DB_PATH);
   try {
@@ -758,13 +758,14 @@ async function runnerStatusCmd(): Promise<void> {
     console.log(
       r.state === "never_seen"
         ? "Runner: no heartbeat seen"
-        : `Runner: ${r.state} (last heartbeat ${r.age_seconds}s ago; stale after ${r.stale_after_seconds}s)`
+        : `Runner: ${r.state} (last heartbeat ${ago(r.age_seconds ?? 0)} ago; counted offline after ${ago(r.stale_after_seconds)})`
     );
-    console.log(`Commands waiting: ${st.waiting_total} (${st.expiring_soon_total} expiring within 1 h), expired approvals: ${st.expired_total}`);
+    const more = st.truncated ? "at least " : "";
+    console.log(`Commands waiting: ${more}${st.waiting_total} (${st.expiring_soon_total} expiring within 1 h), expired approvals: ${more}${st.expired_total}`);
     for (const n of st.namespaces) {
       console.log(
         `  [${n.namespace}] waiting ${n.waiting}, expiring soon ${n.expiring_soon}, expired ${n.expired}` +
-          (n.oldest_waiting_seconds !== null ? `, oldest ${n.oldest_waiting_seconds}s (task #${n.oldest_waiting_task_id})` : "")
+          (n.oldest_waiting_seconds !== null ? `, oldest waited ${ago(n.oldest_waiting_seconds)} (task #${n.oldest_waiting_task_id})` : "")
       );
     }
     if (st.notice) console.log(st.notice);

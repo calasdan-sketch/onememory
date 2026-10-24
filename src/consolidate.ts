@@ -775,7 +775,10 @@ export function consolidateNotes(
         }
       }
     }
-    return merged;
+    // The merged note is stamped with whoever ran the merge; say whose text it
+    // was made from (reported, not stored).
+    const writers = [...new Set(notes.map((n) => n.written_by))].sort();
+    return { ...merged, merged_from_writers: writers };
   });
 }
 

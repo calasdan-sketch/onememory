@@ -7,6 +7,7 @@
 // A per-request holder object (not a bare string) lets the HTTP API open the
 // context before it has authenticated and fill the label in afterwards.
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 
 export interface ActorRef {
   label: string;
@@ -29,10 +30,11 @@ export function currentActor(): string {
  * Fixed markers for writers that have no token. They are set by the entry
  * point (never by a client): `stdio` = the local MCP stdio server, `cli` =
  * an `onememory` command run by the machine owner, `server` = the server's
- * own background jobs. A token labelled like one of these is stored as
+ * own background jobs, `runner` = the command runner process (it writes the
+ * heartbeat that runner_status trusts). A token labelled like one of these is stored as
  * `token:<label>` so it cannot impersonate a marker.
  */
-export const WRITER_MARKERS = ["stdio", "cli", "server"] as const;
+export const WRITER_MARKERS = ["stdio", "cli", "server", "runner"] as const;
 export type WriterMarker = (typeof WRITER_MARKERS)[number];
 
 let processWriter = "";
@@ -45,11 +47,19 @@ export function setProcessWriter(marker: WriterMarker | ""): void {
 /** Longest stored writer identity (labels are operator-chosen; this is a backstop). */
 export const WRITER_MAX = 100;
 
-/** One printable line: no control characters / line breaks, bounded length. */
+/**
+ * One printable line: control characters and line breaks become spaces, runs
+ * of whitespace collapse, ends are trimmed. A label longer than WRITER_MAX is
+ * shortened to a prefix plus "~" and 12 hex digits of its SHA-256, so two
+ * long labels sharing a prefix stay distinct and the SAME function applied to
+ * a filter value finds the stored one. Idempotent.
+ */
 export function cleanWriter(s: unknown): string {
   if (typeof s !== "string") return "";
   // eslint-disable-next-line no-control-regex
-  return s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").trim().slice(0, WRITER_MAX);
+  const t = s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\s]+/g, " ").trim();
+  if (t.length <= WRITER_MAX) return t;
+  return t.slice(0, WRITER_MAX - 13) + "~" + createHash("sha256").update(t).digest("hex").slice(0, 12);
 }
 
 /**
@@ -57,12 +67,17 @@ export function cleanWriter(s: unknown): string {
  * the authenticated token's label, else the entry point's fixed marker,
  * else "" (unknown: a library caller or an old row). Never derived from
  * anything the client sent in the request body.
+ *
+ * A token label that equals a marker (any letter case) or already starts with
+ * `token:` is stored as `token:<label>`, so no label can impersonate a marker
+ * or another token's escaped form.
  */
 export function currentWriter(): string {
   const a = actorStore.getStore();
   if (a?.authed) {
     const label = cleanWriter(a.label) || "(unlabeled)";
-    return (WRITER_MARKERS as readonly string[]).includes(label) ? `token:${label}` : label;
+    const lower = label.toLowerCase();
+    return (WRITER_MARKERS as readonly string[]).includes(lower) || lower.startsWith("token:") ? cleanWriter(`token:${label}`) : label;
   }
   return processWriter;
 }

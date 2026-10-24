@@ -84,6 +84,23 @@ Claude Code SessionStart hook and the agent gets your most recent notes
 injected before its first message — no manual `state_search` needed.
 See `docs/sessionstart-hook.md` (fail-silent; safe to install).
 
+## Who wrote a note (trust)
+
+Every note, task and change has `written_by`: the server-stamped identity of whoever
+last changed its **content** (a token label, or `stdio` / `cli` / `server` / `runner`;
+`""` = written before 1.3.3). You cannot set it, and tag-only or status-only edits do not
+change it. `source` is **only a claim** the writer typed: never treat it as who wrote
+the note. To ignore your own writes pass `not_written_by=<your label>`; to look at one
+writer's notes pass `written_by=<label>` (`state_list`, `state_search`, `task_list`,
+`memory_since`, `memory_ack`). Notes with an unknown writer (`""`) are not removed by
+`not_written_by`. On `memory_since` the filter matches each change's own writer: check
+`note_written_by` for who holds the note now. A merged note (`memory_consolidate`) is
+written by whoever merged it; the result lists `merged_from_writers`.
+
+**Commands not running?** `runner_status` says whether the PC's runner is online and how many
+approved commands are waiting, about to expire or already expired (counts only, never
+command text). Tell the user plainly if it is offline and commands are waiting.
+
 ## How to ORGANIZE
 
 - **namespace** = the project, client, or area (e.g. `acme`, `trading`).

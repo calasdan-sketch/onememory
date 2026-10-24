@@ -252,10 +252,10 @@ token).
 
 ## Who wrote this?
 
-Every note carries a **server-stamped** `written_by` (the last writer) and `created_by`
+Every note carries a **server-stamped** `written_by` (who last changed its title or body; a tag edit or a task status change does not count) and `created_by`
 (the first). It is the label of the authenticated token that made the call, or a fixed
 marker for writers with no token: `stdio` (local MCP), `cli` (an `onememory` command),
-`server` (its own jobs). A client cannot set it: `written_by` in a request body is
+`server` (its own jobs), `runner` (the command runner). A client cannot set it: `written_by` in a request body is
 ignored, and an import stamps the *importing* admin. The old `source` field is still
 there, but it is only what the writer *claims*, so anyone can put anything in it.
 

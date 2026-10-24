@@ -54,7 +54,7 @@ function signAsset(file: string): string | null {
   }
   return signCache.get(file) ?? null;
 }
-import { runnerStatus } from "./runner-status.js";
+import { runnerStatus } from "./liveness.js";
 import { PayloadTooLargeError, readBody, normalizeTokens, IMPORT_BODY_BYTES } from "./http-common.js";
 
 /**
@@ -1065,6 +1065,7 @@ export function createApiServer(
               owner: url.searchParams.get("owner") ?? undefined,
               parent_id: intParam(url, "parent_id", 1),
               limit,
+              ...writerFilter(url),
             });
             sendJson(res, 200, { tasks, total, searchedNamespaces: namespaces ?? [] });
             return;

@@ -229,25 +229,43 @@ GET /runner/status[?namespace=ns]     # REST, read token
 onememory runner-status [--json]      # CLI on the machine holding the store
 ```
 
-It returns the runner's state (`online`, `stale` or `never_seen`) from the
-heartbeat's age, and for each namespace you can read: `waiting` (approved, not
-started), `expiring_soon` (approval ends within an hour), `expired` (the
-approval lapsed before the runner took it), and the age and id of the oldest
-waiting task. Only counts, ages and ids: never command text, parameters or
-targets (`task_get` is still the only place those are read).
+It returns the runner's state (`online`, `stale` or `never_seen`) and, for each namespace you
+can read: `waiting` (approved, not started), `expiring_soon` (approval ends within an hour),
+`expired` (a genuine approval that lapsed before the runner took the task), and the age and id
+of the oldest waiting task. Only counts, ages and ids: never command text, parameters, targets or
+the host name (`task_get` is still the only place those are read). Past 2,000 queued approved
+tasks the counts are "at least" (`truncated: true`).
 
-When commands are waiting and the runner is not online, the same fact is one
-line at the top of `catch_up` (`runner_notice`), in the SessionStart recall
-and on the dashboard, for example:
+**What counts as waiting.** The same rule the runner uses to pick tasks, shared in the code
+(`classifyQueuedCommand`): the task is in the one namespace this runner serves
+(`ONEMEMORY_RUNNER_TASK_NAMESPACE`), is addressed to this runner (`target` = its machine name),
+carries an approval whose signature checks out, is not leased, and is not expired. A command for another
+machine, or in another namespace, is not "waiting" and never triggers the offline notice. The runner
+publishes its machine name, task namespace and beat interval in its heartbeat; the server reads them from
+there (and falls back to its own `ONEMEMORY_RUNNER_ID` / `ONEMEMORY_RUNNER_TASK_NAMESPACE`). A runner
+that has never been seen and has no such settings on the server counts nothing: there is nothing to say
+which machine the commands are for. Expired approvals are shown even when the runner is online, because
+they need a person to approve again. (The runner's rate window is a runtime limit and is not part of the
+count.)
+
+When commands are waiting and the runner is not online, or approvals have expired, the same fact is one
+line at the top of `catch_up` (`runner_notice`), in the SessionStart recall and on the dashboard, for example:
 `Runner offline (last seen 3 h ago): 2 approved commands waiting, 1 expiring within 1 h.`
 
-The runner counts as stale after `ONEMEMORY_RUNNER_STALE_SECONDS` without a
-heartbeat (default `600`, about three missed beats). The store does not hold
-the runner secret, so the heartbeat time here is a hint a token holder could
-forge. To prove the heartbeat is real, use the sign page's "Check a result"
-with the word `heartbeat`. The status shows only the heartbeat's age, not the
-host or process id, and it shows it to any caller who can read a namespace,
-because one runner serves the whole store.
+**How the heartbeat is judged.** The store does not hold the runner secret, so it cannot check the
+signature inside the heartbeat. Instead the time is the server's own timestamp of the heartbeat note (the
+`alive_at` in the body is ignored, so a wrong clock or a forged body cannot make the runner look alive),
+a time in the future is not believed, and only a note stamped `written_by: runner` by the server counts
+(a token holder's note carries their token label; a token named `runner` is stored as `token:runner`).
+A runner older than 1.3.4 stamps no marker and is accepted as before. This is a strong hint, not a proof:
+someone who can write the database file can still fake it; to prove a heartbeat, use the sign page's
+"Check a result" with the word `heartbeat`. It is shown to any caller who can read a namespace, because
+one runner serves the whole store; only its age and state are shown.
+
+The runner counts as stale after `ONEMEMORY_RUNNER_STALE_SECONDS` without a heartbeat (default `600`),
+and never less than three of its own beat intervals, so setting `ONEMEMORY_RUNNER_HEARTBEAT_MS` above
+200000 does not cause a permanent false "offline". Results are cached for 5 seconds while nothing in the
+store changes.
 
 ## Which commands have been handled
 
@@ -295,7 +313,7 @@ do not grow forever. Unclaimed commands are never pruned, however old.
 | `ONEMEMORY_ENABLE_SIGN_PAGE` | *(off)* | Set to `1` on the **API** process to serve `/sign`. |
 | `ONEMEMORY_RUNNER_RETENTION_DAYS` | `30` | Delete handled notes older than this. `0` keeps everything. |
 | `ONEMEMORY_RUNNER_PRUNE_EVERY_MS` | `3600000` | Minimum gap between cleanup sweeps. |
-| `ONEMEMORY_RUNNER_STALE_SECONDS` | `600` | Heartbeat age after which `runner_status` reports the runner stale (30 s - 7 d). Set on the **API/MCP** process. |
+| `ONEMEMORY_RUNNER_STALE_SECONDS` | `600` | Heartbeat age after which `runner_status` reports the runner stale (30 s - 7 d, and never less than three beat intervals). Set on the **API/MCP** process. |
 | `ONEMEMORY_RUNNER_ID` | machine name | This runner's name, matched against a command's `target`. |
 
 ## Honest limits

@@ -50,7 +50,7 @@ import {
   type RunnerDeps,
   type CommandEnvelope,
 } from "./runner.js";
-import { queuedCommandTasks, markCommandRunning, finishCommandTask, taskFromNote, approvalNonce } from "./tasks.js";
+import { queuedCommandTasks, markCommandRunning, finishCommandTask, classifyQueuedCommand, approvalNonce } from "./tasks.js";
 import { audit } from "./security.js";
 
 /** One pass over the queued command tasks. Returns how many were run or failed. */
@@ -68,16 +68,16 @@ export async function pollTasks(deps: RunnerDeps): Promise<number> {
   const queued = queuedCommandTasks(deps.store, ns).reverse();
   for (const note of queued) {
     if (room <= 0) break;
-    const task = taskFromNote(note, deps.store, now);
-    const cmd = task.command;
-    if (!cmd) continue;
-    if (cmd.target !== me) continue; // another machine's task: not ours, leave it alone
-    if (task.approval !== "approved") continue; // unapproved, edited since approval, or forged: never runs
-    // Leases: a command task cannot be claimed (claimTask refuses) and admin
-    // approve/revoke clears any lease, so a live lease on an APPROVED task can
-    // only predate the approval. The runner still respects it (it never
-    // preempts another owner); re-approving clears it.
-    if (task.lease) continue;
+    // The ONE rule shared with the runner-status view (tasks.ts): right
+    // namespace, addressed to this runner (another machine's task is left
+    // alone), approval MAC valid and unexpired (edited since approval, or
+    // forged: never runs), no live lease. A command task cannot be claimed
+    // (claimTask refuses) and approve/revoke clear any lease, so a live lease
+    // on an APPROVED task can only predate the approval; the runner never
+    // preempts another owner, and re-approving clears it.
+    const verdict = classifyQueuedCommand(deps.store, note, { me, namespace: ns }, now);
+    if (verdict.kind !== "runnable") continue;
+    const cmd = verdict.command;
 
     const nonce = approvalNonce(note);
     const cmdId = `task-${note.id}-${nonce}`;
