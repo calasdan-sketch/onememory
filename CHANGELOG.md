@@ -6,7 +6,22 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [1.3.0] - unreleased
+## [1.3.1] - 2026-10-24
+
+Fix release: package name, CI, and Windows. No schema change (still v12).
+
+### Fixed
+- Package name is `onememory-mcp` again everywhere (package.json, lockfile, README, INSTALL, INFRA, docs, publish workflow, the schema-too-new error message). 1.3.0 was published under this name; the repository had been pointing at a scoped name by mistake.
+- `new Store(...)` that throws part-way (corrupt or directory-valued key file, schema newer than the code) now closes the SQLite handle it opened. Before, the file stayed locked, which on Windows made the data directory impossible to delete.
+- Security audit: dependencies updated so `npm audit --audit-level=high` is clean (body-parser, fast-uri, hono via lockfile; `zod` raised to `^4.6.7`, 3.x has no patched release). Type-check and the full test suite pass on zod 4; this is a major-version bump of a direct dependency, so please report any schema-validation difference.
+
+### Tests (Windows CI)
+- Command-task tests allowed only POSIX path characters in the marker parameter, so a `C:\...` temp path was refused by the allowlist pattern and nothing ran. The pattern now allows `:` and `\`. The runner itself already ran commands without a shell; no runner change was needed.
+- Tests that start a child process now wait for it to exit before deleting its directory, and temp-dir cleanup retries (Windows holds files open briefly).
+- The SIGTERM graceful-drain test is skipped on Windows only, which has no SIGTERM (a kill there is a hard terminate). It still runs on Linux and macOS.
+- Windows was not run locally; these fixes are reasoned from the CI log, not executed on Windows.
+
+## [1.3.0] - 2026-10-24
 
 Cross-device / cross-model awareness: every session can see what the others
 did and plan, and a task can now drive the PC's runner. Tasks, handoffs, leases
@@ -150,7 +165,7 @@ with the exceptions listed under "Changed".
 
 ## [1.2.1] - 2026-10-24
 
-**Package renamed:** published on npm as `@decnutz/onememory` (the plain `onememory` name is refused by npm as too similar to `one-memory`; previously `onememory-mcp`, whose earlier releases were withdrawn). The command is still `onememory`.
+**Package name:** the npm package is `onememory-mcp` (the command is `onememory`). An earlier version of this note claimed a rename to a scoped name; that was wrong. Neither the plain `onememory` name nor a scoped name was ever published.
 
 Hardening and honesty release from an independent multi-reviewer pass over
 1.2.0 (crypto and namespaces, data and retention, retrieval and MCP, docs and
