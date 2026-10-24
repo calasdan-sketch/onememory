@@ -6,7 +6,7 @@ MCP-capable agent. They all launch it the same way — a local command over
 
 > **One-time setup first** (Node.js 24+):
 > ```bash
-> npm install -g @decnutz/onememory
+> npm install -g onememory-mcp
 > ```
 > That puts the `onememory` command on your PATH; every client below runs
 > `onememory mcp`. Your memory lives in `~/.onememory` (override with

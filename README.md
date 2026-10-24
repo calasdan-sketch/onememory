@@ -3,7 +3,7 @@
 **One small, self-hosted memory store that every AI agent you use can share — over MCP or plain REST, from your desktop, the web, or your phone.**
 
 [![CI](https://github.com/calasdan-sketch/onememory/actions/workflows/ci.yml/badge.svg)](https://github.com/calasdan-sketch/onememory/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/@decnutz/onememory)](https://www.npmjs.com/package/@decnutz/onememory)
+[![npm](https://img.shields.io/npm/v/onememory-mcp)](https://www.npmjs.com/package/onememory-mcp)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Node](https://img.shields.io/badge/node-%3E%3D24-green)
 
@@ -21,7 +21,7 @@ that speaks MCP or HTTP.
 > `node -v`. Can't upgrade? Use [Docker](#docker) instead.
 
 ```bash
-npm i -g @decnutz/onememory                           # 1. install
+npm i -g onememory-mcp                           # 1. install
 claude mcp add onememory -- onememory mcp        # 2. wire it into Claude Code (stdio)
 onememory doctor                                 # 3. verify Node, database, token
 ```
@@ -31,7 +31,7 @@ and in a fresh chat ask "what port is my staging server on?". Step 4, only
 if you want the dashboard, REST API and MCP-over-HTTP (the `curl` examples
 below need it): `onememory start`.
 
-No global install: `claude mcp add onememory -- npx -y @decnutz/onememory mcp`.
+No global install: `claude mcp add onememory -- npx -y onememory-mcp mcp`.
 `onememory init` prints the config for Claude Desktop / Cursor / Copilot;
 [INSTALL.md](./INSTALL.md) has every client.
 
