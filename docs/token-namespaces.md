@@ -83,7 +83,7 @@ token pinned to `shared` can write to `work` (grants never confer write).
 
 ## Isolation guarantees
 
-Verified in [test/token-namespace.test.ts](../test/token-namespace.test.ts):
+Verified in `test/token-namespace.test.ts` (in the source repository):
 
 - A pinned token **writes only to its namespace**, even if the body carries a
   different `namespace` field.
@@ -108,7 +108,7 @@ outside its namespace; a prompt-injected agent being told to "read the
 **Does not protect against:** an attacker who already holds the *primary*
 token (that is full access by design); a malicious operator editing
 `tokens.json` (they own the box); traffic analysis on an unencrypted tunnel
-(put TLS in front — see [INFRA.md](./INFRA.md)); or a compromised server
+(put TLS in front — see [INFRA.md](../INFRA.md)); or a compromised server
 process (it holds the database and every key).
 
 **Not a substitute for encryption at rest.** Namespace permissions control

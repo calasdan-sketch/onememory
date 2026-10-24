@@ -612,9 +612,12 @@ function janitorPool(store: Store, opts: JanitorOptions): NoteRecord[] {
   // Live notes only: archived notes are "forgotten but restorable"; the
   // janitor must never merge-and-delete them (that resurrects the content as
   // a live note and destroys the archive entry).
-  return opts.ownNamespace
-    ? store.exportAll({ live: true }).filter((n) => n.namespace === opts.ownNamespace)
-    : store.exportAll({ live: true });
+  // Notes touched by a distrusted writer never enter the pool: merging a
+  // distrusted copy of a trusted note would make the merged note hidden and
+  // the trusted original vanish from every default read.
+  const live = store.exportAll({ live: true });
+  const visible = store.filterVisible(live);
+  return opts.ownNamespace ? visible.filter((n) => n.namespace === opts.ownNamespace) : visible;
 }
 
 /**
@@ -702,6 +705,16 @@ export function consolidateNotes(
   const expectedRevs = new Map(notes.map((n) => [n.id, n.rev]));
   const deleteSources = opts.deleteSources !== false;
   const sourceIds = new Set(notes.map((n) => n.id));
+  // A merge of a distrusted note with a trusted one would hide the trusted
+  // text (the merged note carries every source's writers) and, with
+  // deleteSources, remove the trusted original. Refuse; merge like with like.
+  const flags = notes.map((n) => store.isDistrusted(n));
+  if (flags.some(Boolean) && !flags.every(Boolean)) {
+    throw new ValidationError(
+      "cannot consolidate: some of these notes were touched by a distrusted writer and some were not, so the merged note would be hidden " +
+        "(and the trusted originals lost from every default read). Consolidate the distrusted ones together, or leave them out."
+    );
+  }
 
   return store.transaction(() => {
     // Re-read every source inside the transaction: the ids were validated

@@ -100,8 +100,8 @@ immediately visible through the others:
 | `task_get` | read | One task in full (notes, command, approval state, result) |
 | `task_list` | read | List tasks (default: all but done), filter by status/owner/parent |
 | `task_claim` | write | Take / heartbeat / release a task with a lease (compare-and-swap) |
-| `task_approve` | admin | Approve (or revoke) a command task for the PC's runner ([RUNNER.md](./RUNNER.md)) |
-| `runner_status` | read | Is the PC's runner listening, and how many approved commands are waiting / expiring / expired ([RUNNER.md](./RUNNER.md)) |
+| `task_approve` | admin | Approve (or revoke) a command task for the PC's runner ([RUNNER.md](https://github.com/calasdan-sketch/onememory/blob/main/docs/RUNNER.md)) |
+| `runner_status` | read | Is the PC's runner listening, and how many approved commands are waiting / expiring / expired ([RUNNER.md](https://github.com/calasdan-sketch/onememory/blob/main/docs/RUNNER.md)) |
 | `session_handoff` | write | Leave a structured handoff (done / pending / decisions / next step) |
 | `catch_up` | read | One call: changes since this consumer last looked + open tasks (compact) + latest handoffs |
 | `memory_ack` | read | Confirm a manual-ack change-feed page (`ack_token`) |
@@ -134,7 +134,7 @@ MCP `state_read` `neighbors` option.
 
 This plain REST API is also how non-agent tools plug in. **n8n**, for
 example, can read and write the store via an HTTP Request node (or its MCP
-Client node) — see [INFRA.md](./INFRA.md) § "Use with n8n".
+Client node) — see [INFRA.md](../INFRA.md) § "Use with n8n".
 
 `GET /changes` mirrors `memory_since` (read scope; see [change-feed.md](./change-feed.md)); it requires a `since` parameter and answers `400` without one. `&wait=<0-55>` holds the request open until something changes ([live wait](./change-feed.md#live-wait)).
 `POST /tasks` · `PUT /tasks/:id` · `GET /tasks` · `GET /tasks/:id` · `POST /tasks/:id/claim` · `POST /tasks/:id/approve` (admin) · `POST /handoffs` · `GET /handoffs` · `GET /catch-up` · `POST /ack` are the REST side of the task board, handoffs, catch-up and acknowledged reads ([tasks.md](./tasks.md), [change-feed.md](./change-feed.md)); writes need write scope, reads read scope, and namespaces apply as for `/notes`.

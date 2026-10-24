@@ -9,7 +9,7 @@ import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { DatabaseSync } from "node:sqlite";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -422,8 +422,12 @@ describe("MCP tools", () => {
     assert.equal(list.notes.length, 0);
     const list2 = parseTool(await cursor.callTool({ name: "state_list", arguments: { written_by: "cursor" } }));
     assert.equal(list2.notes.length, 1);
+    // not_written_by means "nothing claude-code touched": cursor rewrote claude-code's note, so the note
+    // still carries claude-code's content in its history (1.4.1: the previous writer joins the taint set)
     const search = parseTool(await code.callTool({ name: "state_search", arguments: { query: "GraphQL", not_written_by: "claude-code" } }));
-    assert.equal(search.results.length, 1);
+    assert.equal(search.results.length, 0);
+    const search2 = parseTool(await code.callTool({ name: "state_search", arguments: { query: "GraphQL", not_written_by: "someone-else" } }));
+    assert.equal(search2.results.length, 1);
     const since = parseTool(await code.callTool({ name: "memory_since", arguments: { since: "1h", written_by: "cursor" } }));
     assert.equal(since.changes.length, 1);
     assert.equal(since.changes[0].written_by, "cursor");
@@ -696,11 +700,21 @@ describe("upgrade safety", () => {
       const copy = new DatabaseSync(bak, { readOnly: true });
       assert.equal((copy.prepare("SELECT COUNT(*) AS n FROM notes").get() as any).n, 1);
       copy.close();
-      // a second upgrade must not replace the original copy
-      writeFileSync(bak, "SENTINEL");
+      // a second upgrade keeps a VALID existing copy (it is the original pre-upgrade state) ...
+      const before = readFileSync(bak);
       downgradeTo(path, 12);
       new Store(path).close();
-      assert.equal(readFileSync(bak, "utf8"), "SENTINEL");
+      assert.ok(readFileSync(bak).equals(before), "a valid copy is not replaced");
+      assert.ok(logged.some((l) => /keeping the existing pre-upgrade copy/.test(l)));
+      // ... but a garbage, zero-byte or truncated one is NOT a backup: it is replaced, never trusted
+      for (const junk of [Buffer.from("SENTINEL"), Buffer.alloc(0), before.subarray(0, 1000)]) {
+        writeFileSync(bak, junk);
+        downgradeTo(path, 12);
+        new Store(path).close();
+        assert.equal(Store.peekSchemaVersion(bak), 12, `replaced a ${junk.length}-byte stale copy`);
+        assert.ok(Store.verifyBackupFile(bak).ok);
+      }
+      assert.deepEqual(readdirSync(dir).filter((f) => f.endsWith(".partial")), [], "no .partial left behind");
     } finally {
       console.error = realError;
       rmSync(dir, { recursive: true, force: true });

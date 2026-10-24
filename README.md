@@ -224,8 +224,8 @@ encryption of note bodies. See [SECURITY.md](./SECURITY.md) for what it does
 | `memory_since` | read | change feed (`wait_seconds` = live wait) |
 | `task_put` / `task_list` / `task_get` | write / read / read | shared task board across devices and models; `client_key` makes a create retry-safe |
 | `task_claim` | write | take / heartbeat / release a task with a lease (compare-and-swap) |
-| `task_approve` | admin | approve a command task so the PC's runner may run it ([RUNNER.md](./docs/RUNNER.md)) |
-| `runner_status` | read | is the PC's runner listening, and how many approved commands are waiting for it (`onememory runner-status`, `GET /runner/status`; [RUNNER.md](./docs/RUNNER.md)) |
+| `task_approve` | admin | approve a command task so the PC's runner may run it ([RUNNER.md](https://github.com/calasdan-sketch/onememory/blob/main/docs/RUNNER.md)) |
+| `runner_status` | read | is the PC's runner listening, and how many approved commands are waiting for it (`onememory runner-status`, `GET /runner/status`; [RUNNER.md](https://github.com/calasdan-sketch/onememory/blob/main/docs/RUNNER.md)) |
 | `session_handoff` / `catch_up` | write / read | leave a handoff; one-call catch-up at session start |
 | `memory_ack` | read | confirm a manual-ack change-feed page |
 | `memory_stats` | read | totals, most-read, never-read, stale |

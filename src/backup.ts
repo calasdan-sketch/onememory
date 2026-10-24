@@ -12,6 +12,7 @@ import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Store } from "./store.js";
 import { keyPath } from "./crypto.js";
+import { attestKeyPath, peekSigningKey } from "./attest.js";
 
 export interface BackupResult {
   dir: string;
@@ -21,13 +22,17 @@ export interface BackupResult {
   key: string | null;
   /** True when the command-task approval key was copied into the backup (--include-approval-key). */
   approvalKey: boolean;
+  /** Path of the copied attestation signing key (--include-attest-key), or null. */
+  attestKey: string | null;
+  /** True when the database has an attestation key that was NOT copied (a restore gets a new identity). */
+  attestKeyLeftOut: boolean;
 }
 
 export function backupStore(
   store: Store,
   dbPath: string,
   outDir: string,
-  opts: { includeApprovalKey?: boolean } = {}
+  opts: { includeApprovalKey?: boolean; includeAttestKey?: boolean } = {}
 ): BackupResult {
   const dir = resolve(outDir);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -73,6 +78,20 @@ export function backupStore(
       /* windows */
     }
   }
+  // The attestation signing key is the server's signing identity. A database restored without it
+  // keeps its server_id but mints a NEW key: peers that trusted the old key reject its exports, and
+  // this server can no longer recognise its own earlier signed exports. Copy it on request only.
+  let attestKey: string | null = null;
+  const hasAttestKey = peekSigningKey(dirname(dbPath)) !== null;
+  if (hasAttestKey && opts.includeAttestKey) {
+    attestKey = join(dir, ".attest-key");
+    copyFileSync(attestKeyPath(dirname(dbPath)), attestKey);
+    try {
+      chmodSync(attestKey, 0o600);
+    } catch {
+      /* windows */
+    }
+  }
   writeFileSync(
     join(dir, "README.txt"),
     [
@@ -89,9 +108,23 @@ export function backupStore(
       opts.includeApprovalKey
         ? "approval key INCLUDED (--include-approval-key): whoever holds this folder AND can write to a live store can mint\ncommand-task approvals. Guard it like the .key."
         : "approval key NOT included: command-task approvals in a restored copy read as stale (fail closed); an admin\nre-approves the tasks that are still queued.",
+      attestKey
+        ? ".attest-key INCLUDED (--include-attest-key): the server's signing identity. Guard it like the .key; two live servers must\nnever share it. Restore it beside state.db to keep the same signing identity."
+        : hasAttestKey
+          ? "attestation key NOT included (--include-attest-key copies it): a restored copy keeps its server_id but creates a NEW signing\nkey on first use, so peers that trusted the old key must be given the new one (`onememory trust identity`)."
+          : "(no attestation key yet: none was ever created)",
       "",
     ].join("\n"),
     { mode: 0o600 }
   );
-  return { dir, db, bytes: statSync(db).size, notes, key, approvalKey: Boolean(opts.includeApprovalKey) };
+  return {
+    dir,
+    db,
+    bytes: statSync(db).size,
+    notes,
+    key,
+    approvalKey: Boolean(opts.includeApprovalKey),
+    attestKey,
+    attestKeyLeftOut: hasAttestKey && !attestKey,
+  };
 }

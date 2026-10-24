@@ -175,6 +175,12 @@ export interface WaitingCommand {
 export interface RunnerIdentity {
   me: string;
   namespace: string;
+  /**
+   * True for a runner that has not said which namespace it serves (never sent a
+   * heartbeat, or an older one): then `namespace` is "" and a command is judged in
+   * its own namespace. Status counting only; the runner itself always knows its namespace.
+   */
+  unconfirmed?: boolean;
 }
 
 /**
@@ -224,7 +230,7 @@ export function classifyQueuedCommand(
 ): QueuedVerdict {
   const cmd = parseBody(n.body).command;
   if (!cmd) return { kind: "skip", why: "not_command" };
-  if (!who.namespace || n.namespace !== who.namespace) return { kind: "skip", why: "other_namespace" };
+  if (who.unconfirmed ? false : !who.namespace || n.namespace !== who.namespace) return { kind: "skip", why: "other_namespace" };
   if (cmd.target !== who.me) return { kind: "skip", why: "other_target" };
   if (distrusted(n)) return { kind: "skip", why: "distrusted" };
   const m = APPROVAL_RE.exec(stateOf(n).approval ?? "");
@@ -292,9 +298,4 @@ export function scanWaitingCommands(
   if (!who.namespace) return { items: [], truncated: false };
   if (namespaces && !namespaces.includes(who.namespace)) return { items: [], truncated: false };
   return scanQueuedCommands(store, () => who, [who.namespace], now, maxTotal);
-}
-
-/** Back-compat wrapper: the waiting list only. */
-export function waitingCommandTasks(store: Store, who: RunnerIdentity, namespaces?: string[], now = Date.now(), maxTotal = 2_000): WaitingCommand[] {
-  return scanWaitingCommands(store, who, namespaces, now, maxTotal).items;
 }

@@ -13,6 +13,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -97,7 +98,7 @@ export function privateDir(dir: string): void {
 }
 
 /** The data-dir files that hold notes or credentials: owner read/write only. */
-export const PRIVATE_FILES = ["state.db", "state.db-wal", "state.db-shm", "audit.log", ".token", "tokens.json", "spaces.json", ".key"];
+export const PRIVATE_FILES = ["state.db", "state.db-wal", "state.db-shm", "audit.log", ".token", "tokens.json", "spaces.json", ".key", ".attest-key"];
 
 /**
  * Run fn holding an exclusive lock file (created with O_EXCL, so only one
@@ -200,6 +201,11 @@ export function prepareDataDir(): void {
     // The encryption key lives beside the database or at ONEMEMORY_KEY_FILE.
     chmodQuiet(join(dirname(DB_PATH), ".key"), 0o600);
     if (process.env.ONEMEMORY_KEY_FILE) chmodQuiet(process.env.ONEMEMORY_KEY_FILE, 0o600);
+    // The attestation signing key (a sync tool or a restore may have left it 0644) and any pre-upgrade copy of the database.
+    if (process.env.ONEMEMORY_ATTEST_KEY_FILE) chmodQuiet(process.env.ONEMEMORY_ATTEST_KEY_FILE, 0o600);
+    for (const f of readdirSync(dirname(DB_PATH))) {
+      if (/^state\.db\.pre-v\d+-backup(\.\d+\.partial)?$/.test(f) || f === ".attest-key") chmodQuiet(join(dirname(DB_PATH), f), 0o600);
+    }
   } catch {
     /* read-only or foreign-owned dir: hardening is best-effort */
   }

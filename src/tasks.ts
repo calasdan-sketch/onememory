@@ -25,6 +25,7 @@ import { Store, ValidationError, QuarantinedError, DEFAULT_NAMESPACE, type NoteR
 import { runChanges, type ChangesResponse } from "./changes.js";
 import { RESERVED_TAG_PREFIX } from "./reserved-tags.js";
 import { runnerNotice } from "./liveness.js";
+import { currentWriter } from "./actor.js";
 import {
   TASK_STATUSES,
   TASK_TAG,
@@ -61,7 +62,6 @@ export {
   classifyQueuedCommand,
   scanQueuedCommands,
   scanWaitingCommands,
-  waitingCommandTasks,
   envRunnerId,
   envRunnerTaskNamespace,
 } from "./task-core.js";
@@ -421,6 +421,26 @@ function assertNoCycle(store: Store, selfId: number, parentId: number): void {
   }
 }
 
+
+/**
+ * Idempotent-create lookup (client_key). A retry must find ITS OWN earlier
+ * task, never another writer's: the key is a convenience, not a claim on the
+ * namespace. Visible hits win (anyone's visible task is a legitimate replay of
+ * the same key); a hit hidden by the distrust list counts only for the writer
+ * that wrote it (a distrusted client retrying its own create). Another
+ * writer's hidden hit is ignored, so a distrusted token cannot pre-squat a
+ * key, have its text "replayed" into a trusted agent's context, or block the
+ * trusted write.
+ */
+function ckeyHit(store: Store, namespace: string, kindTag: string, ckeyTagValue: string): NoteRecord | undefined {
+  const hits = store.list({ namespace, limit: 50, withTags: [kindTag, `${TAG_CKEY}${ckeyTagValue}`], includeDistrusted: true }).notes;
+  if (hits.length === 0) return undefined;
+  const visible = store.filterVisible(hits);
+  if (visible.length) return visible[0];
+  const me = currentWriter();
+  return hits.find((h) => me !== "" && h.written_by === me);
+}
+
 /** Run fn in one write transaction, but let a quarantine (which is a stored result) commit. */
 function inTransaction<T>(store: Store, fn: () => T): T {
   let quarantined: QuarantinedError | null = null;
@@ -523,6 +543,8 @@ export function putTask(
     ) {
       throw new TaskNotFoundError(`no task with id ${input.id}`);
     }
+    // A task a distrusted writer wrote reads as missing here too: an update would echo its text back.
+    if (store.isDistrusted(existing)) throw new TaskNotFoundError(`no task with id ${input.id}`);
     const cur = stateOf(existing);
     const curBody = parseBody(existing.body);
     const next: TaskState = { ...cur };
@@ -641,8 +663,7 @@ export function putTask(
   // retries (even from two processes) cannot both create.
   let replay = false;
   const note = inTransaction(store, () => {
-    // includeDistrusted: an idempotent retry must find its own task even if the writer was distrusted since.
-    const hit = store.list({ namespace, limit: 1, withTags: [TASK_TAG, `${TAG_CKEY}${s0.ckey}`], includeDistrusted: true }).notes[0];
+    const hit = ckeyHit(store, namespace, TASK_TAG, s0.ckey as string);
     if (hit) {
       replay = true;
       return hit;
@@ -727,13 +748,11 @@ function distrustedTaskError(id: number): ValidationError {
  */
 export function getTask(store: Store, id: number, namespaces?: string[], opts: { includeDistrusted?: boolean } = {}): Task {
   if (!Number.isInteger(id) || id < 1) throw new ValidationError("id must be a positive integer");
-  const n = store.read(id);
+  const n = store.readVisible(id, { includeDistrusted: opts.includeDistrusted === true });
   if (!n || n.archived_at || !isTaskNote(n) || (namespaces !== undefined && !namespaces.includes(n.namespace))) {
     throw new TaskNotFoundError(`no task with id ${id}`);
   }
-  const flagged = store.markDistrusted([n])[0];
-  if (flagged.distrusted && !opts.includeDistrusted) throw new TaskNotFoundError(`no task with id ${id}`);
-  return taskFromNote(opts.includeDistrusted ? flagged : n, store);
+  return taskFromNote(n, store);
 }
 
 // ---- Claim / lease --------------------------------------------------------------
@@ -1102,7 +1121,7 @@ export function writeHandoff(
   }
   let replay = false;
   const note = inTransaction(store, () => {
-    const hit = store.list({ namespace, limit: 1, withTags: [HANDOFF_TAG, `${TAG_CKEY}${ck}`], includeDistrusted: true }).notes[0];
+    const hit = ckeyHit(store, namespace, HANDOFF_TAG, ck);
     if (hit) {
       replay = true;
       return hit;

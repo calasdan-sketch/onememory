@@ -53,12 +53,15 @@ function usage(): void {
       "  changes --purge             delete the whole change log (titles of past changes) and all markers",
       "            What changed while you were away: created/updated/deleted notes",
       "            grouped by source. --since last uses (and advances) a per-consumer marker.",
-      "  backup [--out <dir>] [--include-approval-key]",
+      "  backup [--out <dir>] [--include-approval-key] [--include-attest-key] | backup --prune-premigration",
       "            Consistent hot copy of the database (works while the server runs)",
       "            into <dir>/state.db, plus a copy of the encryption key (.key) if",
       "            at-rest encryption is on. Default dir: ./onememory-backup-<time>.",
       "            WARNING: store the key SEPARATELY from the backup; a backup without",
       "            its key is unreadable, and one stored with it is not encrypted.",
+      "            --include-attest-key also copies the signing key (.attest-key) so a restore keeps",
+      "            this server's signing identity. --prune-premigration deletes the copies an",
+      "            upgrade left next to the database (<db>.pre-v*-backup).",
       "            When: before upgrades, and on a schedule.",
       "  runner-status [--namespace ns] [--json]",
       "            Is the PC's command runner listening, and how many approved commands are",
@@ -70,18 +73,20 @@ function usage(): void {
       "            With --exec, runs <program> (no shell) per batch with the changes as",
       "            JSON on stdin and ONEMEMORY_CHANGE_COUNT in the environment.",
       "            When: you want a script or notifier to react to a phone/other-session write.",
-      "  export --format md --dir <path> [--namespace ns] [--no-prune] [--force]",
+      "  export --format md --dir <path> [--namespace ns] [--no-prune] [--force] [--include-distrusted]",
       "            Write one Markdown file per note (YAML front-matter) into",
       "            namespace folders. Deterministic and git-friendly; prunes",
       "            files of deleted notes it wrote earlier (--no-prune keeps them).",
-      "  export --format json [--out file] [--no-attest]",
-      "            Full JSON backup (same shape as GET /export) to stdout or a file, with this",
-      "            server's signed per-note attestations (--no-attest leaves them out).",
-      "  import --file backup.json [--dedupe]",
+      "  export --format json [--out file] [--attest]",
+      "            Full JSON backup (same shape as GET /export) to stdout or a file: {\"notes\": [...]},",
+      "            as in every release before 1.4.0. --attest adds an `export` header (this server and",
+      "            its public key) and a signed attestation per note, for another server to verify.",
+      "  import --file backup.json [--dedupe] [--json]",
       "            Restore a JSON backup. Notes whose attestation verifies against a trusted key",
       "            keep their original writer; everything else is stamped as imported by 'cli'.",
       "  trust [list | identity | distrust <writer> [--namespace ns|*] | undistrust <writer> [--namespace ns|*]",
-      "         | attester-add <public-key> [--server-id id] [--label text] | attester-remove <key-id>] [--json]",
+      "         | attester-add <public-key> --server-id id [--label text] [--not-after time] [--any-server]",
+      "         | attester-remove <key-id> | export-key --out file | rotate] [--json]   (onememory trust --help)",
       "            The trust policy: writers whose notes are left out of every read (and never run),",
       "            and the other servers whose signed exports an import will believe. See docs/trust.md.",
       "  import --dir <path> [--dry-run] [--allow-move]",
@@ -172,6 +177,29 @@ async function doctor(): Promise<void> {
   } catch (e) {
     dbProblem = true;
     warn("database problem: " + (e as Error).message);
+  }
+
+  // Pre-upgrade copies (`<db>.pre-v*-backup`) hold the notes as they were before an upgrade, outside
+  // retention, deletes and at-rest encryption. Say that they exist, how big and how old, and how to remove them.
+  for (const b of Store.preMigrationBackups(DB_PATH)) {
+    const mb = (b.bytes / 1e6).toFixed(1);
+    warn(
+      `pre-upgrade copy ${b.path} (${mb} MB, ${b.age_days} day(s) old). It still holds notes you may since have deleted or encrypted. ` +
+        "Keep it until you have checked the upgrade, then remove it: onememory backup --prune-premigration"
+    );
+  }
+  try {
+    const { peekSigningKey, attestKeyPath } = await import("./attest.js");
+    const { dirname } = await import("node:path");
+    const { statSync } = await import("node:fs");
+    const kp = attestKeyPath(dirname(DB_PATH));
+    if (peekSigningKey(dirname(DB_PATH))) {
+      const mode = statSync(kp).mode & 0o077;
+      if (process.platform !== "win32" && mode !== 0) warn(`${kp} is readable by other users (it is tightened to 0600 when the server starts)`);
+      else ok(`attestation key present (${kp}); back it up with --include-attest-key if you rely on signed exports`);
+    }
+  } catch {
+    /* no key yet */
   }
 
   try {
@@ -713,6 +741,13 @@ function parseFlags(
 ): { flags: Record<string, string | true>; rest: string[] } {
   const flags: Record<string, string | true> = {};
   const rest: string[] = [];
+  // A value is never swallowed from a KNOWN following flag (`--label --any-server` is a missing value), but a value
+  // that merely starts with "--" (a base64url key can) is still a value.
+  const looksLikeFlag = (t: string): boolean => {
+    if (!t.startsWith("--") || t.length <= 2) return false;
+    const n = t.slice(2, t.indexOf("=") > 0 ? t.indexOf("=") : undefined);
+    return spec.values.includes(n) || spec.bools.includes(n);
+  };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--") {
@@ -724,7 +759,7 @@ function parseFlags(
     const name = a.startsWith("--") ? (eq > 0 ? a.slice(2, eq) : a.slice(2)) : null;
     if (name && spec.values.includes(name)) {
       if (eq > 0) flags[name] = a.slice(eq + 1);
-      else if (i + 1 < args.length) flags[name] = args[++i];
+      else if (i + 1 < args.length && !looksLikeFlag(args[i + 1])) flags[name] = args[++i];
       else {
         console.error(`Missing value for --${name}`);
         process.exit(1);
@@ -746,18 +781,44 @@ async function backupCmd(): Promise<void> {
   const { DB_PATH } = await import("./config.js");
   const { Store } = await import("./store.js");
   const { backupStore } = await import("./backup.js");
-  const { flags } = parseFlags(process.argv.slice(3), { values: ["out"], bools: ["include-approval-key"] });
+  const { flags } = parseFlags(process.argv.slice(3), { values: ["out"], bools: ["include-approval-key", "include-attest-key", "prune-premigration"] });
+  if (flags["prune-premigration"] === true) {
+    // Remove the copies the upgrade made (`<db>.pre-v*-backup`): they hold the notes as they were before
+    // the upgrade, including any deleted or forgotten since, and are outside encryption and retention.
+    const { unlinkSync } = await import("node:fs");
+    const found = Store.preMigrationBackups(DB_PATH);
+    if (found.length === 0) {
+      console.log("No pre-upgrade copies found next to the database.");
+      return;
+    }
+    for (const f of found) {
+      unlinkSync(f.path);
+      console.log(`Removed ${f.path} (${f.bytes} bytes, ${f.age_days} day(s) old).`);
+    }
+    return;
+  }
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*$/, "").replace("T", "-");
   const out = str(flags.out) ?? `onememory-backup-${stamp}`;
   const store = new Store(DB_PATH);
   try {
-    const r = backupStore(store, DB_PATH, out, { includeApprovalKey: flags["include-approval-key"] === true });
+    const r = backupStore(store, DB_PATH, out, {
+      includeApprovalKey: flags["include-approval-key"] === true,
+      includeAttestKey: flags["include-attest-key"] === true,
+    });
     console.log(`Backed up ${r.notes} note(s) (${r.bytes} bytes) to ${r.db}`);
     console.log(
       r.approvalKey
         ? "Included the command-task approval key (--include-approval-key): guard this backup like the encryption key."
         : "The command-task approval key was NOT copied: after a restore, existing approvals read as stale (fail closed) and an admin re-approves queued command tasks."
     );
+    if (r.attestKey) {
+      console.log(`Included the attestation signing key (--include-attest-key): guard this backup like the encryption key.`);
+    } else if (r.attestKeyLeftOut) {
+      console.log(
+        "The attestation signing key (.attest-key) was NOT copied: a restore keeps the server_id but creates a NEW signing key, so peers that\n" +
+          "trusted the old one must be told the new key. Use --include-attest-key to keep the identity."
+      );
+    }
     if (r.key) {
       console.log(`Copied the encryption key to ${r.key} (mode 0600).`);
       console.log(
@@ -936,7 +997,8 @@ async function exportCmd(): Promise<void> {
   const { Store } = await import("./store.js");
   const { flags } = parseFlags(process.argv.slice(3), {
     values: ["format", "dir", "namespace", "out"],
-    bools: ["no-prune", "force", "no-attest"],
+    // --no-attest is accepted and does nothing: attestations are opt-in (--attest) since 1.4.1.
+    bools: ["no-prune", "force", "attest", "no-attest", "include-distrusted"],
   });
   const format = str(flags.format) ?? (str(flags.dir) ? "md" : undefined);
   const { EXPORT_PAGE_SIZE } = await import("./store.js");
@@ -965,10 +1027,12 @@ async function exportCmd(): Promise<void> {
       const write = (s: string): Promise<void> =>
         out.write(s) ? Promise.resolve() : new Promise((r) => out.once("drain", r));
 
-      // Header + attestations (see attest.ts). If the signing key cannot be
-      // created the backup is still written, without them: a backup must not
-      // fail over a signature.
-      let attest = flags["no-attest"] !== true;
+      // Attestations are OPT-IN (--attest): without it the file is byte-compatible with
+      // every release before 1.4.0, `{"notes": [...]}`. With it, an `export` header
+      // (this server and its public key) and a signed attestation per note (see
+      // attest.ts). If the signing key cannot be created the backup is still
+      // written, without them: a backup must not fail over a signature.
+      let attest = flags.attest === true;
       let header = "";
       if (attest) {
         try {
@@ -1006,8 +1070,8 @@ async function exportCmd(): Promise<void> {
       return;
     }
     if (format !== "md" || !str(flags.dir)) {
-      console.error("Usage: onememory export --format md --dir <path> [--namespace ns] [--no-prune] [--force]");
-      console.error("       onememory export --format json [--out file]");
+      console.error("Usage: onememory export --format md --dir <path> [--namespace ns] [--no-prune] [--force] [--include-distrusted]");
+      console.error("       onememory export --format json [--out file] [--attest]");
       process.exit(1);
     }
     const { exportMarkdown } = await import("./sync.js");
@@ -1015,6 +1079,7 @@ async function exportCmd(): Promise<void> {
       namespace: str(flags.namespace),
       prune: !flags["no-prune"],
       force: flags.force === true,
+      includeDistrusted: flags["include-distrusted"] === true,
     });
     console.log(
       `Exported ${r.notes} note(s) to ${r.dir}: ${r.written} written, ${r.unchanged} unchanged, ${r.removed} removed.`
@@ -1090,16 +1155,19 @@ async function importCmd(): Promise<void> {
 async function importJsonFile(file: string, dedupe: boolean, json: boolean): Promise<void> {
   const { DB_PATH } = await import("./config.js");
   const { Store, ValidationError, attestationsToShow } = await import("./store.js");
+  const { printable } = await import("./security.js");
   const { readFileSync } = await import("node:fs");
   let parsed: { notes?: unknown };
   try {
-    parsed = JSON.parse(readFileSync(file, "utf8"));
+    const v = JSON.parse(readFileSync(file, "utf8")) as unknown;
+    // Both shapes: {"notes":[...]} (every release; with an `export` header when attested) and a bare [...].
+    parsed = Array.isArray(v) ? { notes: v } : (v as { notes?: unknown });
   } catch (e) {
     console.error(`Cannot read ${file}: ${(e as Error).message}`);
     process.exit(1);
   }
   if (!parsed || !Array.isArray(parsed.notes)) {
-    console.error("Expected a JSON file shaped like { \"notes\": [...] }");
+    console.error("Expected a JSON file shaped like { \"notes\": [...] } (or a bare array of notes)");
     process.exit(1);
   }
   const store = new Store(DB_PATH);
@@ -1114,15 +1182,16 @@ async function importJsonFile(file: string, dedupe: boolean, json: boolean): Pro
     const a = attestationsToShow(report.attestations);
     if (a) {
       console.log(`Attestations: ${a.verified} verified, ${a.unverified} unverified (stamped as imported by this command).`);
-      for (const [why, n] of Object.entries(a.reasons)) console.log(`  ${n} x ${why}`);
+      for (const [why, n] of Object.entries(a.reasons)) console.log(`  ${n} x ${printable(why)}`);
       for (const k of a.untrusted_keys) {
-        console.log(`  key ${k.key_id} (server ${k.server_id}) signed ${k.notes} note(s) but is not trusted. If you know it: onememory trust attester-add --public-key <public-key> --server-id ${k.server_id}`);
+        // key_id / server_id come from the file: shown quoted and stripped of control characters, never as part of a command to paste.
+        console.log(`  key ${printable(k.key_id)} (server ${printable(k.server_id)}) signed ${k.notes} note(s) but is not trusted. To trust it you must get its public key from that server's admin (onememory trust identity there).`);
       }
     }
     if (report.quarantined.length) console.log(`${report.quarantined.length} note(s) held by the linter (onememory quarantine).`);
     if (report.rejected.length) {
       console.error(`${report.rejected.length} note(s) rejected:`);
-      for (const r of report.rejected) console.error(`  ${r.title}: ${r.error}`);
+      for (const r of report.rejected) console.error(`  ${printable(r.title)}: ${printable(r.error)}`);
       process.exitCode = 1;
     }
   } catch (e) {
@@ -1136,40 +1205,110 @@ async function importJsonFile(file: string, dedupe: boolean, json: boolean): Pro
   }
 }
 
+function trustHelp(): void {
+  console.log(
+    [
+      "onememory trust: whom this store does not believe.",
+      "",
+      "  trust [list] [--json]                    the distrust list, trusted attesters, recent changes, this server's id",
+      "  trust identity [--json]                  this server's id and public key (creates the signing key if needed)",
+      "  trust distrust <writer> --namespace <ns|'*'>     leave a writer's notes out of every read and never run them",
+      "  trust undistrust <writer> --namespace <ns|'*'>",
+      "        <writer> is a token label, or a writer id <server_id>/<label>. Quote the star: --namespace '*'.",
+      "  trust attester-add <public-key> --server-id <id> [--label text] [--not-after <ISO time>] [--any-server]",
+      "        Believe signed exports from that server. A key is trusted for ONE server (--server-id);",
+      "        --any-server accepts a key for any server id (discouraged). --not-after ends trust for",
+      "        exports signed after that time (planned rotation). A key starting with '-': --public-key <key>.",
+      "  trust attester-remove <key-id>",
+      "  trust export-key --out <file>            copy this server's signing key (mode 0600) to move its identity",
+      "  trust rotate                             make a new signing key; the old one is kept as <key file>.<id>.old",
+      "",
+      "See docs/trust.md.",
+    ].join("\n")
+  );
+}
+
 // `onememory trust ...`: the trust policy (docs/trust.md). Local, like every CLI command.
 async function trustCmd(): Promise<void> {
+  const args = process.argv.slice(3);
+  if (args.some((a) => a === "--help" || a === "-h") || args[0] === "help") {
+    trustHelp();
+    return;
+  }
   const { DB_PATH } = await import("./config.js");
   const { Store, ValidationError } = await import("./store.js");
-  const { flags, rest } = parseFlags(process.argv.slice(3), {
-    values: ["namespace", "server-id", "label", "public-key", "writer", "key-id"],
-    bools: ["json"],
+  const { flags, rest } = parseFlags(args, {
+    values: ["namespace", "server-id", "label", "public-key", "writer", "key-id", "not-after", "out"],
+    bools: ["json", "any-server"],
   });
   const action = rest[0] ?? "list";
+  const known = ["list", "identity", "distrust", "undistrust", "attester-add", "attester-remove", "export-key", "rotate"];
+  if (!known.includes(action)) {
+    console.error(`Unknown trust action: ${action}\n`);
+    trustHelp();
+    process.exit(1);
+  }
+  const maxRest = action === "list" || action === "identity" || action === "rotate" || action === "export-key" ? 1 : 2;
+  if (rest.length > maxRest) {
+    console.error(
+      `Unexpected extra argument(s): ${rest.slice(maxRest).map((x) => JSON.stringify(x.slice(0, 40))).join(" ")}. ` +
+        "If you typed --namespace * the shell expanded the star into file names: write --namespace '*'."
+    );
+    process.exit(1);
+  }
+  const nsFlag = str(flags.namespace);
+  if (nsFlag && nsFlag !== "*") {
+    const { existsSync } = await import("node:fs");
+    if (existsSync(nsFlag)) {
+      console.error(`Note: "${nsFlag}" is also a file or folder in this directory. If you meant every namespace, quote the star: --namespace '*'.`);
+    }
+  }
   const store = new Store(DB_PATH);
   const show = (v: unknown, text: string): void => console.log(flags.json ? JSON.stringify(v, null, 2) : text);
   try {
     switch (action) {
       case "list": {
-        let identity: { server_id: string; key_id?: string; public_key?: string } = { server_id: store.serverId() };
-        try {
-          identity = store.identity();
-        } catch (e) {
-          console.error(`(no signing key: ${(e as Error).message})`);
-        }
-        const out = { ...identity, distrust: store.distrustRules(), attesters: store.attesterList(), log: store.trustLog(20) };
+        // Read-only: never creates the signing key.
+        const identity = store.peekIdentity();
+        const view = store.trustView();
+        const out = { ...identity, distrust: view.distrust, attesters: view.attesters, log: view.log };
         if (flags.json) {
           console.log(JSON.stringify(out, null, 2));
           return;
         }
-        console.log(`This server: ${identity.server_id}`);
+        console.log(`This server: ${identity.server_id}${identity.key_id ? ` (signing key ${identity.key_id})` : " (no signing key yet: `onememory trust identity` creates it)"}`);
         console.log(`Distrusted writers (${out.distrust.length}):`);
         for (const r of out.distrust) console.log(`  [${r.namespace}] ${r.writer}  (added ${r.added_at} by ${r.added_by})`);
         console.log(`Trusted attesters (${out.attesters.length}):`);
-        for (const a of out.attesters) console.log(`  ${a.key_id} server=${a.server_id || "(any)"} ${a.label ? `"${a.label}" ` : ""}[${a.source}]`);
+        for (const a of out.attesters) {
+          console.log(
+            `  ${a.key_id} server=${a.server_id || "(ANY - unpinned)"} ${a.label ? `"${a.label}" ` : ""}${a.not_after ? `not_after=${a.not_after} ` : ""}[${a.source}]`
+          );
+        }
         if (out.log.length) {
           console.log("Recent changes:");
           for (const l of out.log) console.log(`  ${l.at} ${l.actor} ${l.action} [${l.namespace}] ${l.subject}`);
         }
+        return;
+      }
+      case "export-key": {
+        const out = str(flags.out);
+        if (!out) {
+          console.error("Usage: onememory trust export-key --out <file>");
+          process.exit(1);
+        }
+        const r = store.exportSigningKey(out!);
+        show(r, `Copied signing key ${r.key_id} to ${r.path} (mode 0600). Guard it: whoever holds it can sign as this server. Do not run two live servers with the same key.`);
+        return;
+      }
+      case "rotate": {
+        const r = store.rotateSigningKey();
+        show(
+          r,
+          `New signing key ${r.new_key_id}${r.old_key_id ? ` (replaces ${r.old_key_id}, kept as ${r.old_key_file})` : ""}.\n` +
+            `Give the new public key to the peers that verify this server's exports:\n  onememory trust attester-add --public-key ${r.public_key} --server-id ${store.serverId()}\n` +
+            (r.old_key_id ? `and, on them, end trust in the old key for later exports: onememory trust attester-add <old public key> --server-id ${store.serverId()} --not-after <now>` : "")
+        );
         return;
       }
       case "identity": {
@@ -1201,11 +1340,22 @@ async function trustCmd(): Promise<void> {
       case "attester-add": {
         const key = str(flags["public-key"]) ?? rest[1];
         if (!key) {
-          console.error("Usage: onememory trust attester-add <public-key> [--server-id <id>] [--label <text>]   (a key starting with \"-\": --public-key <key>)");
+          console.error("Usage: onememory trust attester-add <public-key> --server-id <id> [--label <text>] [--not-after <ISO time>] [--any-server]   (a key starting with \"-\": --public-key <key>)");
           process.exit(1);
         }
-        const r = store.attesterAdd({ public_key: key, server_id: str(flags["server-id"]), label: str(flags.label) });
-        show(r, `Trusting key ${r.key_id}${r.server_id ? ` for server ${r.server_id}` : " (any server id)"}.`);
+        const r = store.attesterAdd({
+          public_key: key,
+          server_id: str(flags["server-id"]),
+          label: str(flags.label),
+          any_server: flags["any-server"] === true,
+          not_after: str(flags["not-after"]),
+        });
+        show(
+          r,
+          `Trusting key ${r.key_id}${r.server_id ? ` for server ${r.server_id}` : " for ANY server id (the key's holder can claim to be any peer)"}` +
+            `${r.not_after ? `, for exports signed up to ${r.not_after}` : ""}.` +
+            (r.replaced ? ` (This replaced an earlier entry: pin ${r.replaced.server_id || "any"}, not_after ${r.replaced.not_after || "none"}.)` : "")
+        );
         return;
       }
       case "attester-remove": {
@@ -1344,6 +1494,14 @@ async function encryptCmd(): Promise<void> {
       console.log(`Enabled at-rest encryption. Encrypted ${n} note ${n === 1 ? "body" : "bodies"}.`);
       console.log(`Key file: ${crypto.keyPath(keyDir)} -- back it up; losing it loses the bodies.`);
       console.log("Keyword search now covers title+tags only (bodies cannot be indexed as ciphertext).");
+      const copies = Store.preMigrationBackups(DB_PATH);
+      if (copies.length) {
+        console.log(
+          `WARNING: ${copies.length} pre-upgrade copy(ies) of this database exist and were made BEFORE encryption, so their note bodies are PLAINTEXT:\n` +
+            copies.map((c) => `         ${c.path}`).join("\n") +
+            "\n         Remove them once you are happy with the upgrade: onememory backup --prune-premigration"
+        );
+      }
     } finally {
       store.close();
     }

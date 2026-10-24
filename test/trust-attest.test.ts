@@ -198,14 +198,25 @@ describe("attestations: signing and verifying", () => {
     as("alice", () => a.create({ title: "decision", body: "x" }));
     const notes = exported(a);
     const id = a.identity();
-    // env var, unpinned
-    process.env.ONEMEMORY_TRUSTED_ATTESTERS = id.public_key;
-    assert.equal((await importInto(b, notes)).att.verified, 1);
-    // env var pinned to a different server id: not believed
-    process.env.ONEMEMORY_TRUSTED_ATTESTERS = `99999999-9999-4999-8999-999999999999=${id.public_key}`;
-    assert.deepEqual((await importInto(b, notes)).att.reasons, { "server id does not match the trusted key": 1 });
-    process.env.ONEMEMORY_TRUSTED_ATTESTERS = `${id.server_id}=${id.public_key}, garbage;;`;
-    assert.equal((await importInto(b, notes)).att.verified, 1);
+    const realErr = console.error;
+    const warned: string[] = [];
+    console.error = (...x: unknown[]) => void warned.push(x.join(" "));
+    try {
+      // a bare key (no server id) is refused: it could claim to be any server
+      process.env.ONEMEMORY_TRUSTED_ATTESTERS = id.public_key;
+      assert.equal((await importInto(b, notes)).att.verified, 0);
+      assert.ok(warned.some((w) => /no usable entry/.test(w)), "a variable that yields nothing is reported loudly");
+      // env var pinned to a different server id: not believed
+      process.env.ONEMEMORY_TRUSTED_ATTESTERS = `99999999-9999-4999-8999-999999999999=${id.public_key}`;
+      assert.deepEqual((await importInto(b, notes)).att.reasons, { "server id does not match the trusted key": 1 });
+      process.env.ONEMEMORY_TRUSTED_ATTESTERS = `${id.server_id}=${id.public_key}, garbage;;`;
+      assert.equal((await importInto(b, notes)).att.verified, 1);
+      // the documented JSON array form
+      process.env.ONEMEMORY_TRUSTED_ATTESTERS = JSON.stringify([{ public_key: id.public_key, server_id: id.server_id, label: "a" }]);
+      assert.equal((await importInto(b, notes)).att.verified, 1);
+    } finally {
+      console.error = realErr;
+    }
     delete process.env.ONEMEMORY_TRUSTED_ATTESTERS;
     assert.equal((await importInto(b, notes)).att.verified, 0);
     // admin list, then removal
@@ -221,9 +232,15 @@ describe("attestations: signing and verifying", () => {
     assert.throws(() => b.attesterAdd({ public_key: a.identity().public_key, server_id: "nope" }), /UUID/);
     assert.throws(() => b.attesterAdd({ public_key: a.identity().public_key, server_id: b.serverId() }), /own id/);
     assert.throws(() => b.attesterRemove("zz"), /key_id/);
-    const added = b.attesterAdd({ public_key: a.identity().public_key, label: "pal" });
+    assert.throws(() => b.attesterAdd({ public_key: a.identity().public_key, label: "pal" }), /server_id is required/, "a key must be pinned to a server");
+    assert.throws(() => b.attesterAdd({ public_key: a.identity().public_key, server_id: a.serverId(), not_after: "never" }), /not_after/);
+    const added = b.attesterAdd({ public_key: a.identity().public_key, label: "pal", any_server: true });
     assert.equal(added.key_id, a.identity().key_id);
     assert.deepEqual(b.trustLog(5).map((l) => l.action), ["attester-add"]);
+    assert.match(b.trustLog(1)[0].subject, /ANY-SERVER/);
+    // re-adding with a pin replaces the entry and says so
+    const pinned = b.attesterAdd({ public_key: a.identity().public_key, server_id: a.serverId() });
+    assert.deepEqual(pinned.replaced, { server_id: "", not_after: "" });
   });
 
   test("a key trusted without a server id can never vouch for this server's own id", async () => {
@@ -232,7 +249,7 @@ describe("attestations: signing and verifying", () => {
     as("alice", () => c.create({ title: "n", body: "b" }));
     const notes = exported(c);
     notes[0].attestation!.server_id = b.serverId();
-    b.attesterAdd({ public_key: c.identity().public_key });
+    b.attesterAdd({ public_key: c.identity().public_key, any_server: true });
     const r = await importInto(b, notes);
     assert.equal(r.att.verified, 0);
     c.close();
@@ -302,18 +319,21 @@ describe("attestations: signing and verifying", () => {
     // another server's writer with the same label is a different writer
     b.distrustAdd("default", `99999999-9999-4999-8999-999999999999/alice`);
     assert.equal(b.list().notes.length, 1);
-    // an UNVERIFIED claim is never grounds for trusting or distrusting
+    // an UNVERIFIED claim cannot make anything MORE trusted, but it can only ADD taint: a distrusted
+    // writer's name in an unattested file still hides the note (stripping the attestation launders nothing)
     const c = new Store(":memory:");
     const plain = a.exportBatch(0, 100) as unknown as ImportNote[];
     const r = await c.importNotes(plain);
+    c.distrustAdd("default", "bob");
+    assert.equal(c.list().notes.length, r.length, "a rule naming someone the file does not mention hides nothing");
     c.distrustAdd("default", "alice");
-    assert.equal(c.list().notes.length, r.length, "imported_written_by 'alice' is only a claim: not matched by the rule");
+    assert.equal(c.list().notes.length, 0, "the claimed writer 'alice' is in the taint set, so the rule applies");
     c.close();
   });
 });
 
 describe("attestations: HTTP export / import and the CLI", () => {
-  test("GET /export has the header and an attestation per note; ?attest=0 turns it off; the import reports counts", async () => {
+  test("GET /export is the plain {notes} body by default; ?attest=1 adds the header and an attestation per note; the import reports counts", async () => {
     const a = new Store(":memory:");
     const b = new Store(":memory:");
     as("alice", () => a.create({ title: "one", body: "x" }));
@@ -326,12 +346,14 @@ describe("attestations: HTTP export / import and the CLI", () => {
     const urlB = `http://127.0.0.1:${(sb.address() as AddressInfo).port}`;
     const h = { Authorization: "Bearer adm", "Content-Type": "application/json" };
     try {
-      const dump: any = await (await fetch(urlA + "/export", { headers: h })).json();
+      const dump: any = await (await fetch(urlA + "/export?attest=1", { headers: h })).json();
       assert.equal(dump.export.server_id, a.serverId());
       assert.equal(dump.export.public_key, a.identity().public_key);
       assert.ok(dump.notes.every((n: any) => n.attestation && n.attestation.key_id === dump.export.key_id));
-      const plain: any = await (await fetch(urlA + "/export?attest=0", { headers: h })).json();
-      assert.equal(plain.export, undefined);
+      const plain: any = await (await fetch(urlA + "/export", { headers: h })).json();
+      assert.equal(plain.export, undefined, "the default body is the pre-1.4.0 {notes:[...]} envelope");
+      assert.deepEqual(Object.keys(plain), ["notes"]);
+      assert.deepEqual((await (await fetch(urlA + "/export?attest=0", { headers: h })).json()) as any, plain, "?attest=0 is the same plain body");
       assert.ok(plain.notes.every((n: any) => n.attestation === undefined));
       const res: any = await (await fetch(urlB + "/import", { method: "POST", headers: h, body: JSON.stringify(dump) })).json();
       assert.equal(res.imported, 2);
@@ -359,7 +381,7 @@ describe("attestations: HTTP export / import and the CLI", () => {
       const server = createApiServer(s, [{ token: "adm", scope: "admin", label: "a" }]);
       await new Promise<void>((r) => server.listen(0, r));
       const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-      const res = await fetch(base + "/export", { headers: { Authorization: "Bearer adm" } });
+      const res = await fetch(base + "/export?attest=1", { headers: { Authorization: "Bearer adm" } });
       assert.equal(res.status, 200);
       const j: any = await res.json();
       assert.equal(j.notes.length, 1);
@@ -392,7 +414,7 @@ describe("attestations: HTTP export / import and the CLI", () => {
       assert.equal(ident.status, 0, ident.stderr);
       assert.equal(JSON.parse(ident.stdout).public_key, aid.public_key);
       const out = join(dir, "dump.json");
-      const ex = run("a.db", "export", "--format", "json", "--out", out);
+      const ex = run("a.db", "export", "--format", "json", "--attest", "--out", out);
       assert.equal(ex.status, 0, ex.stderr);
       const dump = JSON.parse(readFileSync(out, "utf8"));
       assert.equal(dump.export.server_id, aid.server_id);
@@ -402,6 +424,9 @@ describe("attestations: HTTP export / import and the CLI", () => {
       const first = run("b.db", "import", "--file", out, "--json");
       assert.equal(first.status, 0, first.stderr);
       assert.equal(JSON.parse(first.stdout).attestations.verified, 0);
+      const unpinned = run("b.db", "trust", "attester-add", aid.public_key);
+      assert.equal(unpinned.status, 1, "a key without a server id is refused");
+      assert.match(unpinned.stderr, /server_id is required/);
       const add = run("b.db", "trust", "attester-add", aid.public_key, "--server-id", aid.server_id, "--label", "a");
       assert.equal(add.status, 0, add.stderr + add.stdout);
       const second = run("b.db", "import", "--file", out, "--json");
@@ -415,12 +440,15 @@ describe("attestations: HTTP export / import and the CLI", () => {
       const dashKey = Buffer.from([0xfb, 0xef, ...new Array(30).fill(7)]).toString("base64url");
       assert.ok(dashKey.startsWith("-"));
       assert.equal(run("b.db", "trust", "attester-add", dashKey).status, 1, "bare, it is an unknown option (clear error, not a crash)");
-      assert.equal(run("b.db", "trust", "attester-add", "--public-key", dashKey, "--label", "dash").status, 0);
-      assert.equal(run("b.db", "trust", "attester-add", "--", dashKey).status, 0, "after -- it is positional (already present: idempotent)");
+      assert.equal(run("b.db", "trust", "attester-add", "--public-key", dashKey, "--label", "dash", "--any-server").status, 0);
+      assert.equal(run("b.db", "trust", "attester-add", "--any-server", "--", dashKey).status, 0, "after -- it is positional (already present: idempotent)");
       assert.equal(run("b.db", "trust", "distrust", "--writer", "-odd", "--namespace", "*").status, 0);
       assert.ok(JSON.parse(run("b.db", "trust", "list", "--json").stdout).distrust.some((r: any) => r.writer === "-odd"));
+      const plainOut = run("a.db", "export", "--format", "json");
+      assert.equal(JSON.parse(plainOut.stdout).export, undefined, "plain by default");
+      assert.deepEqual(Object.keys(JSON.parse(plainOut.stdout)), ["notes"]);
       const noAttest = run("a.db", "export", "--format", "json", "--no-attest");
-      assert.equal(JSON.parse(noAttest.stdout).export, undefined);
+      assert.equal(JSON.parse(noAttest.stdout).export, undefined, "--no-attest is still accepted");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

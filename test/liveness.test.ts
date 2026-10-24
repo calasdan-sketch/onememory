@@ -286,13 +286,33 @@ describe("runner status: trust and correctness", () => {
     assert.match(s.notice!, /Runner offline \(last seen 3 h ago\)/);
   });
 
-  test("the body's own alive_at is never trusted; the server's timestamp is", () => {
+  test("the body's alive_at can only make a heartbeat OLDER than the server stamp, never newer", () => {
     heartbeat(store, 3 * 3600, { body: { alive_at: new Date(Date.now() + 86_400_000).toISOString() } });
     const s = runnerStatus(store);
     assert.equal(s.runner.state, "stale", "a future alive_at in the body does not make it online");
     assert.ok(s.runner.age_seconds! >= 3 * 3600 - 5);
+    // a lagging alive_at (beyond the skew allowance) is believed: it is how a tag-only touch is told apart
     heartbeat(store, 5, { body: { alive_at: "1999-01-01T00:00:00Z" } });
-    assert.equal(runnerStatus(store).runner.state, "online", "a stale alive_at in the body does not make it offline");
+    assert.notEqual(runnerStatus(store).runner.state, "online", "the runner itself said it was alive in 1999");
+    // within the allowance the server stamp wins
+    heartbeat(store, 5, { body: { alive_at: new Date(Date.now() - 60_000).toISOString() } });
+    assert.equal(runnerStatus(store).runner.state, "online");
+  });
+
+  test("a tag-only edit (or any non-heartbeat write) by the runner label does not refresh liveness", () => {
+    const id = heartbeat(store, 3 * 3600);
+    assert.equal(runnerStatus(store).runner.state, "stale");
+    // the runner label (or anyone holding it) touches ONLY the tags: updated_at moves to now, alive_at does not
+    store.update(id, { tags: ["heartbeat", "x"] }, { writtenBy: "runner" });
+    clearRunnerStatusCache(store);
+    const s = runnerStatus(store);
+    assert.equal(s.runner.state, "stale", "a tag-only touch is not a heartbeat");
+    assert.ok(s.runner.age_seconds! >= 3 * 3600 - 5);
+    // a body-less heartbeat note is not believed at all
+    store.create({ namespace: "runner", title: "runner heartbeat", body: "not json", tags: ["heartbeat"] }, { writtenBy: "runner" });
+    store.create({ namespace: "runner", title: "runner heartbeat", body: "{}", tags: ["heartbeat"] }, { writtenBy: "runner" });
+    clearRunnerStatusCache(store);
+    assert.equal(runnerStatus(store).runner.state, "stale");
   });
 
   test("a heartbeat stamped in the future (server clock) is not believed; a small skew is clamped", () => {
@@ -331,16 +351,23 @@ describe("runner status: trust and correctness", () => {
     assert.equal(runnerStatus(store).runner.state, "never_seen", "off again");
   });
 
-  test("tasks for another machine or another namespace are not 'waiting' and raise no offline notice", () => {
+  test("tasks for another namespace are not 'waiting'; a never-seen target is shown as unconfirmed, not hidden", () => {
     heartbeat(store, 5 * 3600, { runner: "pc-1", ns: "tasks" });
+    approvedTask(store, "elsewhere");
+    const s0 = runnerStatus(store);
+    assert.equal(s0.waiting_total, 0, "pc-1 serves 'tasks' only");
+    assert.equal(s0.notice, undefined);
+    // a command for a runner that never sent a heartbeat cannot be placed in a namespace: it is surfaced
+    // in the command's own namespace and flagged, rather than silently dropped (1.4.1)
     const other = putTask(store, { title: "other pc", namespace: "tasks", command: { action: "hello" }, target: "laptop-2" }).task;
     approveTask(store, { id: other.id, if_rev: store.read(other.id)!.rev });
-    approvedTask(store, "elsewhere");
-    const s = runnerStatus(store);
-    assert.equal(s.waiting_total, 0);
-    assert.equal(s.notice, undefined);
+    const s1 = runnerStatus(store);
+    assert.equal(s1.waiting_total, 1);
+    const t = s1.targets.find((x: any) => x.target === "laptop-2");
+    assert.ok(t, "the never-seen target is listed");
+    assert.equal(t.namespace_unconfirmed, true);
     approvedTask(store, "tasks");
-    assert.equal(runnerStatus(store).waiting_total, 1, "only the task addressed to this runner in its namespace");
+    assert.equal(runnerStatus(store).waiting_total, 2, "plus the task addressed to pc-1 in its namespace");
   });
 
   test("the classifier the runner polls with is the one the status uses", () => {

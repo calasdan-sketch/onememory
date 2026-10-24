@@ -46,7 +46,9 @@ describe("change feed: event writer vs note writer", () => {
     assert.equal(s.changes({ since: HOUR_AGO(), noteWrittenBy: "alice" }).changes.length, 0);
     assert.equal(s.changes({ since: HOUR_AGO(), noteWrittenBy: "bob" }).changes.length, 1);
     assert.equal(s.changes({ since: HOUR_AGO(), notNoteWrittenBy: "bob" }).changes.length, 0);
-    assert.equal(s.changes({ since: HOUR_AGO(), notNoteWrittenBy: "alice" }).changes.length, 1);
+    // "not" is the exclusion form: alice's content was rewritten by bob, so alice still touched the note (1.4.1)
+    assert.equal(s.changes({ since: HOUR_AGO(), notNoteWrittenBy: "alice" }).changes.length, 0);
+    assert.equal(s.changes({ since: HOUR_AGO(), notNoteWrittenBy: "dave" }).changes.length, 1);
     // a tag-only touch by carol does not make her the note's writer
     as("carol", () => s.update(n.id, { tags: ["t"] }));
     assert.equal(s.changes({ since: HOUR_AGO(), noteWrittenBy: "carol" }).changes.length, 0);
@@ -74,7 +76,8 @@ describe("change feed: event writer vs note writer", () => {
     const b = as("good", () => s.create({ title: "x two", body: "beta" }));
     const merged = as("admin", () => consolidateNotes(s, [a.id, b.id]));
     as("someone", () => s.update(merged.id, { body: "rewritten" }));
-    assert.deepEqual(s.read(merged.id)!.merged_from_writers, ["evil", "good"]);
+    // the merger (admin) is replaced as the content writer, so it joins the set; the taint only ever grows
+    assert.deepEqual(s.read(merged.id)!.merged_from_writers, ["admin", "evil", "good"]);
     assert.equal(s.list({ notWrittenBy: "evil" }).notes.some((n) => n.id === merged.id), false);
   });
 
@@ -284,8 +287,18 @@ describe("module structure", () => {
     assert.ok(imports("liveness.ts").includes("./task-core.js"));
   });
 
-  test("the server-needed modules are not named runner-* (the npm package leaves those out)", () => {
-    for (const f of ["liveness.ts", "task-core.ts", "trust.ts", "attest.ts"]) assert.ok(!/^runner/.test(f));
+  test("no module that ships in the npm package imports a runner-* module (the package leaves those out)", () => {
+    // package.json "files" excludes dist/src/runner*; a static import of one from a shipped module would
+    // crash the published server at start-up. (Dynamic import() is checked too.)
+    const shipped = readdirSync(SRC).filter((f) => f.endsWith(".ts") && !/^runner/.test(f));
+    assert.ok(shipped.length > 20, "sanity: the source listing worked");
+    for (const f of ["liveness.ts", "task-core.ts", "trust.ts", "attest.ts"]) assert.ok(shipped.includes(f), `${f} ships`);
+    const offenders: string[] = [];
+    for (const f of shipped) {
+      const text = readFileSync(join(SRC, f), "utf8");
+      if (/(?:from\s+|import\s*\(\s*)["']\.\/runner[^"']*["']/.test(text)) offenders.push(f);
+    }
+    assert.deepEqual(offenders, [], "shipped modules must not import ./runner*");
   });
 
   test("tasks.ts still re-exports the public classifier names", async () => {
@@ -345,9 +358,12 @@ describe("file sync carries the writer only as an unverified claim", () => {
       assert.equal(got.title, "from the phone");
       assert.equal(got.written_by, "cli", "stamped with the importing process, not the file's claim");
       assert.equal(got.imported_written_by, `${a.serverId()}/phone`);
-      // so distrusting that name does NOT act on a claim a file can forge
+      // A claim can only ever ADD taint (never remove it): distrusting that name hides the note, so a file
+      // cannot launder a distrusted writer's note by omitting or rewriting the claim, and a forged claim
+      // can only hide the forger's own import.
       b.distrustAdd("default", "phone");
-      assert.equal(b.list().notes.length, 1);
+      assert.equal(b.list().notes.length, 0);
+      assert.equal(b.list({ includeDistrusted: true }).notes.length, 1);
     } finally {
       rmSync(dir, { recursive: true, force: true });
       a.close();

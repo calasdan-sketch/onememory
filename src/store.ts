@@ -12,7 +12,7 @@
 // app-level "remember to reindex" step to forget.
 
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, statSync, readdirSync, renameSync, existsSync } from "node:fs";
+import { mkdirSync, statSync, statfsSync, readdirSync, renameSync, existsSync, copyFileSync, unlinkSync } from "node:fs";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { dirname, basename, join } from "node:path";
 import { checkSizes, audit } from "./security.js";
@@ -43,6 +43,9 @@ import { currentActor, currentWriter, cleanWriter } from "./actor.js";
 import {
   ALL_NAMESPACES,
   MAX_DISTRUST_RULES,
+  MAX_DISTRUST_RULES_PER_NAMESPACE,
+  MAX_TRUST_LOG_ROWS,
+  canonicalRuleWriter,
   NOTE_COLUMNS,
   distrustSql,
   makeWriterId,
@@ -60,8 +63,12 @@ import {
   ephemeralKey,
   isPublicKey,
   keyIdOf,
+  isServerId,
   loadOrCreateSigningKey,
-  parseTrustedAttestersEnv,
+  parseTrustedAttestersEnvDetailed,
+  peekSigningKey,
+  tightenKeyFile,
+  attestKeyPath,
   signRecord,
   verifyRecord,
   type Attestation,
@@ -1018,6 +1025,8 @@ function dropFromIndex(idx: NsEdgeIndex, id: number): void {
   idx.tfNorm.delete(id);
 }
 
+let warnedEnvAttesters = "";
+
 export class Store {
   private db: DatabaseSync;
   private readonly dbPath: string;
@@ -1116,7 +1125,10 @@ export class Store {
           `(${SCHEMA_VERSION}). Upgrade onememory (npm i -g onememory-mcp@latest) instead of opening it with an older version.`
       );
     }
-    if (found >= SCHEMA_VERSION) return;
+    if (found >= SCHEMA_VERSION) {
+      this.ensureV14Extras();
+      return;
+    }
     if (found >= 1) this.preMigrationBackup(found);
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -1137,6 +1149,21 @@ export class Store {
   }
 
   /**
+   * Columns added to v14 tables AFTER the first v14 builds shipped (1.4.1:
+   * trust_attesters.not_after). Idempotent and cheap (one PRAGMA); a database
+   * opened read-only simply goes without until a writer opens it.
+   */
+  private ensureV14Extras(): void {
+    try {
+      if (this.hasColumn("trust_attesters", "not_after") === false && this.hasColumn("trust_attesters", "key_id")) {
+        this.addColumn("trust_attesters", "not_after", "TEXT NOT NULL DEFAULT ''");
+      }
+    } catch {
+      /* read-only file: not_after stays unset */
+    }
+  }
+
+  /**
    * Before the first upgrade of a non-empty file (v1..v13 -> v14), keep one
    * copy of the pre-upgrade database next to it: `<db>.pre-v14-backup`. It is a
    * consistent snapshot (VACUUM INTO) still at the OLD schema version, so an
@@ -1149,18 +1176,126 @@ export class Store {
   private preMigrationBackup(from: number): void {
     if (this.dbPath === ":memory:") return;
     const dest = this.dbPath + `.pre-v${SCHEMA_VERSION}-backup`;
+    // A name of our own, so two processes opening the same old file at once never share (or delete) a copy in progress.
+    const part = `${dest}.${process.pid}.partial`;
+    const dropPartial = (): void => {
+      for (const f of [part, part + "-journal", part + "-wal", part + "-shm"]) {
+        try {
+          unlinkSync(f);
+        } catch {
+          /* not there */
+        }
+      }
+    };
     try {
-      if (existsSync(dest)) return;
       if (!this.db.prepare("SELECT 1 FROM notes LIMIT 1").get()) return;
-      this.db.exec(`VACUUM INTO '${dest.replace(/'/g, "''")}'`);
-      chmodQuiet(dest, 0o600);
+      const have = Number((this.db.prepare("SELECT COUNT(*) AS c FROM notes").get() as { c: number }).c);
+      if (existsSync(dest)) {
+        // A copy from an earlier attempt: keep it only if it is a complete, readable
+        // pre-upgrade snapshot. A zero-byte or truncated file (a crash or full disk
+        // while the copy ran, or by an older build that wrote straight to this name)
+        // would otherwise be trusted forever and "restore" an empty database.
+        const check = Store.verifyBackupFile(dest);
+        if (check.ok) {
+          console.error(`[onememory] keeping the existing pre-upgrade copy ${dest} (${check.notes} notes, schema v${check.version}); not replacing it.`);
+          return;
+        }
+        console.error(`[onememory] the existing pre-upgrade copy ${dest} is not usable (${check.reason}); replacing it.`);
+        unlinkSync(dest);
+      }
+      dropPartial();
+      // Leftovers of a copy that was killed long ago (another process's, older than 10 minutes).
+      try {
+        for (const f of readdirSync(dirname(dest))) {
+          const full = join(dirname(dest), f);
+          if (f.startsWith(basename(dest) + ".") && /\.partial(-journal|-wal|-shm)?$/.test(f) && Date.now() - statSync(full).mtimeMs > 600_000) unlinkSync(full);
+        }
+      } catch {
+        /* best effort */
+      }
+      // Room for the copy (about the size of the database) plus a margin.
+      try {
+        const dbSize = statSync(this.dbPath).size;
+        const st = statfsSync(dirname(this.dbPath));
+        const free = Number(st.bavail) * Number(st.bsize);
+        if (free < dbSize * 1.1 + 1_000_000) {
+          console.error(
+            `[onememory] not enough free disk space to copy the database before upgrading (need about ${Math.ceil(dbSize / 1e6)} MB, ${Math.floor(free / 1e6)} MB free); ` +
+              "continuing WITHOUT a pre-upgrade copy. Make your own backup first if you need one (onememory backup)."
+          );
+          return;
+        }
+      } catch {
+        /* statfs unavailable: try the copy anyway */
+      }
+      // Written under a temporary name and renamed only when complete and verified.
+      this.db.exec(`VACUUM INTO '${part.replace(/'/g, "''")}'`);
+      chmodQuiet(part, 0o600);
+      const done = Store.verifyBackupFile(part, have);
+      if (!done.ok) throw new Error(`the copy did not verify (${done.reason})`);
+      if (existsSync(dest)) {
+        dropPartial(); // another process finished its copy first
+        return;
+      }
+      renameSync(part, dest);
+      dropPartial();
       console.error(
         `[onememory] upgrading the database from schema v${from} to v${SCHEMA_VERSION}; the original was copied to ${dest} ` +
-          "(to roll back: stop every onememory process, put that file back as the database, install the older version)."
+          "(to roll back: stop every onememory process, MOVE that file over the database, install the older version). " +
+          "It holds your notes as they were before the upgrade, including any you later delete or forget: remove it once you are happy " +
+          "(`onememory backup --prune-premigration`)."
       );
     } catch (e) {
+      dropPartial();
       console.error(`[onememory] could not copy the database before upgrading (${(e as Error).message}); continuing.`);
     }
+  }
+
+  /**
+   * Is this file a usable database snapshot? Opens it read-only, checks the
+   * schema version, that `notes` is readable, optionally that it holds exactly
+   * `expectNotes` rows, and runs SQLite's quick integrity check.
+   */
+  static verifyBackupFile(path: string, expectNotes?: number): { ok: true; notes: number; version: number } | { ok: false; reason: string } {
+    let db: DatabaseSync | null = null;
+    try {
+      if (statSync(path).size === 0) return { ok: false, reason: "the file is empty" };
+      db = new DatabaseSync(path, { readOnly: true });
+      const version = Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
+      if (version < 1) return { ok: false, reason: "no schema version (an incomplete copy)" };
+      const notes = Number((db.prepare("SELECT COUNT(*) AS c FROM notes").get() as { c: number }).c);
+      if (expectNotes !== undefined && notes !== expectNotes) return { ok: false, reason: `it holds ${notes} notes, expected ${expectNotes}` };
+      const qc = db.prepare("PRAGMA quick_check(1)").get() as { quick_check?: string } | undefined;
+      if (qc && qc.quick_check !== undefined && qc.quick_check !== "ok") return { ok: false, reason: `integrity check: ${String(qc.quick_check).slice(0, 80)}` };
+      return { ok: true, notes, version };
+    } catch (e) {
+      return { ok: false, reason: (e as Error).message.slice(0, 120) };
+    } finally {
+      try {
+        db?.close();
+      } catch {
+        /* nothing to close */
+      }
+    }
+  }
+
+  /** The pre-upgrade copies next to a database file (`<db>.pre-v*-backup`): path, size, age. */
+  static preMigrationBackups(dbPath: string): Array<{ path: string; bytes: number; age_days: number }> {
+    if (dbPath === ":memory:") return [];
+    const dir = dirname(dbPath);
+    const base = basename(dbPath);
+    const out: Array<{ path: string; bytes: number; age_days: number }> = [];
+    try {
+      for (const f of readdirSync(dir)) {
+        if (!f.startsWith(base + ".pre-v") || !/-backup(\.\d+\.partial)?$/.test(f)) continue;
+        const full = join(dir, f);
+        const st = statSync(full);
+        out.push({ path: full, bytes: st.size, age_days: Math.floor((Date.now() - st.mtimeMs) / 86_400_000) });
+      }
+    } catch {
+      /* directory unreadable */
+    }
+    return out.sort((a, b) => a.path.localeCompare(b.path));
   }
 
   /** Highest change_log sequence number (0 when empty): a cheap "has anything changed?" stamp. */
@@ -1535,7 +1670,8 @@ export class Store {
           server_id TEXT NOT NULL DEFAULT '',
           label TEXT NOT NULL DEFAULT '',
           added_at TEXT NOT NULL,
-          added_by TEXT NOT NULL DEFAULT ''
+          added_by TEXT NOT NULL DEFAULT '',
+          not_after TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS trust_log (
           seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1831,6 +1967,32 @@ export class Store {
     // The `neighbors` key is only present when requested: existing callers
     // (and their deepEqual assertions) see a byte-identical shape otherwise.
     return { ...record, neighbors: this.annotatedNeighbors(id, opts.includeDistrusted === true) };
+  }
+
+  /**
+   * THE by-id read for anything that hands note content to a caller (REST,
+   * MCP, tasks, handoffs, CLI): a note the distrust list names reads as
+   * missing (null) unless `includeDistrusted`, and is then marked
+   * `distrusted: true`. `read()` is the raw, internal read (no policy); a
+   * guard test (test/trust-gate-guard.test.ts) fails when a new call site of
+   * it appears in a surface that returns content.
+   */
+  readVisible(id: number, opts: ReadOpts = {}): (NoteRecord & { neighbors?: NeighborEntry[]; distrusted?: true }) | null {
+    const probe = this.read(id);
+    if (!probe) return null;
+    const hidden = this.isDistrusted(probe);
+    if (hidden && opts.includeDistrusted !== true) return null;
+    const rec = opts.trackAccess || opts.withNeighbors ? this.read(id, opts) : probe;
+    if (!rec) return null;
+    return hidden ? { ...rec, distrusted: true as const } : rec;
+  }
+
+  /** The notes (or note-shaped rows) NOT touched by a distrusted writer. One rule load for the whole list. */
+  filterVisible<T extends WriterFacts>(notes: readonly T[]): T[] {
+    const rules = this.distrustRules();
+    if (rules.length === 0) return [...notes];
+    const id = this.serverId();
+    return notes.filter((n) => !matchesDistrust(rules, n, id));
   }
 
   /**
@@ -2253,6 +2415,8 @@ export class Store {
        * still recorded in change_log.actor.
        */
       keepWriter?: boolean;
+      /** internal: names an unverified source (a vault file's origin_writer) says touched this text; they only ever ADD taint. */
+      alsoTouchedBy?: string[];
     } & LintOpts = {}
   ): NoteRecord | null {
     validateForgetAfter(patch.forget_after);
@@ -2342,15 +2506,43 @@ export class Store {
       // Sealed under the write lock so the key state cannot change between
       // the check and the write (see writeKey), bound to this id+namespace.
       const sealed = this.sealBody(body, noteAad(id, namespace));
+      // Taint is monotonic: when a content edit hands the note to a NEW writer,
+      // everyone who touched it before (its previous writer, a verified
+      // original author an import carried in, and the writers already merged
+      // in) stays in merged_from_writers, so editing a distrusted writer's note
+      // does not launder it. Read under the write lock so a concurrent
+      // consolidation's list is not lost.
+      let mergedAfter: string;
+      {
+        const cur = this.db
+          .prepare("SELECT written_by, attested_writer, attested_by, merged_from_writers FROM notes WHERE id = ?")
+          .get(id) as { written_by: string; attested_writer: string; attested_by: string; merged_from_writers: string } | undefined;
+        mergedAfter = cur?.merged_from_writers ?? "";
+        if (cur && restamp) {
+          const set = new Set<string>(parseMerged(cur.merged_from_writers));
+          const add = (x: string): void => {
+            const c = cleanWriter(x);
+            if (c && c !== writer) set.add(c);
+          };
+          add(cur.written_by);
+          if (cur.attested_writer && cur.attested_by) {
+            add(cur.attested_writer);
+            add(`${cur.attested_by}/${cur.attested_writer}`);
+          }
+          mergedAfter = mergedToStorage(set);
+        }
+        if (cur && opts.alsoTouchedBy?.length) mergedAfter = mergedToStorage([...parseMerged(mergedAfter), ...opts.alsoTouchedBy]);
+      }
       const res = this.db
         .prepare(
           `UPDATE notes SET namespace = ?, title = ?, body = ?, tags = ?, source = ?, rev = ?, updated_at = ?,
                             body_enc = ?, expires_at = ?, written_by = ?,
                             attested_writer = CASE WHEN ? = 1 THEN '' ELSE attested_writer END,
-                            attested_by = CASE WHEN ? = 1 THEN '' ELSE attested_by END
+                            attested_by = CASE WHEN ? = 1 THEN '' ELSE attested_by END,
+                            merged_from_writers = ?
            WHERE id = ? AND (? IS NULL OR rev = ?)`
         )
-        .run(namespace, title, sealed.body, tags, source, rev, now, sealed.bodyEnc, expiresAt, writer, restamp ? 1 : 0, restamp ? 1 : 0, id, want, want);
+        .run(namespace, title, sealed.body, tags, source, rev, now, sealed.bodyEnc, expiresAt, writer, restamp ? 1 : 0, restamp ? 1 : 0, mergedAfter, id, want, want);
 
       if (Number(res.changes) === 0) {
         // The row either vanished or its rev moved since we read it.
@@ -2941,8 +3133,9 @@ export class Store {
       .all(afterId, ...(ns ?? []), lim) as unknown as NoteRow[];
     const key = opts.attest ? this.signing() : null;
     const sid = key ? this.serverId() : "";
+    const exportedAt = new Date().toISOString();
     const sealed = (n: NoteRecord): NoteRecord & { attestation?: Attestation } =>
-      key ? { ...n, attestation: signRecord(key, sid, n) } : n;
+      key ? { ...n, attestation: signRecord(key, sid, n, exportedAt) } : n;
     return rows.map((r) => {
       if (!opts.skipUnreadable) return sealed(this.rec(r));
       try {
@@ -2999,12 +3192,19 @@ export class Store {
     // Attestations: checked against the keys the admin trusts (plus this
     // server's own key for its own server id). Counted into the report.
     const trusted = this.trustedAttesters();
-    let ownCache: { keyId: string; publicKey: string; serverId: string } | null = null;
-    const ownKey = (): { keyId: string; publicKey: string; serverId: string } => {
-      // Only built (and the key file only created) when a note actually carries an attestation.
-      if (!ownCache) {
-        const i = this.identity();
-        ownCache = { keyId: i.key_id, publicKey: i.public_key, serverId: i.server_id };
+    let ownCache: { keyId: string; publicKey: string; serverId: string } | null | undefined;
+    const ownKey = (): { keyId: string; publicKey: string; serverId: string } | null => {
+      // Verification needs only PUBLIC keys. This server's own key is looked up
+      // (never created, never required): a corrupt .attest-key or an unwritable
+      // data dir must not fail a restore; it just means our own old exports
+      // cannot be recognised as ours (they import as unverified, claims kept).
+      if (ownCache === undefined) {
+        try {
+          const k = this.signingKey ?? (this.dbPath === ":memory:" ? null : peekSigningKey(this.keyDir));
+          ownCache = k ? { keyId: k.keyId, publicKey: k.publicKey, serverId: this.serverId() } : null;
+        } catch {
+          ownCache = null;
+        }
       }
       return ownCache;
     };
@@ -3060,7 +3260,9 @@ export class Store {
                   importedWrittenBy:
                     cleanWriter(note.imported_written_by) || cleanWriter(note.written_by) || undefined,
                   importedCreatedBy: cleanWriter(note.imported_created_by) || cleanWriter(note.created_by) || undefined,
-                  ...(carried ? { attestedWriter: carried.writer, attestedBy: carried.by, mergedFromWriters: carried.merged } : {}),
+                  ...(carried
+                    ? { attestedWriter: carried.writer, attestedBy: carried.by, mergedFromWriters: carried.merged }
+                    : { mergedFromWriters: this.claimedTaint(note) }),
                   skipEdges: true,
                   updatedAt: note.updated_at,
                   startRev: note.rev,
@@ -3123,7 +3325,7 @@ export class Store {
   private verifyImported(
     note: ImportNote,
     trusted: ReadonlyMap<string, TrustedAttester>,
-    own: () => { keyId: string; publicKey: string; serverId: string }
+    own: () => { keyId: string; publicKey: string; serverId: string } | null
   ): ReturnType<typeof verifyRecord> {
     const tags = Array.isArray(note.tags) ? note.tags : [];
     if (note.attestation === undefined || note.attestation === null) return { ok: false, reason: "no attestation" };
@@ -3142,10 +3344,41 @@ export class Store {
         attested_writer: typeof note.attested_writer === "string" ? note.attested_writer : "",
         attested_by: typeof note.attested_by === "string" ? note.attested_by : "",
         merged_from_writers: Array.isArray(note.merged_from_writers) ? note.merged_from_writers.filter((x) => typeof x === "string") : [],
+        created_at: typeof note.created_at === "string" ? note.created_at : "",
+        source: typeof note.source === "string" ? note.source : "",
+        expires_at: typeof note.expires_at === "string" ? note.expires_at : null,
+        archived_at: typeof note.archived_at === "string" ? note.archived_at : null,
+        rev: typeof note.rev === "number" ? note.rev : 0,
       },
       trusted,
-      own()
+      own
     );
+  }
+
+  /**
+   * Writers an UNVERIFIED import file names (its written_by / created_by, the
+   * claims an earlier import kept, an attested writer and its merged list). A
+   * claim cannot prove who wrote a note, but it can only ADD taint: these names
+   * go into merged_from_writers, so stripping an attestation (or losing the key
+   * that signed it) cannot launder a distrusted writer's text into a trusted
+   * note. Capped, so a hostile file cannot bloat the column.
+   */
+  private claimedTaint(note: ImportNote): string[] {
+    const out = new Set<string>();
+    const add = (x: unknown): void => {
+      const c = cleanWriter(x);
+      if (c) out.add(c);
+    };
+    add(note.written_by);
+    add(note.created_by);
+    add(note.imported_written_by);
+    add(note.imported_created_by);
+    if (note.attested_writer) {
+      add(note.attested_writer);
+      if (note.attested_by) add(`${cleanWriter(note.attested_by)}/${cleanWriter(note.attested_writer)}`);
+    }
+    if (Array.isArray(note.merged_from_writers)) for (const w of note.merged_from_writers.slice(0, 200)) add(w);
+    return [...out].slice(0, 200);
   }
 
   /**
@@ -3572,7 +3805,7 @@ export class Store {
    * moved between namespaces by a concurrent writer can't leak through a
    * stale edge).
    */
-  listNeighbors(id: number, limit = EDGE_NEIGHBOR_LIMIT, includeDistrusted = true): NeighborEntry[] {
+  listNeighbors(id: number, limit = EDGE_NEIGHBOR_LIMIT, includeDistrusted = false): NeighborEntry[] {
     // A neighbor is in the same namespace as the note, so only that namespace's rules matter.
     const ns = (this.db.prepare("SELECT namespace FROM notes WHERE id = ?").get(id) as { namespace: string } | undefined)?.namespace;
     const dis = includeDistrusted || ns === undefined
@@ -4462,6 +4695,10 @@ export class Store {
     this.db
       .prepare("INSERT INTO trust_log (at, actor, action, namespace, subject) VALUES (?, ?, ?, ?, ?)")
       .run(new Date().toISOString(), actor, action, namespace, subject);
+    // Bounded: keep the newest MAX_TRUST_LOG_ROWS rows (the audit log keeps the full trail).
+    this.db
+      .prepare("DELETE FROM trust_log WHERE seq <= (SELECT MAX(seq) FROM trust_log) - ?")
+      .run(MAX_TRUST_LOG_ROWS);
     audit({ op: `trust.${action}`, namespace, label: actor, kind: "trust", detail: subject.slice(0, 200) });
   }
 
@@ -4481,14 +4718,18 @@ export class Store {
     const ns = typeof namespace === "string" ? namespace.trim() : "";
     if (!ns) throw new ValidationError('namespace is required (use "*" for every namespace)');
     if (ns.length > 200) throw new ValidationError("namespace is too long");
-    const ref = parseWriterRef(writer);
-    if (!ref.label) throw new ValidationError("writer is required: a token label or a writer_id (<server_id>/<label>)");
-    const canonical = ref.serverId ? `${ref.serverId}/${ref.label}` : ref.label;
+    const parsed = canonicalRuleWriter(writer);
+    if (!parsed.ok) throw new ValidationError(parsed.error);
+    const canonical = parsed.writer;
     const addedBy = this.trustActor();
     const at = new Date().toISOString();
     this.transaction(() => {
       const have = this.db.prepare("SELECT 1 FROM trust_distrust WHERE namespace = ? AND writer = ?").get(ns, canonical);
       if (have) return;
+      const perNs = Number((this.db.prepare("SELECT COUNT(*) AS c FROM trust_distrust WHERE namespace = ?").get(ns) as { c: number }).c);
+      if (perNs >= MAX_DISTRUST_RULES_PER_NAMESPACE) {
+        throw new ValidationError(`the distrust list for ${ns === "*" ? "the * bucket" : `namespace ${ns}`} is full (${MAX_DISTRUST_RULES_PER_NAMESPACE} entries); remove one first`);
+      }
       const n = Number((this.db.prepare("SELECT COUNT(*) AS c FROM trust_distrust").get() as { c: number }).c);
       if (n >= MAX_DISTRUST_RULES) throw new ValidationError(`the distrust list is full (${MAX_DISTRUST_RULES} entries); remove one first`);
       this.db.prepare("INSERT INTO trust_distrust (namespace, writer, added_at, added_by) VALUES (?, ?, ?, ?)").run(ns, canonical, at, addedBy);
@@ -4500,9 +4741,9 @@ export class Store {
   /** Take a writer off the list. True if it was there. */
   distrustRemove(namespace: string, writer: string): boolean {
     const ns = typeof namespace === "string" ? namespace.trim() : "";
-    const ref = parseWriterRef(writer);
-    if (!ns || !ref.label) throw new ValidationError("namespace and writer are required");
-    const canonical = ref.serverId ? `${ref.serverId}/${ref.label}` : ref.label;
+    const parsed = canonicalRuleWriter(writer);
+    if (!ns || !parsed.ok) throw new ValidationError("namespace and writer are required");
+    const canonical = parsed.writer;
     let removed = false;
     this.transaction(() => {
       removed = Number(this.db.prepare("DELETE FROM trust_distrust WHERE namespace = ? AND writer = ?").run(ns, canonical).changes) > 0;
@@ -4511,11 +4752,42 @@ export class Store {
     return removed;
   }
 
-  /** Recent trust-configuration changes (who changed what), newest first. */
-  trustLog(limit = 20): Array<{ at: string; actor: string; action: string; namespace: string; subject: string }> {
-    return this.db
-      .prepare("SELECT at, actor, action, namespace, subject FROM trust_log ORDER BY seq DESC LIMIT ?")
-      .all(clampInt(limit, 20, 1, 200)) as unknown as Array<{ at: string; actor: string; action: string; namespace: string; subject: string }>;
+  /**
+   * Recent trust-configuration changes (who changed what), newest first.
+   * `pinnedNamespace`: a namespace-pinned admin sees only rule changes for its
+   * own namespace (and "*" rules, which apply to it), never attester changes
+   * or other tenants' subjects.
+   */
+  trustLog(limit = 20, pinnedNamespace?: string): Array<{ at: string; actor: string; action: string; namespace: string; subject: string }> {
+    const n = clampInt(limit, 20, 1, 200);
+    return (
+      pinnedNamespace === undefined
+        ? this.db.prepare("SELECT at, actor, action, namespace, subject FROM trust_log ORDER BY seq DESC LIMIT ?").all(n)
+        : this.db
+            .prepare(
+              `SELECT at, actor, action, namespace, subject FROM trust_log
+               WHERE (namespace = ? OR namespace = '*') AND action NOT LIKE 'attester-%' ORDER BY seq DESC LIMIT ?`
+            )
+            .all(pinnedNamespace, n)
+    ) as unknown as Array<{ at: string; actor: string; action: string; namespace: string; subject: string }>;
+  }
+
+  /**
+   * The trust configuration as one admin sees it. Unpinned: everything. Pinned
+   * to a namespace: its own rules (plus the "*" rules that apply to it), its own
+   * log lines, and NO attester list (that is server-wide).
+   */
+  trustView(pinnedNamespace?: string): {
+    distrust: DistrustRule[];
+    attesters: ReturnType<Store["attesterList"]>;
+    log: ReturnType<Store["trustLog"]>;
+  } {
+    const pinned = pinnedNamespace !== undefined;
+    return {
+      distrust: this.distrustRules().filter((r) => !pinned || r.namespace === pinnedNamespace || r.namespace === ALL_NAMESPACES),
+      attesters: pinned ? [] : this.attesterList(),
+      log: this.trustLog(20, pinnedNamespace),
+    };
   }
 
   /** Does the distrust list name a writer that touched this note (current writer, attested original, merged sources)? */
@@ -4551,14 +4823,72 @@ export class Store {
 
   /** The attestation signing key of this database (created on first use; in memory only for `:memory:`). */
   private signing(): SigningKey {
-    if (!this.signingKey) this.signingKey = this.dbPath === ":memory:" ? ephemeralKey() : loadOrCreateSigningKey(this.keyDir);
+    if (!this.signingKey) {
+      if (this.dbPath === ":memory:") this.signingKey = ephemeralKey();
+      else {
+        const existed = peekSigningKey(this.keyDir) !== null;
+        this.signingKey = loadOrCreateSigningKey(this.keyDir);
+        if (!existed && this.countAll() > 0 && this.signingKeyMintedFor !== this.serverId()) {
+          // A new key for a database that already has notes and a server id: a restore that lost .attest-key.
+          this.signingKeyMintedFor = this.serverId();
+          console.error(
+            `[onememory] a NEW attestation key was created (${this.signingKey.keyId}) for the existing server id ${this.serverId()}. ` +
+              "If this database was restored from a backup, peers that trusted the old key must be given the new one (`onememory trust identity`); " +
+              "exports signed by the old key will not verify here as 'this server'. See docs/trust.md."
+          );
+        }
+      }
+    }
     return this.signingKey;
   }
+  private signingKeyMintedFor = "";
 
-  /** server_id + public key + key id: what a peer needs to trust this server's attestations. Never the private key. */
+  /** server_id + public key + key id: what a peer needs to trust this server's attestations. Never the private key. Creates the key on first use. */
   identity(): { server_id: string; key_id: string; public_key: string; algorithm: "ed25519" } {
     const k = this.signing();
     return { server_id: this.serverId(), key_id: k.keyId, public_key: k.publicKey, algorithm: "ed25519" };
+  }
+
+  /** Like identity(), but read-only: the key fields appear only if a key already exists (a listing must not mint one). */
+  peekIdentity(): { server_id: string; key_id?: string; public_key?: string; algorithm?: "ed25519" } {
+    const k = this.signingKey ?? (this.dbPath === ":memory:" ? null : peekSigningKey(this.keyDir));
+    return k ? { server_id: this.serverId(), key_id: k.keyId, public_key: k.publicKey, algorithm: "ed25519" } : { server_id: this.serverId() };
+  }
+
+  /**
+   * Replace the signing key with a new one (planned rotation). The old key is
+   * kept beside it as `<key file>.<old key id>.old` (mode 0600) so exports it
+   * signed can still be verified by anyone who trusts it. Returns both ids.
+   */
+  rotateSigningKey(): { old_key_id: string | null; new_key_id: string; public_key: string; old_key_file: string | null } {
+    if (this.dbPath === ":memory:") throw new ValidationError("an in-memory database has no key file to rotate");
+    const p = attestKeyPath(this.keyDir);
+    const old = peekSigningKey(this.keyDir);
+    let oldFile: string | null = null;
+    if (old) {
+      oldFile = `${p}.${old.keyId}.old`;
+      renameSync(p, oldFile);
+      chmodQuiet(oldFile, 0o600);
+    }
+    this.signingKey = null;
+    const k = loadOrCreateSigningKey(this.keyDir);
+    this.signingKey = k;
+    this.db.prepare("INSERT INTO trust_log (at, actor, action, namespace, subject) VALUES (?, ?, 'key-rotate', '*', ?)").run(
+      new Date().toISOString(),
+      this.trustActor(),
+      `${old?.keyId ?? "-"} -> ${k.keyId}`
+    );
+    return { old_key_id: old?.keyId ?? null, new_key_id: k.keyId, public_key: k.publicKey, old_key_file: oldFile };
+  }
+
+  /** Copy the signing key file to `dest` (mode 0600), for moving a server's identity to a new machine. Refuses to overwrite. */
+  exportSigningKey(dest: string): { key_id: string; path: string } {
+    const k = this.signing(); // make sure it exists
+    const src = attestKeyPath(this.keyDir);
+    if (existsSync(dest)) throw new ValidationError(`${dest} already exists; refusing to overwrite it`);
+    copyFileSync(src, dest);
+    chmodQuiet(dest, 0o600);
+    return { key_id: k.keyId, path: dest };
   }
 
   /** Header of an export: format, the exporting server and its public key. Throws if the key cannot be created. */
@@ -4569,51 +4899,109 @@ export class Store {
   /** Public keys whose attestations an import will accept: the admin's list plus ONEMEMORY_TRUSTED_ATTESTERS. */
   trustedAttesters(): Map<string, TrustedAttester> {
     const out = new Map<string, TrustedAttester>();
-    for (const t of parseTrustedAttestersEnv(process.env.ONEMEMORY_TRUSTED_ATTESTERS)) out.set(keyIdOf(t.public_key), t);
-    const rows = this.db.prepare("SELECT key_id, public_key, server_id, label FROM trust_attesters").all() as unknown as Array<{
+    for (const t of this.envAttesters()) out.set(keyIdOf(t.public_key), t);
+    const rows = this.db.prepare("SELECT key_id, public_key, server_id, label, not_after FROM trust_attesters").all() as unknown as Array<{
       key_id: string;
       public_key: string;
       server_id: string;
       label: string;
+      not_after: string;
     }>;
-    for (const r of rows) out.set(r.key_id, { public_key: r.public_key, server_id: r.server_id, label: r.label });
+    for (const r of rows) out.set(r.key_id, { public_key: r.public_key, server_id: r.server_id, label: r.label, ...(r.not_after ? { not_after: r.not_after } : {}) });
     return out;
   }
 
+  /** ONEMEMORY_TRUSTED_ATTESTERS, parsed; unusable entries (or a variable that yields nothing) are reported loudly, once per value. */
+  private envAttesters(): TrustedAttester[] {
+    const raw = process.env.ONEMEMORY_TRUSTED_ATTESTERS;
+    const r = parseTrustedAttestersEnvDetailed(raw);
+    if (raw && raw.trim() && warnedEnvAttesters !== raw) {
+      warnedEnvAttesters = raw;
+      if (r.attesters.length === 0) {
+        console.error(
+          "[onememory] WARNING: ONEMEMORY_TRUSTED_ATTESTERS is set but no usable entry was found, so imports will treat every note as unverified. " +
+            "Use <server id>=<public key> entries (or a JSON array of {public_key, server_id}); see docs/configuration.md."
+        );
+      }
+      for (const i of r.issues) console.error(`[onememory] WARNING: ONEMEMORY_TRUSTED_ATTESTERS entry ${JSON.stringify(i.entry)} ignored: ${i.problem}`);
+    }
+    return r.attesters;
+  }
+
   /** The admin-managed trusted attesters (plus the env ones, marked), for listing. */
-  attesterList(): Array<{ key_id: string; public_key: string; server_id: string; label: string; source: "admin" | "env"; added_at?: string; added_by?: string }> {
+  attesterList(): Array<{ key_id: string; public_key: string; server_id: string; label: string; source: "admin" | "env"; added_at?: string; added_by?: string; not_after?: string; unpinned?: true }> {
+    type Row = { key_id: string; public_key: string; server_id: string; label: string; source: "admin" | "env"; added_at?: string; added_by?: string; not_after?: string; unpinned?: true };
     const rows = this.db
-      .prepare("SELECT key_id, public_key, server_id, label, added_at, added_by FROM trust_attesters ORDER BY added_at")
-      .all() as unknown as Array<{ key_id: string; public_key: string; server_id: string; label: string; added_at: string; added_by: string }>;
-    const out: Array<{ key_id: string; public_key: string; server_id: string; label: string; source: "admin" | "env"; added_at?: string; added_by?: string }> = rows.map((r) => ({ ...r, source: "admin" as const }));
+      .prepare("SELECT key_id, public_key, server_id, label, added_at, added_by, not_after FROM trust_attesters ORDER BY added_at")
+      .all() as unknown as Array<{ key_id: string; public_key: string; server_id: string; label: string; added_at: string; added_by: string; not_after: string }>;
+    const out: Row[] = rows.map((r) => ({
+      key_id: r.key_id,
+      public_key: r.public_key,
+      server_id: r.server_id,
+      label: r.label,
+      source: "admin" as const,
+      added_at: r.added_at,
+      added_by: r.added_by,
+      ...(r.not_after ? { not_after: r.not_after } : {}),
+      ...(r.server_id ? {} : { unpinned: true as const }),
+    }));
     const have = new Set(rows.map((r) => r.key_id));
-    for (const t of parseTrustedAttestersEnv(process.env.ONEMEMORY_TRUSTED_ATTESTERS)) {
+    for (const t of this.envAttesters()) {
       const key_id = keyIdOf(t.public_key);
-      if (!have.has(key_id)) out.push({ key_id, public_key: t.public_key, server_id: t.server_id, label: t.label, source: "env" });
+      if (!have.has(key_id)) out.push({ key_id, public_key: t.public_key, server_id: t.server_id, label: t.label, source: "env", ...(t.not_after ? { not_after: t.not_after } : {}) });
     }
     return out;
   }
 
-  /** Trust a peer's attestation key. `serverId` pins the key to that server (recommended). */
-  attesterAdd(input: { public_key: string; server_id?: string; label?: string }): { key_id: string; public_key: string; server_id: string; label: string } {
+  /**
+   * Trust a peer's attestation key. A key is trusted for ONE server: `server_id`
+   * is required, unless `any_server` is set (discouraged: the key's holder could
+   * then claim to be any peer). `not_after` (ISO-8601) ends trust for exports signed
+   * after that time. Adding a key that is already listed replaces its pin/expiry, and
+   * the log line says what changed.
+   */
+  attesterAdd(input: { public_key: string; server_id?: string; label?: string; any_server?: boolean; not_after?: string }): {
+    key_id: string;
+    public_key: string;
+    server_id: string;
+    label: string;
+    not_after?: string;
+    replaced?: { server_id: string; not_after: string };
+  } {
     const key = typeof input.public_key === "string" ? input.public_key.trim() : "";
     if (!isPublicKey(key)) throw new ValidationError("public_key must be the 43-character base64url key printed by `onememory trust identity` on the other server");
     const sid = (input.server_id ?? "").trim().toLowerCase();
-    if (sid && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(sid)) throw new ValidationError("server_id must be a UUID");
+    if (sid && !isServerId(sid)) throw new ValidationError("server_id must be a UUID");
+    if (!sid && input.any_server !== true) {
+      throw new ValidationError(
+        "server_id is required: a trusted key speaks for ONE server (use the server_id printed by `onememory trust identity` on that server). " +
+          "Pass any_server only if you accept that this key's holder could claim to be any peer."
+      );
+    }
     if (sid && sid === this.serverId()) throw new ValidationError("server_id is this server's own id: a peer cannot speak for this server");
+    const notAfter = (input.not_after ?? "").trim();
+    if (notAfter && Number.isNaN(Date.parse(notAfter))) throw new ValidationError("not_after must be an ISO-8601 time");
     const key_id = keyIdOf(key);
     if (key_id === this.identity().key_id) throw new ValidationError("that is this server's own key: it is always trusted for this server's own exports");
     const label = cleanWriter(input.label ?? "").slice(0, 100);
+    let replaced: { server_id: string; not_after: string } | undefined;
     this.transaction(() => {
+      const prev = this.db.prepare("SELECT server_id, not_after FROM trust_attesters WHERE key_id = ?").get(key_id) as { server_id: string; not_after: string } | undefined;
+      if (prev && (prev.server_id !== sid || prev.not_after !== notAfter)) replaced = { server_id: prev.server_id, not_after: prev.not_after };
       this.db
         .prepare(
-          `INSERT INTO trust_attesters (key_id, public_key, server_id, label, added_at, added_by) VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(key_id) DO UPDATE SET server_id = excluded.server_id, label = excluded.label`
+          `INSERT INTO trust_attesters (key_id, public_key, server_id, label, added_at, added_by, not_after) VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(key_id) DO UPDATE SET server_id = excluded.server_id, label = excluded.label, not_after = excluded.not_after`
         )
-        .run(key_id, key, sid, label, new Date().toISOString(), this.trustActor());
-      this.logTrust("attester-add", "*", `${key_id}${sid ? ` server=${sid}` : ""}${label ? ` label=${label}` : ""}`);
+        .run(key_id, key, sid, label, new Date().toISOString(), this.trustActor(), notAfter);
+      this.logTrust(
+        "attester-add",
+        "*",
+        `${key_id}${sid ? ` server=${sid}` : " ANY-SERVER"}${notAfter ? ` not_after=${notAfter}` : ""}${label ? ` label=${label}` : ""}` +
+          (replaced ? ` (replaced pin=${replaced.server_id || "any"} not_after=${replaced.not_after || "none"})` : "")
+      );
     });
-    return { key_id, public_key: key, server_id: sid, label };
+    return { key_id, public_key: key, server_id: sid, label, ...(notAfter ? { not_after: notAfter } : {}), ...(replaced ? { replaced } : {}) };
   }
 
   /** Stop trusting a key (by key id). True if it was in the admin list. */

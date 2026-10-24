@@ -27,6 +27,7 @@ import {
 import { autoConsolidateCooperative, AUTO_MERGE_SCORE } from "./consolidate.js";
 import { resolveStartupNamespace } from "./namespace.js";
 import { abortAllWaiters } from "./change-wait.js";
+import { pruneStaleHeartbeats } from "./liveness.js";
 
 prepareDataDir();
 assertSafeExposure();
@@ -148,6 +149,7 @@ const purgeEveryMs = (() => {
 const purgeNow = (): void => {
   try {
     store.purgeChangeLog();
+    pruneStaleHeartbeats(store);
   } catch (e) {
     console.error(`[onememory] change-log purge failed: ${(e as Error).message}`);
   }

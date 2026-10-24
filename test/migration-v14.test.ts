@@ -2,9 +2,11 @@
 // encrypted), the one pre-upgrade backup, idempotent reopen, rollback.
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync, copyFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync, copyFileSync, readdirSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { Store, SCHEMA_VERSION } from "../src/store.js";
 import { ensureKey } from "../src/crypto.js";
@@ -190,8 +192,8 @@ describe("schema v14: other upgrade safety", () => {
     }
   });
 
-  test("two processes opening the same old file at once end up with one consistent upgrade", () => {
-    const dir = mkdtempSync(join(tmpdir(), "om-mig14-race-"));
+  test("a second open of an already-upgraded file finds nothing left to do (same process)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "om-mig14-reopen-"));
     try {
       const path = join(dir, "state.db");
       const s = new Store(path);
@@ -200,11 +202,42 @@ describe("schema v14: other upgrade safety", () => {
       downgradeTo(path, 13);
       const { out } = quietly(() => {
         const one = new Store(path);
-        const two = new Store(path); // the second open finds nothing left to do
+        const two = new Store(path);
         return [one, two];
       });
       assert.equal(out[0].serverId(), out[1].serverId());
       out.forEach((x) => x.close());
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("two REAL processes opening the same old file at the same moment end up with one consistent upgrade", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "om-mig14-race-"));
+    try {
+      const path = join(dir, "state.db");
+      const s = new Store(path);
+      s.create({ title: "n", body: "b" });
+      s.close();
+      downgradeTo(path, 13);
+      const storeUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), "..", "src", "store.js")).href;
+      const code = `const {Store}=await import(${JSON.stringify(storeUrl)});const s=new Store(process.argv[1]);process.stdout.write(s.serverId());s.close();`;
+      const run = (): Promise<{ code: number | null; out: string; err: string }> =>
+        new Promise((resolve) => {
+          const c = spawn(process.execPath, ["--input-type=module", "-e", code, path], { stdio: ["ignore", "pipe", "pipe"] });
+          let out = "";
+          let err = "";
+          c.stdout.on("data", (d) => (out += d));
+          c.stderr.on("data", (d) => (err += d));
+          c.on("close", (code) => resolve({ code, out, err }));
+        });
+      const [a, b] = await Promise.all([run(), run()]);
+      assert.equal(a.code, 0, a.err);
+      assert.equal(b.code, 0, b.err);
+      assert.equal(a.out, b.out, "both processes see the same server id");
+      assert.equal(Store.peekSchemaVersion(path), SCHEMA_VERSION);
+      assert.ok(Store.verifyBackupFile(path + ".pre-v14-backup").ok, "exactly one valid pre-upgrade copy");
+      assert.deepEqual(readdirSync(dir).filter((f) => f.includes(".partial")), [], "no partial file is left behind");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

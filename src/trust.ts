@@ -18,7 +18,7 @@
 // `created_by` and the unverified `imported_written_by` claim do NOT count:
 // a later content edit by someone else makes THEM the author, and a claim is
 // only a claim. (Documented in docs/trust.md.)
-import { cleanWriter } from "./actor.js";
+import { cleanWriter, squashWriter } from "./actor.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -26,6 +26,10 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export const ALL_NAMESPACES = "*";
 /** Most rules one store keeps (keeps the SQL fragment and the per-query cost bounded). */
 export const MAX_DISTRUST_RULES = 500;
+/** Most rules one namespace (or the `*` bucket) keeps, so one tenant's admin cannot use up everybody's room. */
+export const MAX_DISTRUST_RULES_PER_NAMESPACE = 50;
+/** Trust-log rows kept (older rows are pruned on write). */
+export const MAX_TRUST_LOG_ROWS = 1000;
 
 /** `<server_id>/<label>`, or "" when either part is missing (an unknown writer has no id). */
 export function makeWriterId(serverId: string, label: string): string {
@@ -42,13 +46,33 @@ export interface WriterRef {
 /**
  * Split a distrust entry or filter value into server id and label. A value is
  * an id only when it starts with a UUID and a slash; anything else is a bare
- * label (labels may contain slashes). Normalised like every writer label.
+ * label (labels may contain slashes). The UUID prefix is split off BEFORE the
+ * label is normalised, so a long label (a writer_id can be 36 + 1 + 100
+ * characters) is shortened exactly the way the stored `written_by` was, and a
+ * rule written from a note's `writer_id` keeps matching.
  */
 export function parseWriterRef(raw: unknown): WriterRef {
-  const s = cleanWriter(raw);
-  const i = s.indexOf("/");
-  if (i === 36 && UUID_RE.test(s.slice(0, 36)) && s.length > 37) return { serverId: s.slice(0, 36).toLowerCase(), label: s.slice(37) };
-  return { serverId: "", label: s };
+  const s = squashWriter(raw);
+  if (s.length > 37 && s[36] === "/" && UUID_RE.test(s.slice(0, 36))) {
+    const label = cleanWriter(s.slice(37));
+    if (label) return { serverId: s.slice(0, 36).toLowerCase(), label };
+  }
+  return { serverId: "", label: cleanWriter(s) };
+}
+
+/**
+ * The canonical stored form of a rule's writer (`label` or `<server_id>/label`),
+ * or an error text when the rule could never match anything: an empty value, or
+ * a value that looks like a writer_id but has no label.
+ */
+export function canonicalRuleWriter(raw: unknown): { ok: true; writer: string; ref: WriterRef } | { ok: false; error: string } {
+  const ref = parseWriterRef(raw);
+  if (!ref.label) return { ok: false, error: "writer is required: a token label or a writer_id (<server_id>/<label>)" };
+  const s = squashWriter(raw);
+  if (ref.serverId === "" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/?$/i.test(s)) {
+    return { ok: false, error: "that is a server id without a label: use <server_id>/<label>, or just the label" };
+  }
+  return { ok: true, writer: ref.serverId ? `${ref.serverId}/${ref.label}` : ref.label, ref };
 }
 
 export interface DistrustRule {
@@ -127,6 +151,16 @@ export const NOTE_COLUMNS: WriterColumns = {
 };
 
 /**
+ * "Is `token` an element of the JSON array in column `col`?" with the SAME
+ * exactness as `Array.includes`. `instr` is only a cheap pre-test (it can hit
+ * inside another element's escaped quotes); `json_each` decides. Two bound
+ * parameters: the JSON-encoded token, then the token itself.
+ */
+export function mergedHasSql(col: string): string {
+  return `(instr(${col}, ?) > 0 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN ${col} <> '' THEN ${col} ELSE '[]' END) WHERE value = ?))`;
+}
+
+/**
  * `" AND NOT (...)"` hiding every row a distrust rule matches, plus its bound
  * parameters; `{ sql: "", params: [] }` when no rule applies (the default,
  * so an empty policy changes nothing). `namespaces` narrows the rules to the
@@ -180,8 +214,8 @@ export function distrustSql(
       gp.push(f.sid, f.label);
     }
     for (const t of tokens) {
-      parts.push(`instr(${cols.merged}, ?) > 0`);
-      gp.push(JSON.stringify(t));
+      parts.push(mergedHasSql(cols.merged));
+      gp.push(JSON.stringify(t), t);
     }
     if (!parts.length) continue;
     const any = `(${parts.join(" OR ")})`;
@@ -190,7 +224,11 @@ export function distrustSql(
     params.push(...gp);
   }
   if (!groups.length) return { sql: "", params: [] };
-  return { sql: ` AND NOT COALESCE(${groups.length === 1 ? groups[0] : `(${groups.join(" OR ")})`}, 0)`, params };
+  // No COALESCE wrapper: SQLite evaluates a COALESCE operand as a value and
+  // cannot short-circuit it (measured 6-10x slower at 100 rules). Every column
+  // the predicate reads is NOT NULL (notes) or COALESCE(note, log) of two NOT
+  // NULL columns, so no row evaluates to NULL.
+  return { sql: ` AND NOT ${groups.length === 1 ? groups[0] : `(${groups.join(" OR ")})`}`, params };
 }
 
 /** `?include_distrusted=1` and friends. */
@@ -227,12 +265,12 @@ export function writerFilterSql(
   }
   return foreign
     ? {
-        sql: `(NOT (${cols.attBy} = ? AND ${cols.attWriter} = ?) AND instr(${cols.merged}, ?) = 0)`,
-        params: [ref.serverId, ref.label, JSON.stringify(`${ref.serverId}/${ref.label}`)],
+        sql: `(NOT (${cols.attBy} = ? AND ${cols.attWriter} = ?) AND NOT ${mergedHasSql(cols.merged)})`,
+        params: [ref.serverId, ref.label, JSON.stringify(`${ref.serverId}/${ref.label}`), `${ref.serverId}/${ref.label}`],
       }
     : {
-        sql: `(${cols.writer} <> ? AND ${cols.attWriter} <> ? AND instr(${cols.merged}, ?) = 0)`,
-        params: [ref.label, ref.label, JSON.stringify(ref.label)],
+        sql: `(${cols.writer} <> ? AND ${cols.attWriter} <> ? AND NOT ${mergedHasSql(cols.merged)})`,
+        params: [ref.label, ref.label, JSON.stringify(ref.label), ref.label],
       };
 }
 
@@ -246,8 +284,8 @@ export function writerTaintFilterSql(cols: WriterColumns, value: string, localId
   const foreign = ref.serverId !== "" && ref.serverId !== localId.toLowerCase();
   return foreign
     ? {
-        sql: `(NOT (${cols.attBy} = ? AND ${cols.attWriter} = ?) AND instr(${cols.merged}, ?) = 0)`,
-        params: [ref.serverId, ref.label, JSON.stringify(`${ref.serverId}/${ref.label}`)],
+        sql: `(NOT (${cols.attBy} = ? AND ${cols.attWriter} = ?) AND NOT ${mergedHasSql(cols.merged)})`,
+        params: [ref.serverId, ref.label, JSON.stringify(`${ref.serverId}/${ref.label}`), `${ref.serverId}/${ref.label}`],
       }
-    : { sql: `(${cols.attWriter} <> ? AND instr(${cols.merged}, ?) = 0)`, params: [ref.label, JSON.stringify(ref.label)] };
+    : { sql: `(${cols.attWriter} <> ? AND NOT ${mergedHasSql(cols.merged)})`, params: [ref.label, JSON.stringify(ref.label), ref.label] };
 }

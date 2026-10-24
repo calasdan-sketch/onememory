@@ -116,7 +116,7 @@ unsigned backup flattens history: every note becomes the importer's, and the pay
   (`<server_id>/<label>`) is for: a filter or rule may use it to say which server.
 - **Heartbeat trust** (`runner_status`): only a note stamped `runner` counts, and its time is the
   server's own timestamp, not the `alive_at` in the body. A runner older than 1.3.4 stamps no marker (`""`);
-  since 1.4.0 those heartbeats are **no longer believed** unless `ONEMEMORY_RUNNER_ACCEPT_LEGACY=1` (see [RUNNER.md](./RUNNER.md)). Anyone with write access to the database file can still stamp anything.
+  since 1.4.0 those heartbeats are **no longer believed** unless `ONEMEMORY_RUNNER_ACCEPT_LEGACY=1` (see [RUNNER.md](https://github.com/calasdan-sketch/onememory/blob/main/docs/RUNNER.md)). Anyone with write access to the database file can still stamp anything.
 - **Upgrading while old processes run.** A process still running the pre-1.3.3 code keeps writing
   after another process has upgraded the file: its edits succeed but never touch `written_by`, so the
   note keeps the previous writer's name on the old process's text. Stop every onememory process
@@ -140,4 +140,4 @@ not in the backup.
 The four items once listed here as planned are built: per-database writer ids, the admin-managed
 `distrust_writers` list, signed Ed25519 attestations for notes moved between servers, and per-target
 runner heartbeats. They are described, with what they do **not** prove, in [trust.md](./trust.md) and
-[RUNNER.md](./RUNNER.md).
+[RUNNER.md](https://github.com/calasdan-sketch/onememory/blob/main/docs/RUNNER.md).

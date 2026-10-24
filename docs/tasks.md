@@ -68,7 +68,7 @@ task's title) and in `state_search`.
 ### Command tasks: phone to PC
 
 `task_put({ command: { action, params }, target })` creates a task in status
-`queued` for the PC's [command runner](./RUNNER.md#command-tasks-the-task-board-in-front-of-the-runner).
+`queued` for the PC's [command runner](https://github.com/calasdan-sketch/onememory/blob/main/docs/RUNNER.md#command-tasks-the-task-board-in-front-of-the-runner).
 It does **not** run by itself: an admin must `task_approve({ id, command_hash })`
 (REST `POST /tasks/:id/approve` with `{ "command_hash": ... }`, admin scope; `rev` as
 `if_rev` also works), echoing the `command_hash` that `task_get` / `task_list` showed,
@@ -79,7 +79,7 @@ edit voids it, it expires (default 24 h), and it is single-use (removed in the w
 that marks the task running). A command task cannot be claimed; approve / revoke clear
 any lease on it. A namespace holds at most 100 queued command tasks. A write token can queue a task and nothing
 more; the runner's signing secret is never stored or exposed. Full rules, and what
-is deliberately not supported, in [RUNNER.md](./RUNNER.md#command-tasks-the-task-board-in-front-of-the-runner).
+is deliberately not supported, in [RUNNER.md](https://github.com/calasdan-sketch/onememory/blob/main/docs/RUNNER.md#command-tasks-the-task-board-in-front-of-the-runner).
 
 ### Reserved tags
 

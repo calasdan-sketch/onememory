@@ -48,6 +48,15 @@ export function heartbeatTitle(runnerId: string): string {
 export const EXPIRING_SOON_MS = 3_600_000;
 /** A heartbeat stamped this far ahead of the server clock is not believed. */
 export const FUTURE_ALLOWANCE_MS = 120_000;
+/**
+ * A runner's own `alive_at` (inside the heartbeat body, which only the runner
+ * process can rewrite: a content edit restamps the note's writer) may lag the
+ * server's timestamp by clock skew, not more. A beat whose server timestamp is
+ * newer than its alive_at by more than this was TOUCHED (a tag or source edit
+ * moves updated_at but not the body), so the alive_at is believed instead.
+ * Runner and server clocks should agree to within about this much (NTP).
+ */
+export const ALIVE_SKEW_MS = 120_000;
 /** The result is reused for this long unless the change log moved. */
 export const STATUS_CACHE_MS = 5_000;
 /** Most heartbeat notes read per writer (one per runner is expected). */
@@ -100,6 +109,8 @@ export interface RunnerTargetStatus {
   stale_after_seconds: number;
   /** The command-task namespace this runner says it serves ("" = unknown / command tasks off). */
   task_namespace: string;
+  /** True when this runner never said which namespace it serves: its commands are counted under their own namespace. */
+  namespace_unconfirmed?: true;
   waiting: number;
   expiring_soon: number;
   expired: number;
@@ -159,19 +170,28 @@ function readBeats(store: Store, now: number): Map<string, Beat> {
       store
         .list({ namespace: HEARTBEAT_NAMESPACE, limit: HEARTBEAT_SCAN_LIMIT, withTags: ["heartbeat"], writtenBy, includeDistrusted: true })
         .notes.filter((n) => n.title === HEARTBEAT_TITLE || n.title.startsWith(`${HEARTBEAT_TITLE}: `));
-    const cands = [...pick("runner"), ...(acceptLegacyHeartbeats() ? pick("") : [])];
-    for (const n of cands) {
+    const cands = [...pick("runner").map((n) => ({ n, authentic: true })), ...(acceptLegacyHeartbeats() ? pick("").map((n) => ({ n, authentic: false })) : [])];
+    for (const { n, authentic } of cands) {
       const t = Date.parse(n.updated_at);
       if (!Number.isFinite(t) || t > now + FUTURE_ALLOWANCE_MS) continue; // never believe the future
       let runner = n.title.startsWith(`${HEARTBEAT_TITLE}: `) ? n.title.slice(HEARTBEAT_TITLE.length + 2) : "";
       const beat: Beat = { at: Math.min(t, now) };
       try {
-        const p = JSON.parse(n.body) as { runner?: unknown; task_namespace?: unknown; heartbeat_ms?: unknown };
+        const p = JSON.parse(n.body) as { runner?: unknown; task_namespace?: unknown; heartbeat_ms?: unknown; alive_at?: unknown };
         if (typeof p.runner === "string" && p.runner) runner = p.runner; // the runner process wrote this body
         if (typeof p.task_namespace === "string") beat.taskNamespace = p.task_namespace;
         if (typeof p.heartbeat_ms === "number" && p.heartbeat_ms > 0) beat.heartbeatMs = p.heartbeat_ms;
+        if (typeof p.alive_at === "string") {
+          const a = Date.parse(p.alive_at);
+          if (Number.isFinite(a)) {
+            // Liveness comes from the runner's own clock reading, not from "the note was touched".
+            if (t - a > ALIVE_SKEW_MS) beat.at = Math.min(a, now);
+          } else if (authentic) continue;
+        } else if (authentic) {
+          continue; // a runner-written body always carries alive_at; without it the note is not a beat
+        }
       } catch {
-        /* a body that is not JSON just carries no claims */
+        if (authentic) continue; // not the runner's JSON body: not a beat
       }
       if (!runner) runner = envRunnerId();
       const have = out.get(runner);
@@ -181,6 +201,34 @@ function readBeats(store: Store, now: number): Map<string, Beat> {
     /* no heartbeats readable: nothing is online */
   }
   return out;
+}
+
+/** Heartbeat notes untouched for this many days are removed by the runner / server housekeeping (0 = never). */
+export function heartbeatPruneDays(): number {
+  const n = Number(process.env.ONEMEMORY_RUNNER_HEARTBEAT_PRUNE_DAYS);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 30;
+}
+
+/**
+ * Delete heartbeat notes of runner ids that have not beaten for `days` days
+ * (renamed hosts, containers, CI): one note per runner id would otherwise stay
+ * forever. A live runner re-creates its note on its next beat. Returns how many were removed.
+ */
+export function pruneStaleHeartbeats(store: Store, days: number = heartbeatPruneDays(), now = Date.now()): number {
+  if (!days || days <= 0) return 0;
+  const cutoff = now - days * 86_400_000;
+  let removed = 0;
+  try {
+    const { notes } = store.list({ namespace: HEARTBEAT_NAMESPACE, limit: 500, withTags: ["heartbeat"], includeDistrusted: true });
+    for (const n of notes) {
+      if (!(n.title === HEARTBEAT_TITLE || n.title.startsWith(`${HEARTBEAT_TITLE}: `))) continue;
+      const t = Date.parse(n.updated_at);
+      if (Number.isFinite(t) && t < cutoff && store.delete(n.id)) removed++;
+    }
+  } catch {
+    /* housekeeping only */
+  }
+  return removed;
 }
 
 /** "45s", "12 min", "3 h", "2 d". */
@@ -211,17 +259,18 @@ function changeSeq(store: Store): number {
  * an explicit `now` is cached for STATUS_CACHE_MS, and only while the change
  * log has not moved, so repeated catch_up / recall calls do not rescan.
  */
-export function runnerStatus(store: Store, namespaces?: string[], explicitNow?: number): RunnerStatus {
+export function runnerStatus(store: Store, namespaces?: string[], explicitNow?: number, opts: { pinned?: boolean } = {}): RunnerStatus {
   const useCache = explicitNow === undefined;
   const now = explicitNow ?? Date.now();
-  const key = JSON.stringify([namespaces ? [...namespaces].sort() : null, staleAfterSeconds(), acceptLegacyHeartbeats()]);
+  const pinned = opts.pinned === true;
+  const key = JSON.stringify([namespaces ? [...namespaces].sort() : null, staleAfterSeconds(), acceptLegacyHeartbeats(), pinned]);
   let seq = -1;
   if (useCache) {
     seq = changeSeq(store);
     const hit = cache.get(store)?.get(key);
     if (hit && hit.seq === seq && seq >= 0 && now - hit.at < STATUS_CACHE_MS) return hit.value;
   }
-  const value = compute(store, namespaces, now);
+  const value = compute(store, namespaces, now, pinned);
   if (useCache && seq >= 0) {
     let m = cache.get(store);
     if (!m) cache.set(store, (m = new Map()));
@@ -233,13 +282,24 @@ export function runnerStatus(store: Store, namespaces?: string[], explicitNow?: 
 
 const SEVERITY: Record<RunnerState, number> = { online: 0, stale: 1, never_seen: 2 };
 
-function compute(store: Store, namespaces: string[] | undefined, now: number): RunnerStatus {
+function compute(store: Store, namespaces: string[] | undefined, now: number, pinned = false): RunnerStatus {
   const beats = readBeats(store, now);
   const envNs = envRunnerTaskNamespace();
 
   // Which tasks would each runner run? What a runner says it serves (its own
   // heartbeat) wins; the server's environment is the fallback.
-  const resolve = (target: string): RunnerIdentity => ({ me: target, namespace: beats.get(target)?.taskNamespace ?? envNs });
+  //   - a runner that SAID which namespace it serves (even "" = command tasks off) is believed;
+  //   - the server's environment is the fallback;
+  //   - with neither (a runner that never sent a heartbeat, or an older one that
+  //     does not name its namespace) the commands addressed to it are counted
+  //     under their own namespace and flagged "unconfirmed", so the
+  //     "runner not listening" notice can fire for the very case it exists for.
+  const resolve = (target: string): RunnerIdentity => {
+    const said = beats.get(target)?.taskNamespace;
+    if (said !== undefined) return { me: target, namespace: said };
+    if (envNs) return { me: target, namespace: envNs };
+    return { me: target, namespace: "", unconfirmed: true };
+  };
   const scan = scanQueuedCommands(store, resolve, namespaces, now);
 
   const by = new Map<string, RunnerNamespaceStatus>();
@@ -258,7 +318,9 @@ function compute(store: Store, namespaces: string[] | undefined, now: number): R
         last_seen: b ? new Date(b.at).toISOString() : null,
         age_seconds: age,
         stale_after_seconds: staleAfter,
-        task_namespace: b?.taskNamespace ?? envNs,
+        // A namespace-pinned caller learns a runner's task namespace only if it is one of its own.
+        task_namespace: pinned && namespaces && !namespaces.includes(b?.taskNamespace ?? envNs) ? "" : b?.taskNamespace ?? envNs,
+        ...(b?.taskNamespace === undefined && !envNs ? { namespace_unconfirmed: true as const } : {}),
         waiting: 0,
         expiring_soon: 0,
         expired: 0,
@@ -269,7 +331,8 @@ function compute(store: Store, namespaces: string[] | undefined, now: number): R
     }
     return t;
   };
-  for (const target of beats.keys()) targetStatus(target);
+  // A pinned caller sees only runners that have commands waiting in its own namespaces (host names are not its business).
+  if (!pinned) for (const target of beats.keys()) targetStatus(target);
 
   for (const w of scan.items) {
     let s = by.get(w.namespace);
@@ -331,7 +394,7 @@ function compute(store: Store, namespaces: string[] | undefined, now: number): R
     namespaces: rows,
     targets,
     ...(scan.truncated ? { truncated: true } : {}),
-    command_tasks_enabled: Boolean(envNs) || [...beats.values()].some((b) => Boolean(b.taskNamespace)),
+    command_tasks_enabled: pinned ? scan.items.length > 0 : Boolean(envNs) || [...beats.values()].some((b) => Boolean(b.taskNamespace)) || scan.items.some((w) => per.get(w.target)?.namespace_unconfirmed === true),
   };
   const parts = targets.map((t) => t.notice).filter((x): x is string => Boolean(x));
   if (parts.length) out.notice = parts.map((p) => p.replace(/\.$/, "")).join("; ") + ".";

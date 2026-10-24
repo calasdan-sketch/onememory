@@ -47,6 +47,13 @@ export function setProcessWriter(marker: WriterMarker | ""): void {
 /** Longest stored writer identity (labels are operator-chosen; this is a backstop). */
 export const WRITER_MAX = 100;
 
+/** The whitespace/control-character part of cleanWriter, without the length cap. */
+export function squashWriter(s: unknown): string {
+  if (typeof s !== "string") return "";
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\s]+/g, " ").trim();
+}
+
 /**
  * One printable line: control characters and line breaks become spaces, runs
  * of whitespace collapse, ends are trimmed. A label longer than WRITER_MAX is
@@ -55,9 +62,7 @@ export const WRITER_MAX = 100;
  * a filter value finds the stored one. Idempotent.
  */
 export function cleanWriter(s: unknown): string {
-  if (typeof s !== "string") return "";
-  // eslint-disable-next-line no-control-regex
-  const t = s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\s]+/g, " ").trim();
+  const t = squashWriter(s);
   if (t.length <= WRITER_MAX) return t;
   return t.slice(0, WRITER_MAX - 13) + "~" + createHash("sha256").update(t).digest("hex").slice(0, 12);
 }

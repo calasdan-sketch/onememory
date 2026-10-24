@@ -78,6 +78,7 @@ import {
   QuarantinedError,
   type NoteRecord,
 } from "./store.js";
+import { parseWriterRef } from "./trust.js";
 import { maybeEmbed } from "./search-service.js";
 
 
@@ -242,10 +243,17 @@ function safeRead(root: string, p: string): string | null {
   }
 }
 
+/** The names a file's `origin_writer` claim contains: the whole value (a writer id) and its label part. */
+function claimNames(raw: string): string[] {
+  const ref = parseWriterRef(raw.trim().slice(0, 300));
+  return [...new Set([ref.serverId ? `${ref.serverId}/${ref.label}` : ref.label, ref.label].filter(Boolean))];
+}
+
 /** Render one note as Markdown with YAML front-matter. */
 export function renderNoteFile(
   note: NoteRecord,
-  identity: { origin: string; id: number }
+  identity: { origin: string; id: number },
+  extra: { distrusted?: boolean } = {}
 ): string {
   const fm: Record<(typeof KEYS)[number], unknown> = {
     id: identity.id,
@@ -261,6 +269,8 @@ export function renderNoteFile(
     hash: contentHash(note),
   };
   const lines = KEYS.map((k) => `${k}: ${JSON.stringify(fm[k])}`);
+  // Written only for a note the trust policy hides from agents (export --include-distrusted).
+  if (extra.distrusted) lines.push("distrusted: true");
   return `---\n${lines.join("\n")}\n---\n${lf(note.body)}\n`;
 }
 
@@ -394,12 +404,18 @@ export interface ExportResult {
 export function exportMarkdown(
   store: Store,
   dir: string,
-  opts: { namespace?: string; prune?: boolean; force?: boolean } = {}
+  opts: { namespace?: string; prune?: boolean; force?: boolean; includeDistrusted?: boolean } = {}
 ): ExportResult {
   const self = store.storeId();
   const origins = store.syncOrigins();
   mkdirSync(dir, { recursive: true });
-  const notes = store.exportAll().filter((n) => !opts.namespace || n.namespace === opts.namespace);
+  const everything = store.exportAll().filter((n) => !opts.namespace || n.namespace === opts.namespace);
+  // A vault is a folder other tools and agents read, outside every read gate: notes touched by a
+  // distrusted writer are left out (and their earlier, unedited files pruned) unless asked for,
+  // and then each such file is marked `distrusted: true`.
+  const notes = opts.includeDistrusted ? everything : store.filterVisible(everything);
+  const hiddenIds = new Set<number>(opts.includeDistrusted ? [] : everything.filter((n) => !notes.includes(n)).map((n) => n.id));
+  const marked = new Set<number>(opts.includeDistrusted ? store.markDistrusted(everything).filter((n) => n.distrusted).map((n) => n.id) : []);
   const keep = new Set<string>();
   /** local id -> [merge base before this export, current content hash] */
   const exported = new Map<number, [string | null, string]>();
@@ -420,7 +436,7 @@ export function exportMarkdown(
     const base = store.syncBase(note.id);
     exported.set(note.id, [base, hash]);
     try {
-      const text = renderNoteFile(note, identity);
+      const text = renderNoteFile(note, identity, { distrusted: marked.has(note.id) });
       const current = safeRead(dir, path);
       if (current === text) {
         store.setSyncBase(note.id, hash);
@@ -463,7 +479,10 @@ export function exportMarkdown(
       const localId = origin === self ? id : store.syncLookup(origin, id);
       const onDisk = contentHash(fileContent(parsed, p, dir));
       let stale: boolean;
-      if (localId !== null && exported.has(localId)) {
+      if (localId !== null && hiddenIds.has(localId)) {
+        // The note is now hidden by the trust policy: its earlier file goes too, unless someone edited it.
+        stale = onDisk === parsed.fm.hash || onDisk === store.syncBase(localId);
+      } else if (localId !== null && exported.has(localId)) {
         // Old path of a renamed note: stale iff it holds what we last synced.
         const [base, hash] = exported.get(localId)!;
         stale = onDisk === base || onDisk === hash;
@@ -644,7 +663,11 @@ export async function importMarkdown(
         {
           updatedAt: typeof fm.updated_at === "string" ? fm.updated_at : undefined,
           // The file's writer claim is displayed, never trusted: the note is stamped with who imported it.
-          ...(typeof fm.origin_writer === "string" && fm.origin_writer.trim() ? { importedWrittenBy: fm.origin_writer.trim().slice(0, 200) } : {}),
+          // A claim can only ADD taint: the names it gives also go into merged_from_writers, so a
+          // distrusted writer's note does not become a trusted one by passing through a vault.
+          ...(typeof fm.origin_writer === "string" && fm.origin_writer.trim()
+            ? { importedWrittenBy: fm.origin_writer.trim().slice(0, 200), mergedFromWriters: claimNames(fm.origin_writer) }
+            : {}),
         }
       );
       if (hasIdentity && origin !== self) store.syncLink(origin!, originId!, n.id);
@@ -684,7 +707,11 @@ export async function importMarkdown(
     }
     const localChanged = baseHash === null || localHash !== baseHash;
     const applyFile = (): NoteRecord | null => {
-      return store.update(local.id, { namespace, title, body, tags: importTags(content.tags, local.tags) }, { ifRev: local.rev });
+      return store.update(
+        local.id,
+        { namespace, title, body, tags: importTags(content.tags, local.tags) },
+        { ifRev: local.rev, ...(typeof fm.origin_writer === "string" && fm.origin_writer.trim() ? { alsoTouchedBy: claimNames(fm.origin_writer) } : {}) }
+      );
     };
 
     if (!fileChanged) {

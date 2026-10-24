@@ -191,7 +191,7 @@ transaction. To roll back: stop every onememory process, put the backup file bac
 the backup. `onememory recall` never upgrades a database.
 
 Runners older than 1.3.4 write a heartbeat with no writer marker, which 1.4.0 no longer believes: see
-[RUNNER.md](./RUNNER.md) for the one-step upgrade (or `ONEMEMORY_RUNNER_ACCEPT_LEGACY=1` as a stopgap).
+[RUNNER.md](https://github.com/calasdan-sketch/onememory/blob/main/docs/RUNNER.md) for the one-step upgrade (or `ONEMEMORY_RUNNER_ACCEPT_LEGACY=1` as a stopgap).
 
 ## Limits
 

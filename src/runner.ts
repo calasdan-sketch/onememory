@@ -42,7 +42,8 @@ import { PROJECT_ROOT } from "./config.js";
 import { audit } from "./security.js";
 import { Store, ValidationError, type NoteRecord } from "./store.js";
 import { pollTasks } from "./runner-tasks.js";
-import { heartbeatTitle } from "./liveness.js";
+import { heartbeatTitle, pruneStaleHeartbeats } from "./liveness.js";
+import { envRunnerId, envRunnerTaskNamespace } from "./task-core.js";
 
 // ---- Tunables (all overridable by env; defaults are the safe end) ----------
 export const RUNNER = {
@@ -83,7 +84,7 @@ export const RUNNER = {
    * set explicitly: a task only ever runs if it lives in exactly this
    * namespace, is addressed to this runner, and carries a valid admin approval.
    */
-  taskNamespace: process.env.ONEMEMORY_RUNNER_TASK_NAMESPACE || "",
+  taskNamespace: envRunnerTaskNamespace(),
   /** Minimum gap between prune sweeps, regardless of heartbeat rate. */
   pruneEveryMs: Number(process.env.ONEMEMORY_RUNNER_PRUNE_EVERY_MS || 3_600_000),
 };
@@ -116,12 +117,7 @@ export interface CommandEnvelope {
 
 /** This machine's runner name, matched against a command's `target`. */
 export function runnerId(): string {
-  return (
-    process.env.ONEMEMORY_RUNNER_ID ||
-    process.env.COMPUTERNAME ||
-    process.env.HOSTNAME ||
-    "default"
-  );
+  return envRunnerId();
 }
 
 export interface AllowEntry {
@@ -871,6 +867,8 @@ export function pruneOld(store: Store, days: number = RUNNER.retentionDays, now 
 
   let removed = 0;
   for (const id of doomed) if (store.delete(id)) removed++;
+  // Heartbeat notes of runner ids that stopped beating long ago (renamed hosts, containers).
+  removed += pruneStaleHeartbeats(store, undefined, now);
   if (removed) audit({ op: "runner.prune", bytes: removed });
   return removed;
 }

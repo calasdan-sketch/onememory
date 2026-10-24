@@ -7,10 +7,51 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, readdirSync, readFileSync, symlinkSync, existsSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, readFileSync, symlinkSync, existsSync, statSync, mkdirSync, writeFileSync } from "node:fs";
+import { gunzipSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { PROJECT_ROOT } from "../src/config.js";
+
+/**
+ * Extract a .tgz with Node alone (no `tar` binary: Windows images and minimal containers do not all have
+ * one). Handles what `npm pack` writes: ustar entries with a name prefix, and pax `path` overrides.
+ */
+function untarGz(file: string, outDir: string): void {
+  const buf = gunzipSync(readFileSync(file));
+  const field = (o: number, n: number): string => {
+    const raw = buf.subarray(o, o + n);
+    const z = raw.indexOf(0);
+    return raw.subarray(0, z < 0 ? n : z).toString("utf8");
+  };
+  let off = 0;
+  let paxPath: string | null = null;
+  while (off + 512 <= buf.length) {
+    if (buf.subarray(off, off + 512).every((b) => b === 0)) break;
+    let name = field(off, 100);
+    const size = parseInt(field(off + 124, 12).trim() || "0", 8);
+    const type = String.fromCharCode(buf[off + 156] || 48);
+    const prefix = field(off + 345, 155);
+    if (prefix) name = `${prefix}/${name}`;
+    const data = buf.subarray(off + 512, off + 512 + size);
+    off += 512 + Math.ceil(size / 512) * 512;
+    if (type === "x") {
+      const m = /\d+ path=([^\n]*)\n/.exec(data.toString("utf8"));
+      paxPath = m ? m[1] : null;
+      continue;
+    }
+    if (type === "g") continue;
+    if (paxPath) {
+      name = paxPath;
+      paxPath = null;
+    }
+    if (type !== "0" && type !== "\0") continue; // directories are created on demand
+    const target = resolve(outDir, name);
+    if (!target.startsWith(resolve(outDir))) throw new Error(`unsafe path in tarball: ${name}`);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, data);
+  }
+}
 
 function packAndExtract(root: string): string {
   const npmCli = process.env.npm_execpath;
@@ -25,7 +66,7 @@ function packAndExtract(root: string): string {
   assert.ok(tgz, "npm pack produced a tarball");
   const out = join(root, "x");
   execFileSync(process.execPath, ["-e", `require("fs").mkdirSync(${JSON.stringify(out)})`]);
-  execFileSync("tar", ["-xzf", join(dest, tgz), "-C", out]);
+  untarGz(join(dest, tgz), out);
   const pkg = join(out, "package");
   assert.ok(existsSync(join(pkg, "dist", "src", "cli.js")), "the tarball holds the CLI");
   // Nothing is installed: reuse the repo's dependencies.
