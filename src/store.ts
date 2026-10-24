@@ -911,7 +911,7 @@ export class Store {
       }
       throw new Error(
         `onememory: this database is at schema version ${found}, newer than this build supports ` +
-          `(${SCHEMA_VERSION}). Upgrade onememory (npm i -g onememory@latest) instead of opening it with an older version.`
+          `(${SCHEMA_VERSION}). Upgrade onememory (npm i -g @decnutz/onememory@latest) instead of opening it with an older version.`
       );
     }
     if (found >= SCHEMA_VERSION) return;

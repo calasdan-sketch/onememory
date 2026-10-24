@@ -5,7 +5,7 @@ name: Publish to npm
 # proves to npm who is running, so no password, token or emailed code is used.
 #
 # THINGS TO VERIFY ON npmjs.com (cannot be checked from this repo):
-#   Package onememory -> Settings -> Trusted Publisher -> GitHub Actions
+#   Package @decnutz/onememory -> Settings -> Trusted Publisher -> GitHub Actions
 #     Owner / user:  calasdan-sketch
 #     Repository:    onememory
 #     Workflow file: publish.yml      (file name only, no path, case-sensitive)

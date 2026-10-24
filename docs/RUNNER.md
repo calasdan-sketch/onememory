@@ -10,7 +10,7 @@ at home, and you want it to do something.
 
 ## Install: from the repo
 
-The runner is **not** part of the published `onememory` package. A plain
+The runner is **not** part of the published `@decnutz/onememory` package. A plain
 memory install contains no runner code and does not serve the signing page.
 Run it from a clone of this repository (a separate `onememory-runner` package
 is coming soon):

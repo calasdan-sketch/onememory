@@ -150,7 +150,7 @@ with the exceptions listed under "Changed".
 
 ## [1.2.1] - 2026-10-24
 
-**Package renamed:** published on npm as `onememory` (previously `onememory-mcp`, whose earlier releases were withdrawn). The command is still `onememory`.
+**Package renamed:** published on npm as `@decnutz/onememory` (the plain `onememory` name is refused by npm as too similar to `one-memory`; previously `onememory-mcp`, whose earlier releases were withdrawn). The command is still `onememory`.
 
 Hardening and honesty release from an independent multi-reviewer pass over
 1.2.0 (crypto and namespaces, data and retention, retrieval and MCP, docs and
