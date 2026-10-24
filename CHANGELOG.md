@@ -6,6 +6,16 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-10-24
+
+Test-only fix for Windows CI. No runner/allowlist change, no schema change (still v12).
+
+### Fixed
+- Root cause of the Windows command-task failures: GitHub's Windows temp directory is an 8.3 short path (`C:\Users\RUNNER~1\...`). The tests' marker-parameter pattern allowed `:` and `\` (1.3.1) but not `~`, so the runner correctly refused the parameter ("does not match the allowed pattern") and never spawned. The pattern now also allows `~` and space. The runner's anchored-pattern check, `shell:false` execution and allowlist strictness are unchanged. Real allowlists are operator-written, so a Windows install only needs a pattern that admits the paths it uses.
+
+### Tests
+- Added a regression test for the Windows-style path against the pattern (and injection strings still rejected); the main command-task test now prints the runner's result if the marker is missing.
+
 ## [1.3.1] - 2026-10-24
 
 Fix release: package name, CI, and Windows. No schema change (still v12).

@@ -47,7 +47,7 @@ describe("command approval: binding, expiry, consumption, starvation, leases", (
       mark: {
         file: process.execPath,
         args: ["-e", "require('fs').appendFileSync(process.argv[1], 'x')"],
-        params: { p: "[A-Za-z0-9/_.:\\\\-]{1,200}" },
+        params: { p: "[A-Za-z0-9/_.:~ \\\\-]{1,200}" },
         paramArgs: ["{p}"],
         description: "write a marker file",
       },

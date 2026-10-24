@@ -39,7 +39,7 @@ describe("command tasks", () => {
       mark: {
         file: process.execPath,
         args: ["-e", "require('fs').writeFileSync(process.argv[1], 'ran')"],
-        params: { p: "[A-Za-z0-9/_.:\\\\-]{1,200}" },
+        params: { p: "[A-Za-z0-9/_.:~ \\\\-]{1,200}" },
         paramArgs: ["{p}"],
         description: "write a marker file",
       },
@@ -76,7 +76,7 @@ describe("command tasks", () => {
     const approved = approveTask(store, { id: t.id, if_rev: store.read(t.id)!.rev });
     assert.equal(approved.approval, "approved");
     assert.equal(await pollTasks(deps), 1);
-    assert.equal(readFileSync(marker, "utf8"), "ran");
+    assert.equal(readFileSync(marker, "utf8"), "ran", `runner result: ${JSON.stringify(getTask(store, t.id).result)}`);
     const after = getTask(store, t.id);
     assert.equal(after.status, "done");
     assert.equal(after.approval, "none", "single-use");
@@ -89,6 +89,12 @@ describe("command tasks", () => {
     rmSync(marker);
     assert.equal(await pollTasks(deps), 0);
     assert.equal(existsSync(marker), false);
+  });
+
+  test("Windows-style temp paths (8.3 short name with ~, drive colon, backslashes) match the test pattern; injection still does not", () => {
+    const re = new RegExp(`^(?:${allow.mark.params!.p})$`);
+    assert.ok(re.test("C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\om-cmdtask-pi9Uh8\\ran.txt"));
+    for (const bad of ["x; touch /tmp/pwned", "a&b", "a|b", "a\"b", "a`b", "a$(b)", "a\nb"]) assert.ok(!re.test(bad), bad);
   });
 
   test("output is recorded on the task", async () => {
