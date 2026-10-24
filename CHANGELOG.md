@@ -9,44 +9,102 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [1.3.0] - unreleased
 
 Cross-device / cross-model awareness: every session can see what the others
-did and plan. Additive; no schema change, no behaviour change unless you use
-the new parameters and tools. (The change feed, `consumer` markers, `if_rev`
-compare-and-swap, per-token namespaces, the signed runner and the recall hook
-already existed and are unchanged.)
+did and plan, and a task can now drive the PC's runner. Additive; no schema
+change (tasks, handoffs, leases and approvals are tagged notes, version stays
+11, so an older binary can still open the database, it just lacks the new
+tools). Existing behaviour is unchanged unless you use the new parameters and
+tools, with the exceptions listed under "Changed".
 
 ### Added
 
-- **Live wait on the change feed.** `GET /changes?...&wait=<0-55>` and
-  `memory_since { wait_seconds }` hold the request until something changes in
-  the caller's scope (create, update, archive, restore, delete, retention
-  sweep), then answer like a normal read; on timeout they return the empty page
-  with `timedOut: true`. In-process writes wake it immediately; writes by
-  another process are noticed by a 1s poll (`ONEMEMORY_WAIT_POLL_MS`). At most
-  4 parked requests per token and 64 per process (`ONEMEMORY_WAIT_MAX_PER_TOKEN`,
-  `ONEMEMORY_WAIT_MAX_TOTAL`); a client that disconnects frees its slot, timers
-  and listener immediately. Not combinable with `cursor` (400).
-- **Task board.** MCP `task_put` / `task_list` and REST `POST /tasks`,
-  `PUT /tasks/:id`, `GET /tasks`: tasks with status (idea, planned, running,
-  blocked, done), next step and owner, plus `if_rev` compare-and-swap. Stored
-  as tagged notes (no new table), so they are encrypted, namespaced, searchable
-  and appear in the change feed. See docs/tasks.md.
-- **Session handoffs.** MCP `session_handoff` and REST `POST /handoffs`,
-  `GET /handoffs`: a structured note (done, pending, decisions, next step,
-  which surface) for the next session.
+- **Live wait on the change feed.** `GET /changes?...&wait=<0-55>` (alias
+  `wait_seconds`) and `memory_since { wait_seconds }` (alias `wait`) hold the
+  request until something changes in the caller's scope, then answer like a
+  normal read; on timeout they return the empty page with `timedOut: true`.
+  **Use 25**: a 55s wait died at exactly 30.0s behind a 30s-idle proxy (55 stays
+  the cap). In-process writes wake it immediately; writes by another process are
+  noticed by a jittered ~1s poll (`ONEMEMORY_WAIT_POLL_MS`). Caps: 16 per token,
+  32 per namespace scope, 64 per process (`ONEMEMORY_WAIT_MAX_PER_TOKEN`,
+  `_PER_NAMESPACE`, `_TOTAL`); the 429 / tool error names the limit. A client
+  disconnect or a server shutdown frees the slot (shutdown returns `timedOut`
+  cleanly and drains in milliseconds). Not combinable with `cursor` (400).
+- **Task board.** MCP `task_put` / `task_get` / `task_list` / `task_claim` and REST
+  `POST /tasks`, `PUT /tasks/:id`, `GET /tasks[/:id]`, `POST /tasks/:id/claim`:
+  status, next step, owner, plus `priority` (0-9), `due`, `parent_id` and
+  `blocked_by[]` (validated, cycles refused), `if_rev` compare-and-swap, and
+  `client_key` idempotency (a retried create returns the existing task,
+  `replayed: true`). `task_claim` is a compare-and-swap lease with heartbeat,
+  release and expiry. Stored as tagged notes (no new table).
+- **Session handoffs.** `session_handoff` / `POST|GET /handoffs`, with `client_key`.
 - **`catch_up`** (MCP) / `GET /catch-up`: changes since this consumer last
-  looked + open tasks + latest handoffs in one call.
-- **`onememory recall`** now prints open tasks (up to 10) and the latest
-  handoff before the recent notes, inside the same size cap; with no tasks or
-  handoffs its output is unchanged.
-- `Store.list` accepts `withTags` / `withoutTags` (exact-tag filters);
+  looked + open tasks (compact: no notes, no command text) + latest handoffs in
+  one call.
+- **Acknowledged reads.** `ack_mode: "manual"` on `memory_since` / `catch_up` /
+  `GET /changes`: the "last" marker moves only when the returned `ack_token`
+  comes back (`ack_token` on the next call, `memory_ack`, or `POST /ack`), so a
+  client that dies mid-delivery gets the changes again. Default stays `auto`
+  (marker moves on delivery, at-most-once); manual is at-least-once.
+  `exclude_self` hides a consumer's own writes (changes whose `source` equals
+  its label).
+- **Command tasks** (see docs/RUNNER.md). `task_put({command, target})` queues a
+  task; an **admin** `task_approve` (MAC bound to namespace, id, a single-use nonce
+  and a hash of the command and target) is required before this PC's runner will
+  run it, and only if the target is that runner's own id, the task is in
+  `ONEMEMORY_RUNNER_TASK_NAMESPACE` (off by default) and the action passes the
+  same allowlist as a signed command note. Edits void the approval; the runner signs
+  with its own secret in memory; no token can read or hold it. There is no
+  "read-only skips approval" class: the allowlist has no such flag.
+- **`onememory backup [--out dir]`**: consistent hot copy (`VACUUM INTO`, safe while
+  the server runs) plus the `.key` file (0600) with a loud warning to store it
+  separately. **`onememory watch [--exec prog args...]`**: long-poll loop that
+  prints changes and optionally runs a program per batch (no shell; data on stdin;
+  marker moves only on exit 0).
+- **`onememory recall`** prints open tasks (up to 10) and the latest handoff before
+  the recent notes, each with its own budget (a long task list never cuts the
+  handoff), a header that counts all open tasks, and every field reduced to one
+  printable line.
+- `audit.log` records task / command-task / claim / approve / handoff / catch_up /
+  ack events with the token **label** and a `kind`, and rotates by size
+  (`ONEMEMORY_AUDIT_MAX_BYTES`, `ONEMEMORY_AUDIT_KEEP`). The server prunes the change
+  log hourly on a timer, not only when the feed is read.
+- `Store.list` accepts `withTags` / `withoutTags` (exact, case-sensitive tag filters);
   `Store.onChange` / `Store.changeHeadSeq` back the live wait.
+
+### Changed (read before upgrading)
+
+- **Reserved tags.** Plain note writes (`POST/PUT /notes`, `state_write`, synced
+  files) can no longer create a note tagged `task`, `handoff` or `task.*`, or add /
+  remove those tags (400, pointing at `task_put`). Existing tagged notes can still be
+  edited as long as that tag set is unchanged. Notes that merely carry `status:`,
+  `owner:` or `surface:` are unaffected.
+- Task titles must be one line (no newlines or control characters); next steps and
+  handoff text have control characters stripped.
+- `catch_up` and `memory_since` are no longer annotated read-only (they advance the
+  consumer marker), `catch_up` returns compact tasks (use `task_get` for notes), and
+  the per-token wait cap is 16 (was 4 in the pre-release).
+- `catch_up` no longer stalls with more than 10,000 pending changes: it reads the whole
+  gap with one tail query, so the marker reaches the true end and `recent` is the true
+  newest. Tag filters are case-sensitive in SQL, so notes tagged `Task` can no longer
+  hide real tasks from `listTasks`.
+- Clearing a task's `owner` now resets the provenance `source` to `task` (it kept the
+  old owner).
+- Task `status` gains `queued` and `failed`.
 
 ### Notes
 
-- The MCP server now advertises 16 tools (was 12). Clients that pin the tool
+- The MCP server now advertises 21 tools (was 12). Clients that pin the tool
   list need to refresh it.
-- Live wait holds an HTTP request open; if you front OneMemory with a proxy,
-  its read timeout must exceed the wait (55s max).
+- Live wait holds an HTTP request open; if you front OneMemory with a proxy, use
+  `wait=25` (see docs/change-feed.md and INFRA.md section 8).
+- The command runner is not part of the published package (see docs/RUNNER.md), so
+  `task_approve` is useful only on a checkout that runs it; the tools themselves ship.
+- INFRA.md gains systemd and Windows Task Scheduler recipes for OneMemory itself,
+  a backup section (including the key) and a 15-minute deploy recipe.
+- Known limits: a claim does not lock a task against plain `task_put` edits of its
+  other fields; command tasks need the runner running on the PC (and the PC awake);
+  `onememory watch` and live waits are for scripts and agent loops, not a push to a
+  chat window (chat clients still act only on a user turn); the systemd and Task
+  Scheduler recipes were written but not run.
 
 ## [1.2.1] - 2026-10-24
 

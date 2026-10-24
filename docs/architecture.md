@@ -63,7 +63,7 @@ immediately visible through the others:
   `rev` for compare-and-swap, a provenance `source`, tags, and namespaces.
 - **`src/api.ts`** — a small HTTP/JSON API + a built-in web dashboard, on
   plain `node:http` (no framework).
-- **`src/mcp-server-core.ts`** — the transport-agnostic MCP server with sixteen
+- **`src/mcp-server-core.ts`** — the transport-agnostic MCP server with twenty-one
   tools, shared by both MCP transports.
 - **`src/mcp-stdio.ts`** — stdio entry point for local Claude Code / Desktop
   / editors.
@@ -92,10 +92,14 @@ immediately visible through the others:
 | `state_delete` | admin | Delete a note |
 | `memory_stats` | read | Totals, most-read notes, never-read and stale counts |
 | `memory_since` | read | Change feed: what was created/updated/deleted since a time ([change-feed.md](./change-feed.md)) |
-| `task_put` | write | Create/update a task on the shared board (status, next_step, owner, `if_rev`) ([tasks.md](./tasks.md)) |
-| `task_list` | read | List tasks (default: all but done), filter by status/owner |
+| `task_put` | write | Create/update a task on the shared board (status, next_step, owner, priority, due, parent, blockers, `client_key`, `if_rev`; `command` + `target` queues a runner command) ([tasks.md](./tasks.md)) |
+| `task_get` | read | One task in full (notes, command, approval state, result) |
+| `task_list` | read | List tasks (default: all but done), filter by status/owner/parent |
+| `task_claim` | write | Take / heartbeat / release a task with a lease (compare-and-swap) |
+| `task_approve` | admin | Approve (or revoke) a command task for the PC's runner ([RUNNER.md](./RUNNER.md)) |
 | `session_handoff` | write | Leave a structured handoff (done / pending / decisions / next step) |
-| `catch_up` | read | One call: changes since this consumer last looked + open tasks + latest handoffs |
+| `catch_up` | read | One call: changes since this consumer last looked + open tasks (compact) + latest handoffs |
+| `memory_ack` | read | Confirm a manual-ack change-feed page (`ack_token`) |
 | `memory_consolidation_candidates` | admin | Near-duplicate pairs (O(n²), single-flight, time-budgeted) |
 | `memory_consolidate` | admin | Merge 2+ notes (`dry_run`, `keep_sources`) |
 | `memory_rebuild_edges` | admin | Rebuild the similarity graph (confirmation gate above 2,000 notes) |
@@ -128,7 +132,25 @@ example, can read and write the store via an HTTP Request node (or its MCP
 Client node) — see [INFRA.md](./INFRA.md) § "Use with n8n".
 
 `GET /changes` mirrors `memory_since` (read scope; see [change-feed.md](./change-feed.md)); it requires a `since` parameter and answers `400` without one. `&wait=<0-55>` holds the request open until something changes ([live wait](./change-feed.md#live-wait)).
-`POST /tasks` · `PUT /tasks/:id` · `GET /tasks` · `POST /handoffs` · `GET /handoffs` · `GET /catch-up` are the REST side of the task board, handoffs and catch-up ([tasks.md](./tasks.md)); writes need write scope, reads read scope, and namespaces apply as for `/notes`.
+`POST /tasks` · `PUT /tasks/:id` · `GET /tasks` · `GET /tasks/:id` · `POST /tasks/:id/claim` · `POST /tasks/:id/approve` (admin) · `POST /handoffs` · `GET /handoffs` · `GET /catch-up` · `POST /ack` are the REST side of the task board, handoffs, catch-up and acknowledged reads ([tasks.md](./tasks.md), [change-feed.md](./change-feed.md)); writes need write scope, reads read scope, and namespaces apply as for `/notes`.
+
+### Naming convention (REST vs MCP)
+
+The two surfaces grew separately, so the names differ in a few predictable
+ways. The rules, so you can guess the other side:
+
+- REST uses nouns and kebab-case paths (`/catch-up`, `/changes`, `/tasks/:id/claim`);
+  MCP uses snake_case verbs-or-nouns (`catch_up`, `memory_since`, `task_claim`).
+  `catch_up` and `/catch-up`, `task_put` and `POST/PUT /tasks` are the same operation.
+- Request fields are snake_case on both (`next_step`, `if_rev`, `client_key`,
+  `ack_token`, `exclude_self`). REST query parameters are the same names.
+- Old name wins where both exist: the live-wait length is `wait` on REST and
+  `wait_seconds` on MCP. Both surfaces now accept **both** spellings
+  (`wait` and `wait_seconds`), so either works anywhere. Prefer `wait_seconds`.
+- Prefixes: `state_*` are note CRUD/search (kept for 1.0 compatibility),
+  `memory_*` are store-level views and maintenance (`memory_since`,
+  `memory_stats`, `memory_ack`), `task_*` and `session_handoff` / `catch_up`
+  are the task board. New tools follow `task_*` / `memory_*`; nothing is renamed.
 `POST /notes/:id/archive` and `POST /notes/:id/restore` soft-forget and bring back a note by id; `POST /sweep-expired` archives every note past its TTL (all three are admin scope; see [encryption-retention.md](./encryption-retention.md)).
 `POST /notes` and `PUT /notes/:id` answer `202 { quarantined: { id, reasons } }`
 when the memory linter holds the write, and add a `warnings` array under

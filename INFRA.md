@@ -445,3 +445,156 @@ callable operations — the same tools Claude and Cursor use.
   agent; the transport and auth it uses are confirmed working here. If your
   n8n build's MCP node behaves differently, fall back to the HTTP Request
   node (Route A).*
+
+
+---
+
+## 6. Running it always-on
+
+OneMemory is one Node process (`onememory start`: API on 8790, MCP on 8791). If
+it dies, your phone and every connector lose it, so run it under something that
+restarts it. The recipes below were written against the process's real
+behaviour (it exits 0 on SIGTERM and non-zero on a fatal error); the service
+definitions themselves could not be run in the environment they were written in
+(no systemd, no Windows), so check them once on your machine: **verify with
+`systemd-analyze verify` / `Get-ScheduledTask`, then reboot once.**
+
+### Linux: systemd
+
+`/etc/systemd/system/onememory.service` (adjust `User`, the `onememory` path
+from `which onememory`, and the data dir):
+
+```ini
+[Unit]
+Description=OneMemory
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=onememory
+Environment=ONEMEMORY_HOME=/var/lib/onememory
+# Optional: ONEMEMORY_TOKEN, ONEMEMORY_BIND, ports ... (see docs/configuration.md)
+EnvironmentFile=-/etc/onememory.env
+ExecStart=/usr/bin/onememory start
+Restart=always
+RestartSec=3
+# SIGTERM ends parked live-waits at once and the process exits in well under a second
+TimeoutStopSec=10
+# Hardening that does not get in the way of a single-file SQLite store:
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/onememory
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo useradd --system --home /var/lib/onememory --create-home onememory
+sudo systemctl daemon-reload && sudo systemctl enable --now onememory
+systemctl status onememory
+journalctl -u onememory -f
+```
+
+`Restart=always` brings it back after a crash or an out-of-memory kill; a clean
+`systemctl restart` drains parked waiters first (they get `timedOut: true`).
+
+### Windows: Task Scheduler for OneMemory itself
+
+The tunnel recipe in section 1 only keeps *cloudflared* alive. This keeps
+OneMemory alive: it starts at logon and Task Scheduler restarts it if it exits.
+PowerShell (run once, normal user; adjust the path from `where.exe onememory`):
+
+```powershell
+$exe = (Get-Command onememory).Source
+$action   = New-ScheduledTaskAction -Execute $exe -Argument "start"
+$trigger  = New-ScheduledTaskTrigger -AtLogOn
+$settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
+            -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName "OneMemory" -Action $action -Trigger $trigger -Settings $settings
+Start-ScheduledTask -TaskName "OneMemory"
+```
+
+Caveats: it starts when you log in, not at raw boot (use NSSM or a service
+wrapper for that), and if your PC sleeps the store sleeps, which also pauses
+phone-to-other-session sync. For something that must stay reachable, run it on a
+small always-on host (a VPS, Fly.io/Railway, or a Raspberry Pi) instead; a
+`docker-compose.yml` ships in the repo.
+
+---
+
+## 7. Backups
+
+State is a single SQLite file plus, when at-rest encryption is on, the key.
+
+```bash
+onememory backup --out ~/om-backup/2026-10-24
+```
+
+- Takes a consistent snapshot with SQLite `VACUUM INTO`, so it is **safe while
+  the server is running and writing**; it never overwrites an existing backup.
+- Writes `state.db`, a `README.txt`, and a copy of **`.key`** (mode 0600) when
+  encryption is enabled, and checks the copy with `PRAGMA integrity_check`.
+- **Store the key separately from the backup.** Encrypted note bodies are
+  unreadable without `.key`; a backup kept next to its key is no longer
+  protected by the encryption. Put the key in a password manager or another
+  drive, keep a second copy, and never lose it: there is no recovery without it.
+- Do not just copy `state.db` while the server runs: without `state.db-wal` /
+  `state.db-shm` the copy can be inconsistent.
+- Restore: stop the server, put `state.db` (and `.key` if you use encryption) in
+  the data dir, delete any stale `state.db-wal` / `state.db-shm`, start it.
+- Schedule it (systemd timer, cron, or Task Scheduler running `onememory backup
+  --out <dated folder>`), and test a restore once.
+- The JSON route (`onememory export --format json`, admin token) is
+  independent of the database file format; use both if you like.
+
+Other housekeeping that runs by itself: `audit.log` rotates at 5 MB keeping 5
+files (`ONEMEMORY_AUDIT_MAX_BYTES`, `ONEMEMORY_AUDIT_KEEP`), and the change log
+is pruned hourly (90-day retention) by the server, not just when the feed is read.
+
+---
+
+## 8. Live wait behind a proxy or tunnel
+
+`memory_since { wait_seconds }` / `GET /changes?wait=` hold an HTTP request open
+and send nothing until it ends. A proxy that cuts idle responses at 30 seconds
+(common for tunnels and corporate proxies) therefore kills a long wait: measured
+here, `wait=25` returned normally at 25.1s, `wait=55` died at exactly 30.0s behind
+a 30s proxy, and a direct connection or a 60s proxy held 55s. **Use 25.** If a
+wait dies, the symptom is a dropped connection, not an error from OneMemory.
+Each parked request holds one of 16 slots per token (32 per namespace scope, 64
+per process); when they run out you get a 429 that says which limit it was.
+
+---
+
+## 9. Deploy in 15 minutes (one person, one box)
+
+Steps marked (verified) were run end to end against this build on Linux, Node
+24, without network access; steps marked (not verified here) need the internet
+or a service manager and were not run.
+
+```bash
+node -v                                  # (verified) must print v24 or newer
+npm install -g onememory                 # (not verified here: needs the npm registry)
+onememory start                          # (verified) creates ~/.onememory/.token and state.db, API :8790, MCP :8791
+curl localhost:8790/health               # (verified) {"status":"ok"}
+T=$(cat ~/.onememory/.token)             # (verified)
+curl -s -H "Authorization: Bearer $T" "localhost:8790/changes?since=last&consumer=pc&wait=25"   # (verified) parks, then returns timedOut:true
+curl -s -H "Authorization: Bearer $T" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+  -X POST localhost:8791/mcp \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_since","arguments":{"since":"last","consumer":"pc","wait_seconds":25}}}'   # (verified)
+onememory backup --out ~/om-backup       # (verified) hot copy, works while the server runs
+onememory doctor                         # (verified) checks Node, database, token, hook
+cloudflared tunnel --url http://localhost:8791   # (not verified here) quick tunnel, TESTING ONLY: the URL changes on restart
+```
+
+Then: make it a service (section 6), set up a named tunnel and add Cloudflare
+Access (sections 1-2), schedule `onememory backup` (section 7), and run the three
+auth checks from section 2 against the public URL before you trust it.
+
+Where to host (CAD, check current prices): your own PC with a free Cloudflare
+Tunnel is about $0 plus a domain at roughly $15/year, but it must stay on; a small
+VPS is roughly $5-8/month; Fly.io or Railway roughly $5-10/month; a Raspberry Pi is
+about $100 once and about $1/month in power.

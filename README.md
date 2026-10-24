@@ -72,6 +72,16 @@ docker compose up -d     # dashboard at http://localhost:8790
 ### Backups & restore
 
 ```bash
+onememory backup --out ~/om-backup     # consistent hot copy; safe while the server runs
+```
+
+`onememory backup` writes `state.db` (via SQLite `VACUUM INTO`) plus, if
+at-rest encryption is on, a copy of the `.key` file. **Keep the key apart from
+the backup**: a backup without its key is unreadable, and one stored next to it
+is not encrypted. See [INFRA.md](./INFRA.md#7-backups). The JSON route (admin
+token) also works:
+
+```bash
 TOKEN=$(cat ~/.onememory/.token)
 curl -H "Authorization: Bearer $TOKEN" localhost:8790/export > backup.json   # or: onememory export --format json --out backup.json
 curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
@@ -114,12 +124,15 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
   away" — created, updated **and deleted** notes grouped by source, with a
   per-device "since I last looked" marker. Driven by a local change log, so
   restores, file-sync imports and deletes are never missed. → [docs/change-feed.md](./docs/change-feed.md)
-- **Live wait.** `GET /changes?wait=30` / `memory_since { wait_seconds }` parks
+- **Live wait.** `GET /changes?wait=25` / `memory_since { wait_seconds: 25 }` parks
   until something changes in your scope, so a session sees an idea added from
-  your phone within moments instead of on its next poll. Bounded, and a
-  dropped client frees its slot. → [docs/change-feed.md](./docs/change-feed.md#live-wait)
-- **Task board, handoffs, catch-up.** `task_put` / `task_list`,
-  `session_handoff`, and one `catch_up` call (changes since you last looked +
+  your phone within moments instead of on its next poll. **Use 25, not the 55
+  maximum:** many proxies and tunnels cut an idle response at 30s (a 55s wait
+  behind one died at 30.0s). Bounded (16 per token), and a dropped client or a
+  server shutdown frees its slot; `ack_mode: "manual"` makes delivery
+  at-least-once. → [docs/change-feed.md](./docs/change-feed.md#live-wait)
+- **Task board, handoffs, catch-up.** `task_put` / `task_get` / `task_list` /
+  `task_claim`, `session_handoff`, and one `catch_up` call (changes since you last looked +
   open tasks + latest handoff). Built on plain notes, so it is encrypted,
   namespaced and searchable like the rest; `onememory recall` includes open
   tasks and the latest handoff at session start. → [docs/tasks.md](./docs/tasks.md)
@@ -206,8 +219,11 @@ encryption of note bodies. See [SECURITY.md](./SECURITY.md) for what it does
 | `state_write` / `state_read` / `state_delete` | write / read / admin | CRUD with compare-and-swap (`if_rev`) and provenance (`source`) |
 | `state_search` / `state_relevant` / `state_list` | read | keyword, semantic or hybrid search; vague-message recall; listing |
 | `memory_since` | read | change feed (`wait_seconds` = live wait) |
-| `task_put` / `task_list` | write / read | shared task board across devices and models |
+| `task_put` / `task_list` / `task_get` | write / read / read | shared task board across devices and models; `client_key` makes a create retry-safe |
+| `task_claim` | write | take / heartbeat / release a task with a lease (compare-and-swap) |
+| `task_approve` | admin | approve a command task so the PC's runner may run it ([RUNNER.md](./docs/RUNNER.md)) |
 | `session_handoff` / `catch_up` | write / read | leave a handoff; one-call catch-up at session start |
+| `memory_ack` | read | confirm a manual-ack change-feed page |
 | `memory_stats` | read | totals, most-read, never-read, stale |
 | `memory_quarantine` | admin | review linter-held writes |
 | `memory_consolidation_candidates` / `memory_consolidate` / `memory_rebuild_edges` | admin | dedup and similarity-graph maintenance |
@@ -220,6 +236,8 @@ REST mirrors them (`/notes`, `/search`, `/relevant`, `/changes`, `/tasks`, `/han
 ```
 onememory start | mcp | doctor | init
 onememory changes --since last --consumer laptop
+onememory watch --consumer pc [--exec program args...]     # react to changes as they land
+onememory backup [--out dir]                                # hot copy of the database (+ key)
 onememory export --format md --dir ~/memory     onememory import --dir ~/memory
 onememory quarantine [list | approve <id> | reject <id>]
 onememory consolidate | rebuild-edges | reindex | relevant "…" | recall
@@ -263,7 +281,7 @@ recall@1 on it. See [docs/encryption-retention.md](./docs/encryption-retention.m
 | [docs/configuration.md](./docs/configuration.md) | all environment variables, server-side namespace resolution |
 | [docs/search.md](./docs/search.md) | semantic, time-aware and relevant search; staleness; consolidation |
 | [docs/change-feed.md](./docs/change-feed.md) | `memory_since` / `GET /changes` |
-| [docs/tasks.md](./docs/tasks.md) | task board, session handoffs, one-call catch-up |
+| [docs/tasks.md](./docs/tasks.md) | task board, claims, command tasks, handoffs, one-call catch-up |
 | [docs/memory-linter.md](./docs/memory-linter.md) | `ONEMEMORY_LINT`, detection rules, quarantine |
 | [docs/file-sync.md](./docs/file-sync.md) | Markdown export/import, GitHub and Syncthing workflows |
 | [docs/sessionstart-hook.md](./docs/sessionstart-hook.md) | automatic recall at Claude Code session start |
