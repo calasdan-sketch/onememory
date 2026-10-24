@@ -1,0 +1,19 @@
+{
+  "status": {
+    "file": "C:\\Windows\\System32\\hostname.exe",
+    "description": "Cheapest possible proof the loop is listening: prints the PC's name."
+  },
+  "site-pull": {
+    "file": "C:\\Program Files\\Git\\cmd\\git.exe",
+    "args": ["-C", "C:\\Users\\danie\\repos\\calas-site", "pull", "--ff-only"],
+    "timeoutMs": 60000,
+    "description": "Fast-forward the live site repo. No merge, no force."
+  },
+  "repo-pull": {
+    "file": "C:\\Program Files\\Git\\cmd\\git.exe",
+    "params": { "repo": "[a-z0-9-]{1,40}" },
+    "paramArgs": ["-C", "C:\\Users\\danie\\repos\\{repo}", "pull", "--ff-only"],
+    "timeoutMs": 60000,
+    "description": "Fast-forward one repo by folder name. The pattern blocks dots, slashes and shell characters."
+  }
+}

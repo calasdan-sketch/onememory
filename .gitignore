@@ -5,7 +5,8 @@ node_modules/
 dist/
 
 # Runtime data (SQLite store + bearer token file)
-data/
+data/*
+!data/runner-allow.example.json
 *.db
 *.db-shm
 *.db-wal
