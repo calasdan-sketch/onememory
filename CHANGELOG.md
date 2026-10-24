@@ -93,7 +93,7 @@ real holes in the trust feature. All are fixed here; schema is **unchanged at v1
 - Three tests that did not test what their names said were fixed: "survives a reopen" (now reopens a file),
   "two processes at once" (now two real child processes), "not named runner-*" (now checks that no shipped
   module imports a runner module). The pack smoke test extracts the tarball with Node (no `tar` binary).
-- 49 new tests (1186 to 1235): `test/trust-141.test.ts`, `test/trust-gate-guard.test.ts` and additions in the liveness,
+- 51 new tests (1186 to 1237): `test/trust-141.test.ts`, `test/trust-gate-guard.test.ts` and additions in the liveness,
   migration and policy suites.
 
 ### Not covered (stated plainly)
