@@ -79,7 +79,16 @@ import {
   type NoteRecord,
 } from "./store.js";
 import { maybeEmbed } from "./search-service.js";
-import { assertPlainWriteTags } from "./reserved-tags.js";
+
+
+/** The approval tag family is store-keyed: a file can neither carry nor mint one. */
+const APPROVAL_TAG_PREFIX = "task.approval:";
+
+/** Tags to store for an imported file: everything except approvals (which stay as the store has them). */
+function importTags(fileTags: readonly string[], localTags: readonly string[] = []): string[] {
+  const keepLocal = localTags.filter((t) => t.startsWith(APPROVAL_TAG_PREFIX));
+  return [...fileTags.filter((t) => !t.startsWith(APPROVAL_TAG_PREFIX)), ...keepLocal];
+}
 
 /** Front-matter keys, in the order export writes them. */
 const KEYS = [
@@ -615,13 +624,15 @@ export async function importMarkdown(
       }
     };
     const createFrom = (): NoteRecord => {
-      assertPlainWriteTags(content.tags); // task / handoff notes don't enter via files
+      // importMarkdown is a LOCAL, admin-trust path (CLI only; no token can
+      // reach it), so a restore from files must bring back tasks, handoffs
+      // and legacy notes tagged `task`. Approvals never travel by file.
       const n = store.create(
         {
           namespace,
           title,
           body,
-          tags: content.tags,
+          tags: importTags(content.tags),
           source: typeof fm.source === "string" ? fm.source : undefined,
           created_at: typeof fm.created_at === "string" ? fm.created_at : undefined,
         },
@@ -664,8 +675,7 @@ export async function importMarkdown(
     }
     const localChanged = baseHash === null || localHash !== baseHash;
     const applyFile = (): NoteRecord | null => {
-      assertPlainWriteTags(content.tags, local.tags);
-      return store.update(local.id, { namespace, title, body, tags: content.tags }, { ifRev: local.rev });
+      return store.update(local.id, { namespace, title, body, tags: importTags(content.tags, local.tags) }, { ifRev: local.rev });
     };
 
     if (!fileChanged) {

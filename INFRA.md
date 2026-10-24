@@ -541,6 +541,11 @@ onememory backup --out ~/om-backup/2026-10-24
   unreadable without `.key`; a backup kept next to its key is no longer
   protected by the encryption. Put the key in a password manager or another
   drive, keep a second copy, and never lose it: there is no recovery without it.
+- The command-task **approval key** (in the database's `_meta`, not in `.key`) is
+  left out of the backup unless you add `--include-approval-key`. After restoring
+  such a backup, existing approvals read as stale (they fail closed) and an admin
+  re-approves queued command tasks. Include the key only if you need approvals to
+  survive a restore, and then guard the backup like the key.
 - Do not just copy `state.db` while the server runs: without `state.db-wal` /
   `state.db-shm` the copy can be inconsistent.
 - Restore: stop the server, put `state.db` (and `.key` if you use encryption) in
@@ -551,7 +556,8 @@ onememory backup --out ~/om-backup/2026-10-24
   independent of the database file format; use both if you like.
 
 Other housekeeping that runs by itself: `audit.log` rotates at 5 MB keeping 5
-files (`ONEMEMORY_AUDIT_MAX_BYTES`, `ONEMEMORY_AUDIT_KEEP`), and the change log
+files (`ONEMEMORY_AUDIT_MAX_BYTES`, `ONEMEMORY_AUDIT_KEEP`; rotation is locked so several
+processes cannot lose lines), and the change log
 is pruned hourly (90-day retention) by the server, not just when the feed is read.
 
 ---

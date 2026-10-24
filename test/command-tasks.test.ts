@@ -73,7 +73,7 @@ describe("command tasks", () => {
 
   test("approved + right target + right namespace + allowlisted: runs, result written back, approval consumed", async () => {
     const t = queue();
-    const approved = approveTask(store, { id: t.id });
+    const approved = approveTask(store, { id: t.id, if_rev: store.read(t.id)!.rev });
     assert.equal(approved.approval, "approved");
     assert.equal(await pollTasks(deps), 1);
     assert.equal(readFileSync(marker, "utf8"), "ran");
@@ -93,14 +93,14 @@ describe("command tasks", () => {
 
   test("output is recorded on the task", async () => {
     const t = putTask(store, { title: "hi", namespace: NS, command: { action: "hello" }, target: "pc-1" }).task;
-    approveTask(store, { id: t.id });
+    approveTask(store, { id: t.id, if_rev: store.read(t.id)!.rev });
     await pollTasks(deps);
     assert.match(String(getTask(store, t.id).result!.output), /hello from the runner/);
   });
 
   test("edited via task_put after approval: approval is gone, nothing runs", async () => {
     const t = queue();
-    approveTask(store, { id: t.id });
+    approveTask(store, { id: t.id, if_rev: store.read(t.id)!.rev });
     const edited = putTask(store, { id: t.id, command: { action: "mark", params: { p: join(dir, "other.txt") } } }).task;
     assert.equal(edited.approval, "none");
     assert.equal(edited.status, "queued");
@@ -111,7 +111,7 @@ describe("command tasks", () => {
 
   test("edited behind the API's back (plain note write) after approval: MAC no longer matches", async () => {
     const t = queue();
-    approveTask(store, { id: t.id });
+    approveTask(store, { id: t.id, if_rev: store.read(t.id)!.rev });
     const n = store.read(t.id)!;
     const evil = join(dir, "evil.txt");
     store.update(t.id, { body: n.body.replace(JSON.stringify(marker), JSON.stringify(evil)) });
@@ -123,14 +123,14 @@ describe("command tasks", () => {
 
   test("changing only the target after approval voids it too", async () => {
     const t = queue();
-    approveTask(store, { id: t.id });
+    approveTask(store, { id: t.id, if_rev: store.read(t.id)!.rev });
     assert.equal(putTask(store, { id: t.id, target: "pc-2" }).task.approval, "none");
     assert.equal(await pollTasks(deps), 0);
   });
 
   test("an approval tag copied from another task does not verify", async () => {
     const a = queue();
-    approveTask(store, { id: a.id });
+    approveTask(store, { id: a.id, if_rev: store.read(a.id)!.rev });
     const b = queue();
     const tagA = store.read(a.id)!.tags.find((x) => x.startsWith("task.approval:"))!;
     store.update(b.id, { tags: [...store.read(b.id)!.tags, tagA] });
@@ -150,7 +150,7 @@ describe("command tasks", () => {
 
   test("wrong target: left untouched for the machine it is addressed to", async () => {
     const t = queue({ target: "pc-2" });
-    approveTask(store, { id: t.id });
+    approveTask(store, { id: t.id, if_rev: store.read(t.id)!.rev });
     assert.equal(await pollTasks(deps), 0);
     assert.equal(existsSync(marker), false);
     assert.equal(getTask(store, t.id).status, "queued");
@@ -162,18 +162,18 @@ describe("command tasks", () => {
 
   test("wrong namespace / feature off: never looked at", async () => {
     const t = putTask(store, { title: "x", namespace: "default", command: { action: "mark", params: { p: marker } }, target: "pc-1" }).task;
-    approveTask(store, { id: t.id });
+    approveTask(store, { id: t.id, if_rev: store.read(t.id)!.rev });
     assert.equal(await pollTasks(deps), 0);
     assert.equal(existsSync(marker), false);
     const t2 = queue();
-    approveTask(store, { id: t2.id });
+    approveTask(store, { id: t2.id, if_rev: store.read(t2.id)!.rev });
     assert.equal(await pollTasks({ ...deps, taskNamespace: "" }), 0, "no task namespace configured = off");
     assert.equal(existsSync(marker), false);
   });
 
   test("a task moved to another namespace after approval loses it (MAC binds the namespace)", async () => {
     const t = queue();
-    approveTask(store, { id: t.id });
+    approveTask(store, { id: t.id, if_rev: store.read(t.id)!.rev });
     store.update(t.id, { namespace: "elsewhere" });
     store.update(t.id, { namespace: NS });
     assert.equal(getTask(store, t.id).approval, "approved", "round trip unchanged is still the same namespace");
@@ -185,7 +185,7 @@ describe("command tasks", () => {
 
   test("non-allowlisted action: approved but refused in writing, nothing spawned", async () => {
     const t = putTask(store, { title: "rm", namespace: NS, command: { action: "rm-rf", params: {} }, target: "pc-1" }).task;
-    approveTask(store, { id: t.id });
+    approveTask(store, { id: t.id, if_rev: store.read(t.id)!.rev });
     assert.equal(await pollTasks(deps), 1);
     const after = getTask(store, t.id);
     assert.equal(after.status, "failed");
@@ -195,21 +195,21 @@ describe("command tasks", () => {
 
   test("parameter outside its pattern is refused (no injection through params)", async () => {
     const t = putTask(store, { title: "inj", namespace: NS, command: { action: "mark", params: { p: "x; touch /tmp/pwned" } }, target: "pc-1" }).task;
-    approveTask(store, { id: t.id });
+    approveTask(store, { id: t.id, if_rev: store.read(t.id)!.rev });
     await pollTasks(deps);
     const after = getTask(store, t.id);
     assert.equal(after.status, "failed");
     assert.match(String(after.result!.reason), /pattern/);
     // an undeclared parameter is refused too
     const t2 = putTask(store, { title: "inj2", namespace: NS, command: { action: "hello", params: { extra: "1" } }, target: "pc-1" }).task;
-    approveTask(store, { id: t2.id });
+    approveTask(store, { id: t2.id, if_rev: store.read(t2.id)!.rev });
     await pollTasks(deps);
     assert.equal(getTask(store, t2.id).status, "failed");
   });
 
   test("replay: an used approval can't run again; re-queue needs a fresh admin approval", async () => {
     const t = queue();
-    approveTask(store, { id: t.id });
+    approveTask(store, { id: t.id, if_rev: store.read(t.id)!.rev });
     await pollTasks(deps);
     rmSync(marker);
     // a write token re-queues it
@@ -218,14 +218,14 @@ describe("command tasks", () => {
     assert.equal(await pollTasks(deps), 0);
     assert.equal(existsSync(marker), false);
     // a fresh approval = a fresh nonce = runs once more
-    approveTask(store, { id: t.id });
+    approveTask(store, { id: t.id, if_rev: store.read(t.id)!.rev });
     assert.equal(await pollTasks(deps), 1);
     assert.equal(existsSync(marker), true);
   });
 
   test("replay against the ledger: a used cmd id is rejected even with a valid approval", async () => {
     const t = queue();
-    const approved = approveTask(store, { id: t.id });
+    const approved = approveTask(store, { id: t.id, if_rev: store.read(t.id)!.rev });
     const tag = store.read(approved.id)!.tags.find((x) => x.startsWith("task.approval:"))!;
     const nonce = tag.slice("task.approval:".length).split(".")[0];
     deps.ledger.add(`task-${t.id}-${nonce}`);
@@ -234,19 +234,19 @@ describe("command tasks", () => {
     assert.match(String(getTask(store, t.id).result!.reason), /already used/);
   });
 
-  test("a live claim keeps the runner away", async () => {
+  test("a command task cannot be claimed, so a lease cannot starve the runner", async () => {
     const t = queue();
-    approveTask(store, { id: t.id });
-    claimTask(store, { id: t.id, owner: "human" });
-    assert.equal(await pollTasks(deps), 0);
+    approveTask(store, { id: t.id, if_rev: store.read(t.id)!.rev });
+    assert.throws(() => claimTask(store, { id: t.id, owner: "human" }), /command task/);
+    assert.equal(await pollTasks(deps), 1);
   });
 
   test("approval rules: needs a command, needs queued", () => {
     const plain = putTask(store, { title: "plain", namespace: NS }).task;
-    assert.throws(() => approveTask(store, { id: plain.id }), /no command/);
+    assert.throws(() => approveTask(store, { id: plain.id, if_rev: store.read(plain.id)!.rev }), /no command/);
     const t = queue();
     putTask(store, { id: t.id, status: "blocked" });
-    assert.throws(() => approveTask(store, { id: t.id }), /only a queued/);
+    assert.throws(() => approveTask(store, { id: t.id, if_rev: store.read(t.id)!.rev }), /only a queued/);
   });
 
   test("validation: target required, status must be queued, params shape", () => {
@@ -261,7 +261,7 @@ describe("command tasks", () => {
   test("flood ceiling applies to command tasks", async () => {
     for (let i = 0; i < 3; i++) {
       const t = putTask(store, { title: `t${i}`, namespace: NS, command: { action: "hello" }, target: "pc-1" }).task;
-      approveTask(store, { id: t.id });
+      approveTask(store, { id: t.id, if_rev: store.read(t.id)!.rev });
     }
     const prev = RUNNER.maxPerPoll;
     (RUNNER as any).maxPerPoll = 2;
@@ -295,7 +295,7 @@ describe("who may approve", () => {
     assert.equal(r2.isError, true);
     assert.equal(store.list({ withTags: ["task"] }).total, 1, "the refused self-approve created nothing");
     const a = await connect("admin");
-    const ok = parseTool(await a.callTool({ name: "task_approve", arguments: { id: made.task.id } }));
+    const ok = parseTool(await a.callTool({ name: "task_approve", arguments: { id: made.task.id, command_hash: made.task.command_hash } }));
     assert.equal(ok.task.approval, "approved");
     const direct = parseTool(await a.callTool({ name: "task_put", arguments: { title: "c3", command: { action: "hello" }, target: "pc-1", approve: true } }));
     assert.equal(direct.task.approval, "approved");
@@ -324,7 +324,7 @@ describe("who may approve", () => {
     assert.equal((await call("POST", "/tasks", "wr", { title: "c2", command: { action: "hello" }, target: "pc-1", approve: true })).status, 403);
     // forging the approval through plain notes is refused
     assert.equal((await call("PUT", `/notes/${made.task.id}`, "wr", { tags: ["task", "status:queued", `task.approval:${"a".repeat(16)}.${"b".repeat(32)}`] })).status, 400);
-    const ok: any = await (await call("POST", `/tasks/${made.task.id}/approve`, "adm")).json();
+    const ok: any = await (await call("POST", `/tasks/${made.task.id}/approve`, "adm", { command_hash: made.task.command_hash })).json();
     assert.equal(ok.task.approval, "approved");
     const got: any = await (await call("GET", `/tasks/${made.task.id}`, "rd")).json();
     assert.equal(got.task.approval, "approved");

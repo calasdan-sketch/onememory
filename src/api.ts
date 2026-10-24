@@ -7,7 +7,8 @@
 // except the open /health and /ready probes and the dashboard page itself.
 // Format: `Authorization: Bearer <token>`.
 
-import { createServer, ServerResponse, Server } from "node:http";
+import { createServer, ServerResponse, Server, type IncomingMessage } from "node:http";
+import { actorStore } from "./actor.js";
 import {
   Store,
   NoteInput,
@@ -278,7 +279,7 @@ export function createApiServer(
   ): { notes: NoteRecord[]; total: number } =>
     store.list({ namespaces: readable(ctx), limit, offset, includeArchived, archivedOnly });
 
-  return createServer(async (req, res) => {
+  const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     // Per-request namespace context. A LOCAL, not a factory-scoped mutable:
     // this server serves concurrent requests, and a shared `let` would be
     // overwritten by an interleaved request while an earlier one is parked in
@@ -389,6 +390,8 @@ export function createApiServer(
         return;
       }
       const scope = principal.scope;
+      const actorRef = actorStore.getStore();
+      if (actorRef) actorRef.label = principal.label;
       // Per-request namespace: a token's own pin WINS over the server's
       // cwd-resolved namespace. This is the isolation boundary for this
       // request -- resolved here, once, so every gate below reads `ns`.
@@ -1063,7 +1066,16 @@ export function createApiServer(
                 audit({ op: "task.claim", id: r.task.id, namespace: r.task.namespace, label: principal.label, kind: "task", detail: r.released ? "release" : r.heartbeat ? "heartbeat" : "claim" });
                 sendJson(res, 200, r);
               } else {
-                const task = approveTask(store, { id: Number(sub[1]), revoke: body.revoke === true }, writeNs);
+                const task = approveTask(
+                  store,
+                  {
+                    id: Number(sub[1]),
+                    revoke: body.revoke === true,
+                    command_hash: typeof body.command_hash === "string" ? body.command_hash : undefined,
+                    if_rev: typeof body.if_rev === "number" ? body.if_rev : undefined,
+                  },
+                  writeNs
+                );
                 audit({ op: body.revoke === true ? "task.revoke" : "task.approve", id: task.id, namespace: task.namespace, label: principal.label, kind: "task" });
                 sendJson(res, 200, { task });
               }
@@ -1098,7 +1110,7 @@ export function createApiServer(
             const warnings: LintFinding[] = [];
             const wantApprove = body.approve === true;
             if (wantApprove && !scopeAllows(scope, "admin")) {
-              sendJson(res, 403, { error: "approve:true needs an admin token; approve with POST /tasks/:id/approve" });
+              sendJson(res, 403, { error: "approve:true needs an admin token; approve with POST /tasks/:id/approve (send the command_hash you read)" });
               return;
             }
             if (wantApprove && !body.command) {
@@ -1108,7 +1120,7 @@ export function createApiServer(
             const put = putTask(store, body as never, writeNs, warnings);
             await maybeEmbed(store, put.note);
             let task = put.task;
-            if (wantApprove && !put.replayed) task = approveTask(store, { id: task.id }, writeNs);
+            if (wantApprove && !put.replayed) task = approveTask(store, { id: task.id, if_rev: task.rev }, writeNs);
             audit({ op: "task.put", id: task.id, namespace: task.namespace, label: principal.label, kind: task.command ? "command-task" : "task", detail: put.replayed ? "replay" : "create" });
             sendJson(res, put.replayed ? 200 : 201, {
               task,
@@ -1338,5 +1350,10 @@ export function createApiServer(
       console.error("[onememory] request error:", (e as Error).message);
       sendJson(res, 500, { error: "internal error" });
     }
+  };
+  // Every request gets its own actor holder; the label is filled in once the
+  // token is authenticated, so change_log records who actually wrote.
+  return createServer((req, res) => {
+    void actorStore.run({ label: "" }, () => handle(req, res));
   });
 }

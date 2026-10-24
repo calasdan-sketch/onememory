@@ -16,15 +16,16 @@
 //                  OUT of that namespace, where this runner never looks.
 //   2. TARGET      command.target equals THIS runner's own id (runnerId()).
 //                  Another machine's tasks are left untouched.
-//   3. APPROVAL    a valid store-keyed MAC over (namespace, task id, nonce,
-//                  hash of the command and target), written only by the
+//   3. APPROVAL    a valid, unexpired store-keyed MAC over (namespace, task id,
+//                  nonce, expiry, hash of the command and target), written only by the
 //                  admin-scope approve path. Editing the command, params or
 //                  target (or re-queuing) voids it; a tag copied onto another
 //                  task or forged by a note writer fails the MAC (the tag
 //                  family is reserved, and the key never leaves the store).
-//   4. REPLAY      the approval nonce is single-use: cmd_id `task-<id>-<nonce>`
-//                  goes into the runner's local ledger BEFORE running, and the
-//                  approval is consumed (removed) when the run ends.
+//   4. REPLAY      the approval is single-use: it is REMOVED from the task in
+//                  the same compare-and-swap write that marks it running (so a
+//                  crash or a lost ledger cannot replay it), and cmd_id
+//                  `task-<id>-<nonce>` also goes into the local ledger BEFORE running.
 //   5. ALLOWLIST   the action must be on THIS PC's allowlist with params
 //                  matching its patterns (resolveAction): exactly the gate
 //                  command notes pass. No allowlist, no run.
@@ -72,7 +73,11 @@ export async function pollTasks(deps: RunnerDeps): Promise<number> {
     if (!cmd) continue;
     if (cmd.target !== me) continue; // another machine's task: not ours, leave it alone
     if (task.approval !== "approved") continue; // unapproved, edited since approval, or forged: never runs
-    if (task.lease) continue; // someone holds it right now
+    // Leases: a command task cannot be claimed (claimTask refuses) and admin
+    // approve/revoke clears any lease, so a live lease on an APPROVED task can
+    // only predate the approval. The runner still respects it (it never
+    // preempts another owner); re-approving clears it.
+    if (task.lease) continue;
 
     const nonce = approvalNonce(note);
     const cmdId = `task-${note.id}-${nonce}`;

@@ -39,6 +39,7 @@ import { isStale, stalenessConfig, annotateStaleness } from "./staleness.js";
 // At-rest encryption for note bodies. No module cycle: crypto.ts imports
 // only node: builtins, never store.ts.
 import { encrypt, decryptIfEncrypted, loadKey, keyPath, noteAad } from "./crypto.js";
+import { currentActor } from "./actor.js";
 
 /**
  * A caller-input error (bad/oversized/secret-bearing data, empty title, stale
@@ -282,7 +283,7 @@ export interface QuarantineEntry {
 export const CHANGE_LOG_RETENTION_DAYS = 90;
 
 /** Current schema version (PRAGMA user_version). See Store.migrate. */
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 /**
  * Notes fetched per page by exportBatch(), which both streaming export
@@ -765,9 +766,14 @@ function archivedClause(includeArchived?: boolean, archivedOnly?: boolean): stri
  * encoding including its quotes, so a tag never matches inside another value;
  * tagsMatch() re-checks exactly as a belt-and-braces guard.
  */
-function tagClause(withTags?: string[], withoutTags?: string[]): { sql: string; params: string[] } {
+function tagClause(withTags?: string[], withoutTags?: string[], tagPrefix?: string): { sql: string; params: string[] } {
   let sql = "";
   const params: string[] = [];
+  if (tagPrefix) {
+    // JSON encoding without the closing quote: matches a tag that STARTS with the prefix.
+    sql += " AND instr(tags, ?) > 0";
+    params.push(JSON.stringify(tagPrefix).slice(0, -1));
+  }
   for (const t of withTags ?? []) {
     sql += " AND instr(tags, ?) > 0";
     params.push(JSON.stringify(t));
@@ -779,9 +785,10 @@ function tagClause(withTags?: string[], withoutTags?: string[]): { sql: string; 
   return { sql, params };
 }
 
-function tagsMatch(rawTags: string, withTags?: string[], withoutTags?: string[]): boolean {
-  if (!withTags?.length && !withoutTags?.length) return true;
+function tagsMatch(rawTags: string, withTags?: string[], withoutTags?: string[], tagPrefix?: string): boolean {
+  if (!withTags?.length && !withoutTags?.length && !tagPrefix) return true;
   const have = parseTags(rawTags);
+  if (tagPrefix && !have.some((t) => t.startsWith(tagPrefix))) return false;
   return (withTags ?? []).every((t) => have.includes(t)) && !(withoutTags ?? []).some((t) => have.includes(t));
 }
 
@@ -873,6 +880,7 @@ export class Store {
     if (!this.lastKey) this.recoverStrandedKey();
     this.keyStamp = this.stampOf();
     this.init();
+    this.installActorStamp();
     this.upgradeV1Envelopes();
     // Notes are private: owner-only db + WAL/SHM (POSIX; no-op on Windows).
     if (dbPath !== ":memory:") for (const ext of ["", "-wal", "-shm"]) chmodQuiet(dbPath + ext, 0o600);
@@ -1203,6 +1211,35 @@ export class Store {
         END;
       `);
     }
+    if (v < 12) {
+      // v12: change_log.actor = the label of the token / connection that made
+      //     the write (NOT the note's free-form `source`), so exclude_self
+      //     hides a consumer's own writes and nothing else. Rows written
+      //     before this version, by the CLI, by scripts or by any other tool
+      //     carry '' and fall back to `source` when filtered. The stamping is
+      //     done per connection by a TEMP trigger (see installActorStamp), so
+      //     the stored triggers are unchanged and foreign writers still work.
+      this.addColumn("change_log", "actor", "TEXT NOT NULL DEFAULT ''");
+    }
+  }
+
+  /**
+   * Stamp the writer's label on every change_log row this connection causes.
+   * A TEMP trigger lives only on this connection (nothing persists in the
+   * file, so other tools and older code are unaffected) and calls a function
+   * registered on this connection only. No actor in scope (CLI, scripts) =
+   * the trigger does nothing and the row keeps actor ''.
+   */
+  private installActorStamp(): void {
+    this.db.function("om_actor", { deterministic: false }, () => currentActor());
+    this.db.exec(`
+      DROP TRIGGER IF EXISTS temp.om_actor_stamp;
+      CREATE TEMP TRIGGER om_actor_stamp AFTER INSERT ON main.change_log
+      WHEN om_actor() <> ''
+      BEGIN
+        UPDATE change_log SET actor = om_actor() WHERE seq = new.seq;
+      END;
+    `);
   }
 
   /**
@@ -2250,6 +2287,8 @@ export class Store {
       withTags?: string[];
       /** Only notes carrying NONE of these exact tags. */
       withoutTags?: string[];
+      /** Only notes with at least one tag starting with this prefix. */
+      withTagPrefix?: string;
     } & RangeOpts = {}
   ): {
     notes: NoteRecord[];
@@ -2258,13 +2297,13 @@ export class Store {
     const limit = clampInt(opts.limit, 50, 1, 500);
     const offset = clampInt(opts.offset, 0, 0, Number.MAX_SAFE_INTEGER);
     const range = rangeClause(opts);
-    const tagF = tagClause(opts.withTags, opts.withoutTags);
+    const tagF = tagClause(opts.withTags, opts.withoutTags, opts.withTagPrefix);
     // Archived filter: default hides archived; archivedOnly inverts it.
     const archSql = archivedClause(opts.includeArchived, opts.archivedOnly);
     const extra = [...range.params, ...tagF.params];
     // SQL LIKE is only a prefilter (tags are a JSON array string); the exact
     // match is re-checked below so a tag never matches inside another value.
-    const exact = (r: NoteRow): boolean => tagsMatch(r.tags, opts.withTags, opts.withoutTags);
+    const exact = (r: NoteRow): boolean => tagsMatch(r.tags, opts.withTags, opts.withoutTags, opts.withTagPrefix);
 
     let rows: NoteRow[];
     let total: number;
@@ -3360,8 +3399,22 @@ export class Store {
     this.lastChangeLogPurge = now;
     const cutoff = new Date(now - CHANGE_LOG_RETENTION_DAYS * 86_400_000).toISOString();
     this.bestEffortWrite(() => {
-      this.db.prepare("DELETE FROM change_log WHERE changed_at < ?").run(cutoff);
+      // Remember how far the purge reached, so a consumer whose marker is
+      // older than that learns it missed events (markerReset) instead of
+      // silently skipping them.
+      const top = this.db.prepare("SELECT MAX(seq) AS m FROM change_log WHERE changed_at < ?").get(cutoff) as { m: number | null };
+      if (top.m === null) return;
+      this.transaction(() => {
+        this.db.prepare("DELETE FROM change_log WHERE changed_at < ?").run(cutoff);
+        const prev = Number(this.getMeta("change_log_purged_to") ?? 0) || 0;
+        this.setMeta("change_log_purged_to", String(Math.max(prev, Number(top.m))));
+      });
     });
+  }
+
+  /** Highest change_log seq ever purged by retention (0 = none): events at or below it are gone. */
+  changeLogPurgedTo(): number {
+    return Number(this.getMeta("change_log_purged_to") ?? 0) || 0;
   }
 
   /**
@@ -3553,7 +3606,7 @@ export class Store {
     const nsParams = opts.namespaces ?? [];
     const srcSql = opts.source !== undefined ? " AND source = ?" : "";
     const srcParams = opts.source !== undefined ? [opts.source] : [];
-    const exSql = c.x ? " AND source <> ?" : "";
+    const exSql = c.x ? " AND (CASE WHEN actor <> '' THEN actor ELSE source END) <> ?" : "";
     const exParams = c.x ? [c.x] : [];
     // One entry per note: its LAST event in the window, kind "deleted" if
     // that event is the delete, else "created" if the note was born in the

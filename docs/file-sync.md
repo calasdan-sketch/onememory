@@ -172,3 +172,10 @@ merge them by hand.
   maintenance commands.
 - Conflicts are whole-note, not line-level merges.
 - Deletes do not propagate through files (see above).
+
+**Tasks and handoffs.** Import is a local admin command (no token can reach it), so
+notes carrying the reserved `task` / `handoff` / `task.*` tags are restored as
+written: an export/import round trip keeps your tasks, handoffs and any 1.2.x notes
+you tagged `task`. The `task.approval:` tag is never imported (approvals are bound
+to the store's own key). If any file is `rejected`, the command prints a loud count
+on stderr and exits with status 1.

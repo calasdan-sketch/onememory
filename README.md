@@ -237,7 +237,7 @@ REST mirrors them (`/notes`, `/search`, `/relevant`, `/changes`, `/tasks`, `/han
 onememory start | mcp | doctor | init
 onememory changes --since last --consumer laptop
 onememory watch --consumer pc [--exec program args...]     # react to changes as they land
-onememory backup [--out dir]                                # hot copy of the database (+ key)
+onememory backup [--out dir] [--include-approval-key]       # hot copy of the database (+ key)
 onememory export --format md --dir ~/memory     onememory import --dir ~/memory
 onememory quarantine [list | approve <id> | reject <id>]
 onememory consolidate | rebuild-edges | reindex | relevant "…" | recall

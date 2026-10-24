@@ -49,7 +49,7 @@ function usage(): void {
       "  changes --purge             delete the whole change log (titles of past changes) and all markers",
       "            What changed while you were away: created/updated/deleted notes",
       "            grouped by source. --since last uses (and advances) a per-consumer marker.",
-      "  backup [--out <dir>]",
+      "  backup [--out <dir>] [--include-approval-key]",
       "            Consistent hot copy of the database (works while the server runs)",
       "            into <dir>/state.db, plus a copy of the encryption key (.key) if",
       "            at-rest encryption is on. Default dir: ./onememory-backup-<time>.",
@@ -707,13 +707,18 @@ async function backupCmd(): Promise<void> {
   const { DB_PATH } = await import("./config.js");
   const { Store } = await import("./store.js");
   const { backupStore } = await import("./backup.js");
-  const { flags } = parseFlags(process.argv.slice(3), { values: ["out"], bools: [] });
+  const { flags } = parseFlags(process.argv.slice(3), { values: ["out"], bools: ["include-approval-key"] });
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*$/, "").replace("T", "-");
   const out = str(flags.out) ?? `onememory-backup-${stamp}`;
   const store = new Store(DB_PATH);
   try {
-    const r = backupStore(store, DB_PATH, out);
+    const r = backupStore(store, DB_PATH, out, { includeApprovalKey: flags["include-approval-key"] === true });
     console.log(`Backed up ${r.notes} note(s) (${r.bytes} bytes) to ${r.db}`);
+    console.log(
+      r.approvalKey
+        ? "Included the command-task approval key (--include-approval-key): guard this backup like the encryption key."
+        : "The command-task approval key was NOT copied: after a restore, existing approvals read as stale (fail closed) and an admin re-approves queued command tasks."
+    );
     if (r.key) {
       console.log(`Copied the encryption key to ${r.key} (mode 0600).`);
       console.log(
@@ -749,8 +754,13 @@ async function watchCmd(): Promise<void> {
     process.exit(1);
   }
   const abort = new AbortController();
-  process.on("SIGINT", () => abort.abort());
-  process.on("SIGTERM", () => abort.abort());
+  // First signal: stop cleanly (kill the running handler, finish). A second one exits at once.
+  const onSignal = (sig: NodeJS.Signals): void => {
+    if (abort.signal.aborted) process.exit(sig === "SIGINT" ? 130 : 143);
+    abort.abort();
+  };
+  process.on("SIGINT", () => onSignal("SIGINT"));
+  process.on("SIGTERM", () => onSignal("SIGTERM"));
   const store = new Store(DB_PATH);
   try {
     console.error(`watching as "${str(flags.consumer) ?? "watch"}" (Ctrl+C to stop)`);
@@ -933,6 +943,7 @@ async function importCmd(): Promise<void> {
   const store = new Store(DB_PATH);
   try {
     const r = await importMarkdown(store, str(flags.dir)!, { dryRun: flags["dry-run"] === true, allowMove: flags["allow-move"] === true });
+    if (r.counts.rejected > 0) process.exitCode = 1;
     if (flags.json) {
       console.log(JSON.stringify(r, null, 2));
       return;
@@ -947,6 +958,12 @@ async function importCmd(): Promise<void> {
         `${c.restored} restored, ${c.unchanged} unchanged, ${c.skipped} skipped, ${c.conflict} conflict(s), ` +
         `${c.quarantined} quarantined, ${c.rejected} rejected.`
     );
+    if (c.rejected > 0) {
+      console.error(
+        `\n!!! ${c.rejected} FILE(S) WERE REJECTED AND NOT IMPORTED (see the "rejected" lines above). ` +
+          `Nothing was dropped silently; fix those files and import again. Exit status 1.`
+      );
+    }
   } catch (e) {
     if (e instanceof ValidationError) {
       console.error(`Error: ${e.message}`);

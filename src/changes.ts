@@ -168,7 +168,8 @@ function runChangesInner(store: Store, req: ChangesRequest): ChangesResponse {
     } else {
       const consumer = consumerKey(req.consumer);
       const seen = store.getFeedMarker(consumer, feedScopeKey(req.namespaces, req.source));
-      markerReset = seen === null;
+      // A marker older than what retention purged has missed events: say so.
+      markerReset = seen === null || seen.seq < store.changeLogPurgedTo();
       page = store.changes({
         since: seen?.at ?? new Date(Date.now() - LAST_FALLBACK_MS).toISOString(),
         fromSeq: seen?.seq,

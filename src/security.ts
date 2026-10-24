@@ -426,14 +426,39 @@ function rotateAuditIfNeeded(path: string): void {
     return;
   }
   if (size < max) return;
-  for (let i = keep; i >= 1; i--) {
-    const src = i === 1 ? path : `${path}.${i - 1}`;
+  // Rotation is a multi-step rename chain; two processes (the server and a CLI)
+  // running it at once would rename over each other's files and lose lines.
+  // Serialize it with an atomic lock directory; whoever loses the race skips
+  // (the winner rotates) and re-checks the size under the lock.
+  const lock = `${path}.lock`;
+  try {
+    mkdirSync(lock);
+  } catch {
     try {
-      if (i === keep) rmSync(`${path}.${i}`, { force: true }); // drop the oldest (Windows can't rename over it)
-      renameSync(src, `${path}.${i}`);
+      // A lock left by a crashed process must not block rotation forever.
+      if (Date.now() - statSync(lock).mtimeMs > 10_000) rmSync(lock, { recursive: true, force: true });
     } catch {
-      /* a gap in the chain is fine */
+      /* raced with the owner: fine */
     }
+    return;
+  }
+  try {
+    try {
+      if (statSync(path).size < max) return; // someone else just rotated
+    } catch {
+      return;
+    }
+    for (let i = keep; i >= 1; i--) {
+      const src = i === 1 ? path : `${path}.${i - 1}`;
+      try {
+        if (i === keep) rmSync(`${path}.${i}`, { force: true }); // drop the oldest (Windows can't rename over it)
+        renameSync(src, `${path}.${i}`);
+      } catch {
+        /* a gap in the chain is fine */
+      }
+    }
+  } finally {
+    rmSync(lock, { recursive: true, force: true });
   }
 }
 

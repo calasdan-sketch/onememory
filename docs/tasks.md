@@ -69,11 +69,15 @@ task's title) and in `state_search`.
 
 `task_put({ command: { action, params }, target })` creates a task in status
 `queued` for the PC's [command runner](./RUNNER.md#command-tasks-the-task-board-in-front-of-the-runner).
-It does **not** run by itself: an admin must `task_approve({ id })` (REST
-`POST /tasks/:id/approve`, admin scope), the task must be addressed to that
+It does **not** run by itself: an admin must `task_approve({ id, command_hash })`
+(REST `POST /tasks/:id/approve` with `{ "command_hash": ... }`, admin scope; `rev` as
+`if_rev` also works), echoing the `command_hash` that `task_get` / `task_list` showed,
+so the approval is refused if the command changed after the admin read it. The task must be addressed to that
 runner's own id and live in the runner's configured task namespace, and the action
 must be on the PC's allowlist. The approval is bound to a hash of the command, so any
-edit voids it, and it is single-use. A write token can queue a task and nothing
+edit voids it, it expires (default 24 h), and it is single-use (removed in the write
+that marks the task running). A command task cannot be claimed; approve / revoke clear
+any lease on it. A namespace holds at most 100 queued command tasks. A write token can queue a task and nothing
 more; the runner's signing secret is never stored or exposed. Full rules, and what
 is deliberately not supported, in [RUNNER.md](./RUNNER.md#command-tasks-the-task-board-in-front-of-the-runner).
 
@@ -90,8 +94,10 @@ forging a "latest handoff", crowding real tasks off the board, or faking a lease
 or approval. Compatible by design: an existing note that already carries these
 tags can still have its title, body and *other* tags edited, and the
 `status:`, `surface:` and `owner:` tags are not reserved on their own (they mean
-nothing without `task` / `handoff`). Files in a synced Markdown folder that carry
-the `task` tag are likewise refused on import (tasks do not travel by file sync).
+nothing without `task` / `handoff`). `onememory import` (Markdown files) is a local
+admin command, not reachable with a token, so it restores such notes as they are
+(a restore from an export loses no tasks or handoffs); approvals are never imported.
+Any rejected file makes the command print a loud count and exit 1.
 
 ## 2. Handoffs
 
@@ -133,7 +139,7 @@ Returns, in one compact result:
   If your client can die before it has handled the result, pass
   `ack_mode: "manual"` and send the returned `ack_token` back (see
   [change-feed.md](./change-feed.md#do-not-lose-changes-acknowledged-reads)); `exclude_self`
-  hides your own writes.
+  hides writes made by your own token (see change-feed.md).
 - **tasks**: the open ones (not `done`), newest change first, **compact**: id,
   title, status, owner, next step, priority, due, parent, blockers, rev. No notes or
   command text; fetch one with `task_get`.

@@ -20,7 +20,7 @@
 // hand-rolled client can't store a task the board can't read back. Callers
 // (REST, MCP, the recall hook) do the token / scope / namespace gating and
 // pass the resulting namespaces in; nothing here widens access.
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, timingSafeEqual, randomBytes } from "node:crypto";
 import { Store, ValidationError, QuarantinedError, DEFAULT_NAMESPACE, type NoteRecord } from "./store.js";
 import { runChanges, type ChangesResponse } from "./changes.js";
 import { RESERVED_TAG_PREFIX } from "./reserved-tags.js";
@@ -109,6 +109,10 @@ export interface Task {
   /** Command tasks only (see docs/tasks.md "Command tasks"). */
   command: TaskCommand | null;
   approval: ApprovalState;
+  /** sha256 of the command as stored (what task_approve must echo back); null without a command. */
+  command_hash: string | null;
+  /** When the current approval stops being valid (ISO), or null. */
+  approval_expires_at: string | null;
   result: Record<string, unknown> | null;
   rev: number;
   created_at: string;
@@ -210,18 +214,25 @@ function intOrNull(v: unknown, name: string): number | null | undefined {
   return v;
 }
 
+/** YYYY-MM-DD that exists on the calendar (2026-02-31 does not). */
+function realDate(ymd: string): boolean {
+  const ms = Date.parse(ymd + "T00:00:00Z");
+  return !Number.isNaN(ms) && new Date(ms).toISOString().slice(0, 10) === ymd;
+}
+
 function normDue(v: unknown): string | null | undefined {
   if (v === undefined) return undefined;
   if (v === null || v === "") return null;
   if (typeof v !== "string") throw new ValidationError("due must be a string (YYYY-MM-DD or an ISO time)");
   const t = v.trim();
   if (/^\d{4}-\d{2}-\d{2}$/.test(t)) {
-    if (Number.isNaN(Date.parse(t + "T00:00:00Z"))) throw new ValidationError("due is not a valid date");
+    if (!realDate(t)) throw new ValidationError("due is not a real calendar date");
     return t;
   }
   if (!/^\d{4}-\d{2}-\d{2}T/.test(t) || Number.isNaN(Date.parse(t))) {
     throw new ValidationError("due must be YYYY-MM-DD or an ISO-8601 time");
   }
+  if (!realDate(t.slice(0, 10))) throw new ValidationError("due is not a real calendar date");
   return new Date(t).toISOString();
 }
 
@@ -349,18 +360,39 @@ export function commandHash(namespace: string, id: number, c: TaskCommand): stri
  * Is this note's approval tag a valid, current approval of the command it
  * carries? (store-keyed MAC over namespace, id, nonce and the command hash)
  */
-export function verifyApproval(store: Store, n: NoteRecord): ApprovalState {
+export function verifyApproval(store: Store, n: NoteRecord, now = Date.now()): ApprovalState {
   const st = stateOf(n);
   if (!st.approval) return "none";
   const cmd = parseBody(n.body).command;
-  const m = /^([0-9a-f]{16})\.([0-9a-f]{32})$/.exec(st.approval);
+  const m = APPROVAL_RE.exec(st.approval);
   if (!cmd || !m) return "stale";
+  const expMs = Number(m[2]);
+  if (!Number.isSafeInteger(expMs) || expMs <= now) return "stale"; // expired approvals die
   try {
-    const want = store.approvalMac([n.namespace, String(n.id), m[1], commandHash(n.namespace, n.id, cmd)], false);
-    return want !== null && want === m[2] ? "approved" : "stale";
+    const want = store.approvalMac([n.namespace, String(n.id), m[1], String(expMs), commandHash(n.namespace, n.id, cmd)], false);
+    if (want === null) return "stale";
+    const a = Buffer.from(want, "hex");
+    const b = Buffer.from(m[3], "hex");
+    return a.length === b.length && timingSafeEqual(a, b) ? "approved" : "stale";
   } catch {
     return "stale"; // fail closed
   }
+}
+
+/** Approval tag: "<nonce16>.<expiry ms>.<mac32>". */
+const APPROVAL_RE = /^([0-9a-f]{16})\.(\d{1,16})\.([0-9a-f]{32})$/;
+
+/** How long an approval stays valid (ONEMEMORY_APPROVAL_TTL_SECONDS, default 24 h, 60 s - 30 d). */
+export function approvalTtlMs(): number {
+  const raw = Number(process.env.ONEMEMORY_APPROVAL_TTL_SECONDS);
+  const sec = Number.isFinite(raw) && raw > 0 ? Math.min(30 * 86_400, Math.max(60, Math.floor(raw))) : 86_400;
+  return sec * 1000;
+}
+
+/** Max queued command tasks per namespace (ONEMEMORY_TASK_COMMAND_QUOTA, default 100). */
+export function commandQuota(): number {
+  const raw = Number(process.env.ONEMEMORY_TASK_COMMAND_QUOTA);
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 100;
 }
 
 /** Note -> Task. Tolerates a hand-edited note (missing tags / header). */
@@ -382,7 +414,12 @@ export function taskFromNote(n: NoteRecord, store?: Store, now = Date.now()): Ta
     blocked_by: st.blockedBy,
     lease,
     command: body.command,
-    approval: store ? verifyApproval(store, n) : st.approval ? "stale" : "none",
+    approval: store ? verifyApproval(store, n, now) : st.approval ? "stale" : "none",
+    command_hash: body.command ? commandHash(n.namespace, n.id, body.command) : null,
+    approval_expires_at: (() => {
+      const e = st.approval ? Number(APPROVAL_RE.exec(st.approval)?.[2]) : NaN;
+      return Number.isSafeInteger(e) ? new Date(e).toISOString() : null;
+    })(),
     result: body.result,
     rev: n.rev,
     created_at: n.created_at,
@@ -614,6 +651,8 @@ export function putTask(
       command = { ...command, target };
     }
     if (commandTouched && command) next.status = "queued";
+    if (command && next.status === "queued" && cur.status !== "queued") assertCommandQuota(store, existing.namespace, existing.id);
+    else if (commandTouched && command && !curBody.command) assertCommandQuota(store, existing.namespace, existing.id);
     if (commandTouched && !command && next.status === "queued") next.status = "idea";
     if (commandTouched || (next.status === "queued" && cur.status !== "queued") || !command) next.approval = null;
     const note = store.update(
@@ -663,6 +702,7 @@ export function putTask(
     s0.blockedBy = blockedBy;
   }
   const command: BodyParts["command"] = cmd ? { action: cmd.action, params: cmd.params, target: target! } : null;
+  if (command) assertCommandQuota(store, namespace, null);
   const doCreate = (): NoteRecord =>
     store.create(
       {
@@ -690,6 +730,26 @@ export function putTask(
     return doCreate();
   });
   return { task: taskFromNote(note, store), note, ...(replay ? { replayed: true as const } : {}) };
+}
+
+/**
+ * Per-namespace cap on queued command tasks, so one write token cannot bury
+ * the admin's approval queue (or the runner) under thousands of them.
+ */
+function assertCommandQuota(store: Store, namespace: string, exceptId: number | null): void {
+  const quota = commandQuota();
+  let n = 0;
+  const page = 500;
+  for (let offset = 0; ; offset += page) {
+    const r = store.list({ namespace, limit: page, offset, withTags: [TASK_TAG, "status:queued"] });
+    for (const x of r.notes) if (x.id !== exceptId && parseBody(x.body).command !== null) n++;
+    if (n >= quota || r.notes.length < page) break;
+  }
+  if (n >= quota) {
+    throw new ValidationError(
+      `too many queued command tasks in namespace "${namespace}" (limit ${quota}); wait for the runner or have an admin clear some`
+    );
+  }
 }
 
 export interface TaskListOpts {
@@ -769,6 +829,14 @@ export function claimTask(
       throw new TaskNotFoundError(`no task with id ${input.id}`);
     }
     const cur = stateOf(existing);
+    if (parseBody(existing.body).command && !input.release) {
+      throw new ValidationError(
+        `task #${existing.id} is a command task: only the runner works on it, so it cannot be claimed (an admin approval clears any lease)`
+      );
+    }
+    if (cur.status === "done" && !input.release) {
+      throw new ValidationError(`task #${existing.id} is already done; reopen it with task_put before claiming it`);
+    }
     const live = cur.lease && cur.lease.expMs > now ? cur.lease : null;
     const next: TaskState = { ...cur, lease: null };
     let heartbeat = false;
@@ -824,7 +892,14 @@ export function claimTask(
  */
 export function approveTask(
   store: Store,
-  input: { id: number; revoke?: boolean },
+  input: {
+    id: number;
+    revoke?: boolean;
+    /** What the admin read (Task.command_hash). Approving requires this or if_rev. */
+    command_hash?: string;
+    /** Or: the revision the admin read (Task.rev). */
+    if_rev?: number;
+  },
   scope: WriteScope = {}
 ): Task {
   if (!Number.isInteger(input.id) || input.id < 1) throw new ValidationError("id must be a positive integer");
@@ -839,15 +914,33 @@ export function approveTask(
   }
   const cur = stateOf(existing);
   const cmd = parseBody(existing.body).command;
-  if (!input.revoke) {
-    if (!cmd) throw new ValidationError("this task has no command to approve");
-    if (cur.status !== "queued") throw new ValidationError(`only a queued command task can be approved (this one is ${cur.status})`);
-  }
-  const next: TaskState = { ...cur };
+  const next: TaskState = { ...cur, lease: null }; // approving or revoking also clears any lease
   if (input.revoke) next.approval = null;
   else {
+    if (!cmd) throw new ValidationError("this task has no command to approve");
+    if (cur.status !== "queued") throw new ValidationError(`only a queued command task can be approved (this one is ${cur.status})`);
+    if (input.command_hash === undefined && input.if_rev === undefined) {
+      throw new ValidationError(
+        "approving needs `command_hash` (or `if_rev`) from the task you read (task_get): you approve exactly what you saw, not whatever is stored now"
+      );
+    }
+    if (input.if_rev !== undefined) {
+      if (!Number.isInteger(input.if_rev) || input.if_rev < 1) throw new ValidationError("if_rev must be a positive integer");
+      if (input.if_rev !== existing.rev) {
+        throw new ValidationError(`stale approval: task #${existing.id} changed since you read it (rev ${existing.rev}, you saw ${input.if_rev}); read it again`);
+      }
+    }
+    const hash = commandHash(existing.namespace, existing.id, cmd);
+    if (input.command_hash !== undefined) {
+      const a = Buffer.from(String(input.command_hash));
+      const b = Buffer.from(hash);
+      if (a.length !== b.length || !timingSafeEqual(a, b)) {
+        throw new ValidationError(`stale approval: the command of task #${existing.id} is not the one you read (command_hash mismatch); read it again`);
+      }
+    }
     const nonce = randomBytes(8).toString("hex");
-    next.approval = `${nonce}.${store.approvalMac([existing.namespace, String(existing.id), nonce, commandHash(existing.namespace, existing.id, cmd!)])}`;
+    const expMs = Date.now() + approvalTtlMs();
+    next.approval = `${nonce}.${expMs}.${store.approvalMac([existing.namespace, String(existing.id), nonce, String(expMs), hash])}`;
   }
   const note = store.update(
     existing.id,
@@ -860,18 +953,34 @@ export function approveTask(
 
 /** The single-use nonce inside a note's approval tag ("" when none). */
 export function approvalNonce(n: NoteRecord): string {
-  return /^([0-9a-f]{16})\./.exec(stateOf(n).approval ?? "")?.[1] ?? "";
+  return APPROVAL_RE.exec(stateOf(n).approval ?? "")?.[1] ?? "";
 }
 
-/** Runner side: queued command tasks in one namespace (approval is verified by the caller). */
-export function queuedCommandTasks(store: Store, namespace: string, limit = 50): NoteRecord[] {
-  return store.list({ namespace, limit, withTags: [TASK_TAG, "status:queued"] }).notes.filter((n) => parseBody(n.body).command !== null);
+/**
+ * Runner side: queued command tasks in one namespace that carry an approval
+ * tag (approval is verified by the caller). Filtered in SQL and paged until
+ * exhausted, so a pile of unapproved tasks cannot push an approved one out of
+ * the window. Newest first.
+ */
+export function queuedCommandTasks(store: Store, namespace: string, maxTotal = 2_000): NoteRecord[] {
+  const out: NoteRecord[] = [];
+  const page = 200;
+  for (let offset = 0; offset < maxTotal; offset += page) {
+    const r = store.list({ namespace, limit: page, offset, withTags: [TASK_TAG, "status:queued"], withTagPrefix: TAG_APPROVAL });
+    for (const n of r.notes) if (parseBody(n.body).command !== null) out.push(n);
+    if (r.notes.length < page) break;
+  }
+  return out;
 }
 
-/** Runner side: queued -> running, only if the task is still at `rev` (CAS). */
+/**
+ * Runner side: queued -> running, only if the task is still at `rev` (CAS).
+ * The approval is CONSUMED in this same write, before anything executes: a
+ * crash (or a lost local ledger) can never replay it.
+ */
 export function markCommandRunning(store: Store, n: NoteRecord): NoteRecord | null {
   try {
-    return store.update(n.id, { tags: tagsFromState(n.tags, { ...stateOf(n), status: "running" }) }, { ifRev: n.rev });
+    return store.update(n.id, { tags: tagsFromState(n.tags, { ...stateOf(n), status: "running", approval: null }) }, { ifRev: n.rev });
   } catch (e) {
     if (e instanceof ValidationError) return null; // edited meanwhile: not ours to run
     throw e;

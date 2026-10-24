@@ -9,11 +9,12 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [1.3.0] - unreleased
 
 Cross-device / cross-model awareness: every session can see what the others
-did and plan, and a task can now drive the PC's runner. Additive; no schema
-change (tasks, handoffs, leases and approvals are tagged notes, version stays
-11, so an older binary can still open the database, it just lacks the new
-tools). Existing behaviour is unchanged unless you use the new parameters and
-tools, with the exceptions listed under "Changed".
+did and plan, and a task can now drive the PC's runner. Tasks, handoffs, leases
+and approvals are tagged notes (no new table). **Schema is now v12** (one added
+column, `change_log.actor`; see "Changed"):
+a database opened by 1.3.0 cannot be opened by 1.2.x. Back up before upgrading.
+Existing behaviour is unchanged unless you use the new parameters and tools,
+with the exceptions listed under "Changed".
 
 ### Added
 
@@ -44,21 +45,37 @@ tools, with the exceptions listed under "Changed".
   comes back (`ack_token` on the next call, `memory_ack`, or `POST /ack`), so a
   client that dies mid-delivery gets the changes again. Default stays `auto`
   (marker moves on delivery, at-most-once); manual is at-least-once.
-  `exclude_self` hides a consumer's own writes (changes whose `source` equals
-  its label).
+  `exclude_self` hides a consumer's own writes: changes whose recorded **writer**
+  (the label of the token / MCP connection that made the write, `change_log.actor`)
+  equals the consumer label. It is not the note's `source`, which any client can
+  set freely. Writes with no recorded writer (CLI, scripts, rows from before v12)
+  fall back to `source`. It only separates devices that use different token labels.
 - **Command tasks** (see docs/RUNNER.md). `task_put({command, target})` queues a
-  task; an **admin** `task_approve` (MAC bound to namespace, id, a single-use nonce
-  and a hash of the command and target) is required before this PC's runner will
+  task; an **admin** `task_approve` is required before this PC's runner will
   run it, and only if the target is that runner's own id, the task is in
   `ONEMEMORY_RUNNER_TASK_NAMESPACE` (off by default) and the action passes the
-  same allowlist as a signed command note. Edits void the approval; the runner signs
-  with its own secret in memory; no token can read or hold it. There is no
-  "read-only skips approval" class: the allowlist has no such flag.
-- **`onememory backup [--out dir]`**: consistent hot copy (`VACUUM INTO`, safe while
-  the server runs) plus the `.key` file (0600) with a loud warning to store it
-  separately. **`onememory watch [--exec prog args...]`**: long-poll loop that
+  same allowlist as a signed command note. The approval is a MAC over namespace,
+  id, a single-use nonce, an **expiry** (default 24 h, `ONEMEMORY_APPROVAL_TTL_SECONDS`)
+  and a hash of the command and target. `task_approve` must echo the task's
+  `command_hash` (shown by `task_get` / `task_list`) or its `rev`, and is refused
+  if the command changed since the admin read it. The runner removes the approval in
+  the same compare-and-swap write that marks the task running, so a crash or a lost
+  ledger cannot replay it. Edits void the approval; the MAC is compared in constant
+  time; the runner finds approved tasks with an SQL filter (paged until exhausted),
+  and a namespace holds at most 100 queued command tasks
+  (`ONEMEMORY_TASK_COMMAND_QUOTA`), so a write token cannot bury an approved task.
+  A command task cannot be claimed, and approve / revoke clear any lease on it. The
+  runner signs with its own secret in memory; no token can read or hold it. There
+  is no "read-only skips approval" class: the allowlist has no such flag.
+- **`onememory backup [--out dir] [--include-approval-key]`**: consistent hot copy
+  (`VACUUM INTO`, safe while the server runs) plus the `.key` file (0600) with a loud
+  warning to store it separately. The command-task **approval key is NOT copied**
+  unless you pass `--include-approval-key`: a restored backup then has stale
+  approvals (fail closed) and an admin re-approves what is still queued. (The key is
+  stored unencrypted in the database's `_meta`; it is not covered by `.key`.) **`onememory watch [--exec prog args...]`**: long-poll loop that
   prints changes and optionally runs a program per batch (no shell; data on stdin;
-  marker moves only on exit 0).
+  marker moves only on exit 0). SIGINT / SIGTERM kill the running handler and stop
+  the loop; a second signal exits at once.
 - **`onememory recall`** prints open tasks (up to 10) and the latest handoff before
   the recent notes, each with its own budget (a long task list never cuts the
   handoff), a header that counts all open tasks, and every field reduced to one
@@ -88,6 +105,26 @@ tools, with the exceptions listed under "Changed".
   hide real tasks from `listTasks`.
 - Clearing a task's `owner` now resets the provenance `source` to `task` (it kept the
   old owner).
+- **Schema v12.** `change_log` gains an `actor` column (default empty). Each `Store`
+  connection stamps it with a connection-local (TEMP) trigger, so nothing about the
+  stored triggers changes and other tools writing the file still work (their rows
+  have an empty actor). Rows from before the upgrade have an empty actor too.
+- `task_approve` / `POST /tasks/:id/approve` now require `command_hash` or `if_rev`
+  (and reject a mismatch); `approve: true` on create passes the new task's rev itself.
+- `task_claim` is refused for `done` tasks and for command tasks (release still works).
+  `due` must be a real calendar date (`2026-02-31` is rejected).
+- **Markdown import (`onememory import`) is a local admin path and now restores
+  notes carrying reserved tags** (tasks, handoffs, 1.2.x notes tagged `task`), so an
+  export/import round trip loses nothing. Approvals never travel by file. It prints a
+  loud rejected count and exits 1 when any file was rejected (it used to say so only
+  in a summary line). Plain-note writes over REST/MCP remain restricted.
+- Change-log retention now records how far it purged: a `since=last` consumer whose
+  marker is older than that gets `markerReset: true` (and everything still retained),
+  instead of silently skipping the purged events.
+- `audit.log` rotation takes a lock directory (`audit.log.lock`), so several
+  processes (server plus CLI) no longer lose lines in the rename chain.
+- Fixed: `onememory watch` exited immediately in a bare terminal (its timers were
+  unref'd and nothing held the event loop); it now stays up.
 - Task `status` gains `queued` and `failed`.
 
 ### Notes
@@ -100,7 +137,12 @@ tools, with the exceptions listed under "Changed".
   `task_approve` is useful only on a checkout that runs it; the tools themselves ship.
 - INFRA.md gains systemd and Windows Task Scheduler recipes for OneMemory itself,
   a backup section (including the key) and a 15-minute deploy recipe.
-- Known limits: a claim does not lock a task against plain `task_put` edits of its
+- Known limits: an approval is a bearer decision of one admin about one command text:
+  `command_hash` binds it to what was read, but the admin must still read it. The
+  approval key lives in the database's `_meta` (not in `.key`); anyone who can write
+  the live database file can mint approvals, so protect the file and its backups.
+  `exclude_self` keys on the token label; two devices sharing one token label hide
+  each other's writes. A claim does not lock a task against plain `task_put` edits of its
   other fields; command tasks need the runner running on the PC (and the PC awake);
   `onememory watch` and live waits are for scripts and agent loops, not a push to a
   chat window (chat clients still act only on a user turn); the systemd and Task

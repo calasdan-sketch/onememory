@@ -19,9 +19,16 @@ export interface BackupResult {
   bytes: number;
   notes: number;
   key: string | null;
+  /** True when the command-task approval key was copied into the backup (--include-approval-key). */
+  approvalKey: boolean;
 }
 
-export function backupStore(store: Store, dbPath: string, outDir: string): BackupResult {
+export function backupStore(
+  store: Store,
+  dbPath: string,
+  outDir: string,
+  opts: { includeApprovalKey?: boolean } = {}
+): BackupResult {
   const dir = resolve(outDir);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const db = join(dir, "state.db");
@@ -31,6 +38,19 @@ export function backupStore(store: Store, dbPath: string, outDir: string): Backu
     chmodSync(db, 0o600);
   } catch {
     /* windows */
+  }
+  // The command-task approval key lets its holder mint approvals the runner
+  // honours. A backup must not carry it unless asked: restored without it,
+  // existing approvals fail their check ("stale") -- fail closed -- and the
+  // admin simply re-approves.
+  if (!opts.includeApprovalKey) {
+    const strip = new DatabaseSync(db);
+    try {
+      strip.prepare("DELETE FROM _meta WHERE key = 'approval_key'").run();
+      strip.exec("VACUUM");
+    } finally {
+      strip.close();
+    }
   }
   // Prove the copy opens and is internally consistent before reporting success.
   const copy = new DatabaseSync(db, { readOnly: true });
@@ -66,9 +86,12 @@ export function backupStore(store: Store, dbPath: string, outDir: string): Backu
           "          the database, anyone who gets this folder can read everything. Move it somewhere else (a password\n" +
           "          manager, a separate drive) and keep a second copy."
         : "(no .key: at-rest encryption was off)",
+      opts.includeApprovalKey
+        ? "approval key INCLUDED (--include-approval-key): whoever holds this folder AND can write to a live store can mint\ncommand-task approvals. Guard it like the .key."
+        : "approval key NOT included: command-task approvals in a restored copy read as stale (fail closed); an admin\nre-approves the tasks that are still queued.",
       "",
     ].join("\n"),
     { mode: 0o600 }
   );
-  return { dir, db, bytes: statSync(db).size, notes, key };
+  return { dir, db, bytes: statSync(db).size, notes, key, approvalKey: Boolean(opts.includeApprovalKey) };
 }

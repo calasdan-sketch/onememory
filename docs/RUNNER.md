@@ -282,7 +282,8 @@ same allowlist.
 ```
 task_put({ title: "pull the site", command: { action: "site-pull", params: { repo: "calas-site" } }, target: "DANITA" })
         // any write token: creates a task in status `queued`. It cannot run yet.
-task_approve({ id: 41 })        // ADMIN token only. Read the task first (task_get).
+task_approve({ id: 41, command_hash: "<the command_hash task_get showed>" })
+        // ADMIN token only. Read the task first (task_get); the approval is refused if the command changed since.
         // the PC's runner runs it within one poll and writes the result onto the task
 ```
 
@@ -307,15 +308,22 @@ writes into its own namespace, so put your runner's namespace there).
    machine name). Tasks for other machines are left alone.
 3. An admin approved it. The approval is a MAC, made with a secret that lives
    only inside the store, over the namespace, the task id, a one-time nonce and
-   a hash of the command, params and target. Editing any of those (through
+   an expiry (default 24 h, `ONEMEMORY_APPROVAL_TTL_SECONDS`) and a hash of the command, params and target.
+   `task_approve` must echo the `command_hash` (or `rev`) the admin read. Editing any of those (through
    `task_put` or by hand) voids it; copying the approval tag to another task
    fails; a write token cannot write the approval tag at all (the `task.*` tags
    are reserved).
-4. It is single-use: the nonce goes in the runner's local ledger before the
-   command starts, and the approval is removed when the run ends. Queueing it
-   again needs a fresh approval.
+4. It is single-use: the approval is removed in the same compare-and-swap write
+   that marks the task `running`, before anything executes (so a crash or a lost
+   ledger cannot replay it), and the nonce also goes in the runner's local ledger.
+   Queueing it again needs a fresh approval.
 5. The action is on this PC's allowlist and the params match their patterns,
    exactly as for a command note. No shell is involved (`shell:false`, argv only).
+
+Queue hygiene: the runner selects approved tasks in SQL and pages through all of
+them, a namespace holds at most 100 queued command tasks
+(`ONEMEMORY_TASK_COMMAND_QUOTA`), and a command task cannot be claimed; approve
+and revoke clear any lease. The runner never overrides a lease held by someone else.
 
 The runner signs the command with **its own** secret in memory. The secret is
 never stored, never sent to the API, and no token (read, write or admin) can

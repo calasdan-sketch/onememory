@@ -133,10 +133,17 @@ The default stays "auto" so existing clients behave exactly as before; the
 trade-off is at-most-once (auto) versus at-least-once (manual: handle changes
 idempotently). `catch_up` takes the same `ack_mode` / `ack_token`.
 
-`exclude_self=1` (`exclude_self: true`) hides changes whose `source` equals the
-`consumer` label, so a device does not wake itself with its own writes: write
-with `source: "pc"`, read as consumer `pc`. (Tasks use their `owner` as
-`source`.)
+`exclude_self=1` (`exclude_self: true`) hides changes **written by** the token (or
+MCP connection) whose label equals the `consumer` label, so a device does not wake
+itself with its own writes. The server records the writer itself (`change_log.actor`,
+schema v12); the note's `source` is free text any client can set, so it is not what
+is compared, except for writes with no recorded writer (CLI, scripts, rows from
+before v12), which fall back to `source`. Give each device its own token label and
+use that label as its `consumer`; devices sharing a label hide each other's writes.
+
+A consumer whose `last` marker is older than the change-log retention (90 days) gets
+`markerReset: true` with whatever is still retained, rather than silently skipping
+the purged events.
 
 ### React from a script: `onememory watch`
 

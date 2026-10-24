@@ -9,6 +9,7 @@
 // state store, not a mock or a second copy.
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { actorStore } from "./actor.js";
 import { z } from "zod";
 import {
   Store,
@@ -153,6 +154,14 @@ export function createMcpServer(
     name: "onememory",
     version: PACKAGE_VERSION,
   });
+
+  // Stamp the connection's label on every write a tool makes (change_log.actor),
+  // by running each tool handler inside the actor context.
+  const registerRaw = server.registerTool.bind(server) as (...a: unknown[]) => unknown;
+  (server as unknown as { registerTool: (...a: unknown[]) => unknown }).registerTool = (name: unknown, cfg: unknown, handler: unknown) =>
+    registerRaw(name, cfg, (...args: unknown[]) =>
+      actorStore.run({ label: conn.label ?? "" }, () => (handler as (...x: unknown[]) => unknown)(...args))
+    );
 
   const denyIfUnder = (need: Scope): string | null =>
     scopeAllows(scope, need) ? null : `this token lacks the required '${need}' scope`;
@@ -997,7 +1006,7 @@ export function createMcpServer(
         exclude_self: z
           .boolean()
           .optional()
-          .describe("Hide changes whose source label equals your `consumer` label (your own writes)."),
+          .describe("Hide changes WRITTEN BY the token/connection whose label equals your `consumer` label (the writer is recorded by the server; writes with no recorded writer fall back to the note's `source`). Only works if each device has its own token label."),
       },
     },
     async ({ since, cursor, namespace, source, limit, consumer, wait_seconds, wait, ack_mode, ack_token, exclude_self }, extra) => {
@@ -1101,7 +1110,7 @@ export function createMcpServer(
         );
         await maybeEmbed(store, put.note);
         let task = put.task;
-        if (approve && !put.replayed) task = approveTask(store, { id: task.id }, writeScope());
+        if (approve && !put.replayed) task = approveTask(store, { id: task.id, if_rev: task.rev }, writeScope());
         audit({
           op: "task.put",
           id: task.id,
@@ -1184,17 +1193,21 @@ export function createMcpServer(
         "ADMIN only. Approve the command currently stored on a queued task so the PC's runner may execute it " +
         "(still only if the action is on the PC's allowlist and the task's `target` is that runner). The approval " +
         "is bound to a hash of the command: editing the command, its params or its target afterwards voids it. " +
-        "`revoke: true` withdraws it. Read the task (task_get) first -- you are approving exactly what it shows.",
+        "`revoke: true` withdraws it (and clears any lease). Read the task (task_get) first and pass back its " +
+        "`command_hash` (or `rev` as if_rev): the approval is refused if the command changed since you read it. " +
+        "An approval expires (default 24 h) and is consumed when the runner starts the task.",
       inputSchema: {
         id: z.number().int().describe("Task id."),
         revoke: z.boolean().optional().describe("Withdraw the approval instead."),
+        command_hash: z.string().optional().describe("The task's command_hash exactly as task_get showed it. Required to approve (or pass if_rev)."),
+        if_rev: z.number().int().optional().describe("Alternatively the task's rev as task_get showed it."),
       },
     },
-    async ({ id, revoke }) => {
+    async ({ id, revoke, command_hash, if_rev }) => {
       try {
         const denied = denyIfUnder("admin");
         if (denied) return errorResult(denied);
-        const task = approveTask(store, { id, revoke }, writeScope());
+        const task = approveTask(store, { id, revoke, command_hash, if_rev }, writeScope());
         audit({ op: revoke ? "task.revoke" : "task.approve", id: task.id, namespace: task.namespace, label: conn.label, kind: "task" });
         return untrustedResult({ task });
       } catch (e) {
@@ -1297,7 +1310,7 @@ export function createMcpServer(
         handoffs: z.number().int().optional().describe("Max handoffs (default 3)."),
         ack_mode: z.enum(["auto", "manual"]).optional().describe("auto (default): marker advances now. manual: it advances when you return `ack_token`."),
         ack_token: z.string().optional().describe("Token from an earlier ack_mode:manual call: moves the marker before reading."),
-        exclude_self: z.boolean().optional().describe("Hide changes whose source label equals your `consumer` label."),
+        exclude_self: z.boolean().optional().describe("Hide changes written by the token whose label equals your `consumer` label (see memory_since)."),
       },
     },
     async ({ consumer, namespace, include_changes, tasks, handoffs, ack_mode, ack_token, exclude_self }) => {
