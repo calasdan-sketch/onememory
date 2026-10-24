@@ -355,8 +355,12 @@ export function verifyApproval(store: Store, n: NoteRecord): ApprovalState {
   const cmd = parseBody(n.body).command;
   const m = /^([0-9a-f]{16})\.([0-9a-f]{32})$/.exec(st.approval);
   if (!cmd || !m) return "stale";
-  const want = store.approvalMac([n.namespace, String(n.id), m[1], commandHash(n.namespace, n.id, cmd)]);
-  return want === m[2] ? "approved" : "stale";
+  try {
+    const want = store.approvalMac([n.namespace, String(n.id), m[1], commandHash(n.namespace, n.id, cmd)], false);
+    return want !== null && want === m[2] ? "approved" : "stale";
+  } catch {
+    return "stale"; // fail closed
+  }
 }
 
 /** Note -> Task. Tolerates a hand-edited note (missing tags / header). */
@@ -854,7 +858,12 @@ export function approveTask(
   return taskFromNote(note, store);
 }
 
-/** Runner side: queued, approved command tasks in one namespace (verified fresh). */
+/** The single-use nonce inside a note's approval tag ("" when none). */
+export function approvalNonce(n: NoteRecord): string {
+  return /^([0-9a-f]{16})\./.exec(stateOf(n).approval ?? "")?.[1] ?? "";
+}
+
+/** Runner side: queued command tasks in one namespace (approval is verified by the caller). */
 export function queuedCommandTasks(store: Store, namespace: string, limit = 50): NoteRecord[] {
   return store.list({ namespace, limit, withTags: [TASK_TAG, "status:queued"] }).notes.filter((n) => parseBody(n.body).command !== null);
 }
@@ -888,7 +897,8 @@ export function finishCommandTask(
   const write = (r: Record<string, unknown>): void => {
     store.update(id, {
       body: taskBody({ ...body, result: r }),
-      tags: tagsFromState(n.tags, { ...stateOf(n), status: outcome.ok ? "done" : "failed" }),
+      // The approval is single-use: it is consumed by the run.
+      tags: tagsFromState(n.tags, { ...stateOf(n), status: outcome.ok ? "done" : "failed", approval: null }),
     });
   };
   try {

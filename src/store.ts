@@ -3416,9 +3416,13 @@ export class Store {
    * admin-scope approve path. Callers bind namespace, note id, nonce and the
    * command hash into `parts`.
    */
-  approvalMac(parts: string[]): string {
+  approvalMac(parts: string[], mint?: true): string;
+  approvalMac(parts: string[], mint: boolean): string | null;
+  approvalMac(parts: string[], mint = true): string | null {
     if (!this.approvalKeyCache) {
       let hex = this.getMeta("approval_key");
+      // Verifying never writes: with no key there cannot be a valid approval.
+      if (!hex && !mint) return null;
       if (!hex) {
         this.db
           .prepare("INSERT OR IGNORE INTO _meta (key, value) VALUES ('approval_key', ?)")

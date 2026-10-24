@@ -272,3 +272,59 @@ do not grow forever. Unclaimed commands are never pruned, however old.
   find that out.
 - It runs commands as whatever user starts it. Do not start it as an
   administrator unless an allowlisted action genuinely needs that.
+
+## Command tasks: the task board in front of the runner
+
+Instead of signing a command on a phone page, you can queue it as a task and
+approve it from any admin session. It reaches the same runner, through the
+same allowlist.
+
+```
+task_put({ title: "pull the site", command: { action: "site-pull", params: { repo: "calas-site" } }, target: "DANITA" })
+        // any write token: creates a task in status `queued`. It cannot run yet.
+task_approve({ id: 41 })        // ADMIN token only. Read the task first (task_get).
+        // the PC's runner runs it within one poll and writes the result onto the task
+```
+
+REST: `POST /tasks` with `command` and `target`, `POST /tasks/:id/approve`
+(admin), `GET /tasks/:id`. Pass `approve: true` when creating with an admin
+token to do both in one call.
+
+Switch it on at the PC by naming the namespace the runner should watch:
+
+    setx ONEMEMORY_RUNNER_TASK_NAMESPACE "tasks"
+    setx ONEMEMORY_RUNNER_ID "DANITA"
+
+It is **off** until you do. The task must be created in that same namespace
+(`namespace: "tasks"` in `task_put`; with namespace resolution on, the API
+writes into its own namespace, so put your runner's namespace there).
+
+### What has to be true before anything runs
+
+1. The task lives in exactly the runner's task namespace. If namespace
+   resolution sent it elsewhere, the runner never sees it (it fails closed).
+2. `target` equals this runner's own id (`ONEMEMORY_RUNNER_ID`, else the
+   machine name). Tasks for other machines are left alone.
+3. An admin approved it. The approval is a MAC, made with a secret that lives
+   only inside the store, over the namespace, the task id, a one-time nonce and
+   a hash of the command, params and target. Editing any of those (through
+   `task_put` or by hand) voids it; copying the approval tag to another task
+   fails; a write token cannot write the approval tag at all (the `task.*` tags
+   are reserved).
+4. It is single-use: the nonce goes in the runner's local ledger before the
+   command starts, and the approval is removed when the run ends. Queueing it
+   again needs a fresh approval.
+5. The action is on this PC's allowlist and the params match their patterns,
+   exactly as for a command note. No shell is involved (`shell:false`, argv only).
+
+The runner signs the command with **its own** secret in memory. The secret is
+never stored, never sent to the API, and no token (read, write or admin) can
+read it. A low-privilege token can queue a task and nothing more.
+
+**Read-only vs mutating actions:** the allowlist has no read-only flag, so there
+is no "safe, skips approval" class. Every command task needs an explicit admin
+approval, whatever the action does.
+
+The outcome lands on the task (`status` done / failed, `result` with the exit
+code and up to 4,000 characters of output) and, as before, as a signed note in
+the `results` namespace.

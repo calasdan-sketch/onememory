@@ -41,6 +41,7 @@ import { dirname, join, posix } from "node:path";
 import { PROJECT_ROOT } from "./config.js";
 import { audit } from "./security.js";
 import { Store, ValidationError, type NoteRecord } from "./store.js";
+import { pollTasks } from "./runner-tasks.js";
 
 // ---- Tunables (all overridable by env; defaults are the safe end) ----------
 export const RUNNER = {
@@ -75,6 +76,13 @@ export const RUNNER = {
   windowMs: Number(process.env.ONEMEMORY_RUNNER_WINDOW_MS || 600_000),
   /** Delete handled commands and results older than this. 0 disables. */
   retentionDays: Number(process.env.ONEMEMORY_RUNNER_RETENTION_DAYS || 30),
+  /**
+   * Namespace whose approved COMMAND TASKS this runner executes (see
+   * runner-tasks.ts). Empty = command tasks are off (the default). Must be
+   * set explicitly: a task only ever runs if it lives in exactly this
+   * namespace, is addressed to this runner, and carries a valid admin approval.
+   */
+  taskNamespace: process.env.ONEMEMORY_RUNNER_TASK_NAMESPACE || "",
   /** Minimum gap between prune sweeps, regardless of heartbeat rate. */
   pruneEveryMs: Number(process.env.ONEMEMORY_RUNNER_PRUNE_EVERY_MS || 3_600_000),
 };
@@ -715,6 +723,8 @@ export interface RunnerDeps {
   recent?: number[];
   /** Override this machine's name (tests, or multiple runners on one box). */
   runnerId?: string;
+  /** Override RUNNER.taskNamespace (tests). "" / undefined = from RUNNER. */
+  taskNamespace?: string;
 }
 
 /**
@@ -915,25 +925,53 @@ export async function processNote(deps: RunnerDeps, note: NoteRecord): Promise<s
   deps.ledger.add(cmd.cmd_id);
   claimNote(deps.store, note);
 
+  const done = await executeCommand(deps, cmd, note.id, note.namespace);
+  return done.verdict;
+}
+
+export interface ExecDone {
+  /** processNote-style verdict string ("ok", "failed", "refused: ...", "ok: actions listed"). */
+  verdict: string;
+  ok: boolean;
+  status: string;
+  exit_code?: number | null;
+  output?: string;
+  reason?: string;
+}
+
+/**
+ * Steps shared by signed command notes and approved command tasks, run AFTER
+ * the command passed verification and was recorded in the replay ledger:
+ * the reserved introspection action, the allowlist gate, then the spawn
+ * (shell:false) and the signed result note. Nothing here widens what an
+ * allowlist entry permits.
+ */
+export async function executeCommand(
+  deps: RunnerDeps,
+  cmd: CommandEnvelope,
+  auditId: number,
+  auditNamespace: string
+): Promise<ExecDone> {
   // The reserved introspection action never executes anything -- it just
   // reports what this machine is willing to do.
   if (cmd.action === INTROSPECT_ACTION) {
-    writeResult(deps.store, deps.secret, cmd.cmd_id, describeActions(deps.allow));
-    return "ok: actions listed";
+    const desc = describeActions(deps.allow);
+    writeResult(deps.store, deps.secret, cmd.cmd_id, desc);
+    return { verdict: "ok: actions listed", ok: true, status: "ok", output: JSON.stringify(desc) };
   }
 
   const resolved = resolveAction(deps.allow, cmd.action, cmd.params ?? {});
   if (!resolved.ok) {
-    audit({ op: "runner.refuse", id: note.id });
+    audit({ op: "runner.refuse", id: auditId });
     writeResult(deps.store, deps.secret, cmd.cmd_id, { status: "refused", reason: resolved.reason });
-    return `refused: ${resolved.reason}`;
+    return { verdict: `refused: ${resolved.reason}`, ok: false, status: "refused", reason: resolved.reason };
   }
 
   // Open the result note BEFORE spawning anything. If the PC loses power or
   // the process is killed mid-command, the operator still finds a note saying
   // "running since 14:02" instead of silence -- which, from another country,
   // is the difference between "it's working on it" and "my PC is dead".
-  audit({ op: "runner.exec", id: note.id, namespace: note.namespace });
+  audit({ op: "runner.exec", id: auditId, namespace: auditNamespace });
   const openId = writeResult(deps.store, deps.secret, cmd.cmd_id, {
     status: "running",
     action: cmd.action,
@@ -945,12 +983,19 @@ export async function processNote(deps: RunnerDeps, note: NoteRecord): Promise<s
     cwd: resolved.cwd,
     timeoutMs: resolved.timeoutMs,
   });
+  const status = outcome.timed_out ? "timed_out" : outcome.exit_code === 0 ? "ok" : "failed";
   closeResult(deps.store, deps.secret, openId, cmd.cmd_id, {
-    status: outcome.timed_out ? "timed_out" : outcome.exit_code === 0 ? "ok" : "failed",
+    status,
     action: cmd.action,
     ...outcome,
   });
-  return outcome.exit_code === 0 ? "ok" : "failed";
+  return {
+    verdict: outcome.exit_code === 0 ? "ok" : "failed",
+    ok: outcome.exit_code === 0 && !outcome.timed_out,
+    status,
+    exit_code: outcome.exit_code,
+    output: [outcome.stdout, outcome.stderr].filter(Boolean).join("\n"),
+  };
 }
 
 /**
@@ -1103,6 +1148,7 @@ export function startRunner(deps: RunnerDeps): StartedRunner {
     busy = true;
     try {
       await pollOnce(deps);
+      await pollTasks(deps);
     } finally {
       busy = false;
     }
@@ -1175,6 +1221,12 @@ export function main(): void {
   console.error(
     `[onememory:runner] listening on namespace "${RUNNER.namespace}" every ${RUNNER.pollMs}ms ` +
       `(${Object.keys(allow).length} allowed action(s))`
+  );
+  console.error(
+    RUNNER.taskNamespace
+      ? `[onememory:runner] command tasks ON: namespace "${RUNNER.taskNamespace}", this runner is "${runnerId()}" ` +
+          "(only admin-approved tasks addressed to that name run)"
+      : "[onememory:runner] command tasks off (set ONEMEMORY_RUNNER_TASK_NAMESPACE to enable)"
   );
 }
 
