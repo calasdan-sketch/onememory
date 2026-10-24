@@ -54,6 +54,7 @@ function signAsset(file: string): string | null {
   }
   return signCache.get(file) ?? null;
 }
+import { runnerStatus } from "./runner-status.js";
 import { PayloadTooLargeError, readBody, normalizeTokens, IMPORT_BODY_BYTES } from "./http-common.js";
 
 /**
@@ -1030,6 +1031,7 @@ export function createApiServer(
         path === "/tasks" ||
         path === "/handoffs" ||
         path === "/catch-up" ||
+        path === "/runner/status" ||
         path === "/ack" ||
         /^\/tasks\/\d+(\/(claim|approve))?$/.test(path)
       ) {
@@ -1197,6 +1199,11 @@ export function createApiServer(
               limit: intParam(url, "limit", 1),
             });
             sendJson(res, 200, { handoffs, searchedNamespaces: namespaces ?? [] });
+            return;
+          }
+          if (req.method === "GET" && path === "/runner/status") {
+            const namespaces = readNs();
+            sendJson(res, 200, { ...runnerStatus(store, namespaces), searchedNamespaces: namespaces ?? [] });
             return;
           }
           if (req.method === "GET" && path === "/catch-up") {

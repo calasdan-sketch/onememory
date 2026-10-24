@@ -33,6 +33,7 @@ import {
   TASK_LIMITS,
 } from "./tasks.js";
 import { ackChanges } from "./changes.js";
+import { runnerStatus } from "./runner-status.js";
 import { assertPlainWriteTags } from "./reserved-tags.js";
 import { waitForChanges, parseWait, WAIT_MAX_SECONDS, WAIT_RECOMMENDED_SECONDS } from "./change-wait.js";
 import { type Scope, PACKAGE_VERSION } from "./config.js";
@@ -1281,6 +1282,35 @@ export function createMcpServer(
         const namespaces = readScope(namespace);
         const { tasks, total } = listTasks(store, { namespaces, status, owner, parent_id, limit });
         return untrustedResult({ tasks, total, searchedNamespaces: namespaces ?? [] });
+      } catch (e) {
+        return errorFor(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "runner_status",
+    {
+      title: "Is the PC's runner listening? (commands waiting)",
+      annotations: { readOnlyHint: true },
+      description:
+        "Read-only. Whether the PC's command runner looks online or stale (age of its last heartbeat), and, per readable " +
+        "namespace, how many admin-approved command tasks are still waiting for it, how many of those have an approval " +
+        "ending within 1 h, how many approvals already expired, and how long the oldest has waited. Use it when an approved " +
+        "command has not run: a stale runner means the PC is off or asleep and the command will run when it wakes " +
+        "(unless the approval expires first). Counts and ages only, never command text (task_get shows that). " +
+        "The heartbeat time is a hint, not proof: verify it on the sign page." +
+        (nsActive ? " The `namespace` parameter is an untrusted hint: only readable namespaces are counted." : ""),
+      inputSchema: {
+        namespace: z.string().optional().describe(nsActive ? "Untrusted hint: restrict to this namespace." : "Restrict to this namespace."),
+      },
+    },
+    async ({ namespace }) => {
+      try {
+        const denied = denyIfUnder("read");
+        if (denied) return errorResult(denied);
+        const namespaces = readScope(namespace);
+        return untrustedResult({ ...runnerStatus(store, namespaces), searchedNamespaces: namespaces ?? [] });
       } catch (e) {
         return errorFor(e);
       }

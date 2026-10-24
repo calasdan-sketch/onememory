@@ -212,6 +212,43 @@ process id. If the heartbeat is stale, the PC is not listening — that is
 different from a command being refused, and you can tell the two apart from
 across an ocean.
 
+## Is the PC asleep? Commands waiting
+
+Approving a command task from your phone does not wake the PC. If the PC is
+off or asleep, the task stays approved and waits. Nothing is lost and nothing
+runs early; the runner takes it on its first poll after waking. The catch is
+the approval clock: an approval lapses (24 h by default,
+`ONEMEMORY_APPROVAL_TTL_SECONDS`), and an expired one needs an admin to
+approve again.
+
+The store tells you instead of leaving you guessing:
+
+```
+runner_status()                       # MCP, read scope
+GET /runner/status[?namespace=ns]     # REST, read token
+onememory runner-status [--json]      # CLI on the machine holding the store
+```
+
+It returns the runner's state (`online`, `stale` or `never_seen`) from the
+heartbeat's age, and for each namespace you can read: `waiting` (approved, not
+started), `expiring_soon` (approval ends within an hour), `expired` (the
+approval lapsed before the runner took it), and the age and id of the oldest
+waiting task. Only counts, ages and ids: never command text, parameters or
+targets (`task_get` is still the only place those are read).
+
+When commands are waiting and the runner is not online, the same fact is one
+line at the top of `catch_up` (`runner_notice`), in the SessionStart recall
+and on the dashboard, for example:
+`Runner offline (last seen 3 h ago): 2 approved commands waiting, 1 expiring within 1 h.`
+
+The runner counts as stale after `ONEMEMORY_RUNNER_STALE_SECONDS` without a
+heartbeat (default `600`, about three missed beats). The store does not hold
+the runner secret, so the heartbeat time here is a hint a token holder could
+forge. To prove the heartbeat is real, use the sign page's "Check a result"
+with the word `heartbeat`. The status shows only the heartbeat's age, not the
+host or process id, and it shows it to any caller who can read a namespace,
+because one runner serves the whole store.
+
 ## Which commands have been handled
 
 The runner keeps its own record on the PC (`data/runner-seen.json`) of every
@@ -258,6 +295,7 @@ do not grow forever. Unclaimed commands are never pruned, however old.
 | `ONEMEMORY_ENABLE_SIGN_PAGE` | *(off)* | Set to `1` on the **API** process to serve `/sign`. |
 | `ONEMEMORY_RUNNER_RETENTION_DAYS` | `30` | Delete handled notes older than this. `0` keeps everything. |
 | `ONEMEMORY_RUNNER_PRUNE_EVERY_MS` | `3600000` | Minimum gap between cleanup sweeps. |
+| `ONEMEMORY_RUNNER_STALE_SECONDS` | `600` | Heartbeat age after which `runner_status` reports the runner stale (30 s - 7 d). Set on the **API/MCP** process. |
 | `ONEMEMORY_RUNNER_ID` | machine name | This runner's name, matched against a command's `target`. |
 
 ## Honest limits
@@ -268,8 +306,10 @@ do not grow forever. Unclaimed commands are never pruned, however old.
 - Output stored in a result note is capped (20k characters) and the store's
   secret scanner may refuse a result that looks like it contains a credential.
   You still get a note saying so, never silence.
-- It does not survive the PC being off or asleep. A stale heartbeat is how you
-  find that out.
+- It does not run while the PC is off or asleep: an approved command simply
+  waits until the PC wakes and the runner polls again, or until the approval
+  expires (24 h by default), whichever comes first. You are told: see
+  [Is the PC asleep? Commands waiting](#is-the-pc-asleep-commands-waiting).
 - It runs commands as whatever user starts it. Do not start it as an
   administrator unless an allowlisted action genuinely needs that.
 

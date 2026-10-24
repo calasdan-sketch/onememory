@@ -71,6 +71,7 @@ export const DASHBOARD_HTML = `<!doctype html>
       <span id="n_err" class="err"></span>
     </div>
   </div>
+  <div id="runner" class="card err" style="display:none"></div>
   <div id="list"></div>
 </main>
 <footer>
@@ -144,7 +145,16 @@ function render(notes){
   }).join("");
 }
 
+function loadRunner(){
+  var el = document.getElementById("runner");
+  api("/runner/status").then(function(j){
+    if(j && j.notice){ el.textContent = j.notice; el.style.display = "block"; }
+    else { el.style.display = "none"; }
+  }).catch(function(){ el.style.display = "none"; });
+}
+
 function load(){
+  loadRunner();
   var q = document.getElementById("q").value.trim();
   var ns = document.getElementById("ns").value.trim();
   var qs = ns ? ("namespace=" + encodeURIComponent(ns)) : "";

@@ -222,6 +222,7 @@ encryption of note bodies. See [SECURITY.md](./SECURITY.md) for what it does
 | `task_put` / `task_list` / `task_get` | write / read / read | shared task board across devices and models; `client_key` makes a create retry-safe |
 | `task_claim` | write | take / heartbeat / release a task with a lease (compare-and-swap) |
 | `task_approve` | admin | approve a command task so the PC's runner may run it ([RUNNER.md](./docs/RUNNER.md)) |
+| `runner_status` | read | is the PC's runner listening, and how many approved commands are waiting for it (`onememory runner-status`, `GET /runner/status`; [RUNNER.md](./docs/RUNNER.md)) |
 | `session_handoff` / `catch_up` | write / read | leave a handoff; one-call catch-up at session start |
 | `memory_ack` | read | confirm a manual-ack change-feed page |
 | `memory_stats` | read | totals, most-read, never-read, stale |
@@ -236,6 +237,7 @@ REST mirrors them (`/notes`, `/search`, `/relevant`, `/changes`, `/tasks`, `/han
 ```
 onememory start | mcp | doctor | init
 onememory changes --since last --consumer laptop
+onememory runner-status                           # is the PC's runner listening? commands waiting?
 onememory watch --consumer pc [--exec program args...]     # react to changes as they land
 onememory backup [--out dir] [--include-approval-key]       # hot copy of the database (+ key)
 onememory export --format md --dir ~/memory     onememory import --dir ~/memory

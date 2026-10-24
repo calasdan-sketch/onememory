@@ -63,7 +63,7 @@ immediately visible through the others:
   `rev` for compare-and-swap, a provenance `source`, tags, and namespaces.
 - **`src/api.ts`** — a small HTTP/JSON API + a built-in web dashboard, on
   plain `node:http` (no framework).
-- **`src/mcp-server-core.ts`** — the transport-agnostic MCP server with twenty-one
+- **`src/mcp-server-core.ts`** — the transport-agnostic MCP server with twenty-two
   tools, shared by both MCP transports.
 - **`src/mcp-stdio.ts`** — stdio entry point for local Claude Code / Desktop
   / editors.
@@ -97,6 +97,7 @@ immediately visible through the others:
 | `task_list` | read | List tasks (default: all but done), filter by status/owner/parent |
 | `task_claim` | write | Take / heartbeat / release a task with a lease (compare-and-swap) |
 | `task_approve` | admin | Approve (or revoke) a command task for the PC's runner ([RUNNER.md](./RUNNER.md)) |
+| `runner_status` | read | Is the PC's runner listening, and how many approved commands are waiting / expiring / expired ([RUNNER.md](./RUNNER.md)) |
 | `session_handoff` | write | Leave a structured handoff (done / pending / decisions / next step) |
 | `catch_up` | read | One call: changes since this consumer last looked + open tasks (compact) + latest handoffs |
 | `memory_ack` | read | Confirm a manual-ack change-feed page (`ack_token`) |

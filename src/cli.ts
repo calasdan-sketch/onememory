@@ -57,6 +57,11 @@ function usage(): void {
       "            WARNING: store the key SEPARATELY from the backup; a backup without",
       "            its key is unreadable, and one stored with it is not encrypted.",
       "            When: before upgrades, and on a schedule.",
+      "  runner-status [--namespace ns] [--json]",
+      "            Is the PC's command runner listening, and how many approved commands are",
+      "            waiting for it (and how many approvals expire soon or already did)?",
+      "            Reads the local store; never prints command text.",
+      "            When: an approved phone command has not run yet.",
       "  watch [--consumer name] [--wait 25] [--namespace ns] [--exec <program> [args...]]",
       "            Long-poll loop on this store: prints each new change as it happens.",
       "            With --exec, runs <program> (no shell) per batch with the changes as",
@@ -735,6 +740,39 @@ async function backupCmd(): Promise<void> {
   }
 }
 
+// `onememory runner-status [--namespace ns] [--json]`
+async function runnerStatusCmd(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const { runnerStatus } = await import("./runner-status.js");
+  const { flags } = parseFlags(process.argv.slice(3), { values: ["namespace"], bools: ["json"] });
+  const store = new Store(DB_PATH);
+  try {
+    const ns = str(flags.namespace);
+    const st = runnerStatus(store, ns ? [ns] : undefined);
+    if (flags.json) {
+      console.log(JSON.stringify(st, null, 2));
+      return;
+    }
+    const r = st.runner;
+    console.log(
+      r.state === "never_seen"
+        ? "Runner: no heartbeat seen"
+        : `Runner: ${r.state} (last heartbeat ${r.age_seconds}s ago; stale after ${r.stale_after_seconds}s)`
+    );
+    console.log(`Commands waiting: ${st.waiting_total} (${st.expiring_soon_total} expiring within 1 h), expired approvals: ${st.expired_total}`);
+    for (const n of st.namespaces) {
+      console.log(
+        `  [${n.namespace}] waiting ${n.waiting}, expiring soon ${n.expiring_soon}, expired ${n.expired}` +
+          (n.oldest_waiting_seconds !== null ? `, oldest ${n.oldest_waiting_seconds}s (task #${n.oldest_waiting_task_id})` : "")
+      );
+    }
+    if (st.notice) console.log(st.notice);
+  } finally {
+    store.close();
+  }
+}
+
 // `onememory watch [--consumer c] [--wait 25] [--namespace ns] [--exec prog args...]`
 async function watchCmd(): Promise<void> {
   const { DB_PATH } = await import("./config.js");
@@ -1192,6 +1230,9 @@ async function main(): Promise<void> {
       break;
     case "backup":
       await backupCmd();
+      break;
+    case "runner-status":
+      await runnerStatusCmd();
       break;
     case "watch":
       await watchCmd();

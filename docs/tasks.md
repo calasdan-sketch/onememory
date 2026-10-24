@@ -168,8 +168,8 @@ changes in your scope. See [change-feed.md](./change-feed.md#live-wait).
 ## Security
 
 - Same tokens, scopes and namespaces as notes: `task_put`, `task_claim` and
-  `session_handoff` need **write**; `task_get`, `task_list` and `catch_up` need
-  **read**; `task_approve` needs **admin**. A namespace-pinned
+  `session_handoff` need **write**; `task_get`, `task_list`, `catch_up` and
+  `runner_status` need **read**; `task_approve` needs **admin**. A namespace-pinned
   token only sees and writes its own namespace (writes always land there; a
   task id from another namespace answers "no task").
 - `task_put` only updates notes that are tasks, never an ordinary note, and the

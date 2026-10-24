@@ -7,7 +7,7 @@ description: >-
   recall with state_search / state_list. Backed by the OneMemory MCP
   server (tools: state_write, state_read, state_search, state_relevant,
   state_list, state_delete, memory_since, memory_ack, task_put, task_get,
-  task_list, task_claim, task_approve, session_handoff, catch_up, memory_stats, memory_quarantine,
+  task_list, task_claim, task_approve, runner_status, session_handoff, catch_up, memory_stats, memory_quarantine,
   memory_consolidation_candidates, memory_consolidate, memory_rebuild_edges). Works in any MCP-capable agent (Claude Code, Claude Desktop,
   Cursor, Copilot, Windsurf, Cline, and more) and across web and mobile.
 license: MIT

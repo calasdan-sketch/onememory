@@ -6,6 +6,28 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.3.4] - 2026-10-24
+
+"Runner offline, N commands waiting." An approved command task used to wait
+silently when the PC was off or asleep. Now the store says so. No schema change.
+
+### Added
+- `runner_status` (MCP, read scope), `GET /runner/status` (REST, read token) and
+  `onememory runner-status [--json]`: the runner's state (`online` / `stale` /
+  `never_seen`, from the heartbeat's age) and, per readable namespace, the approved
+  commands still waiting, those whose approval ends within an hour, approvals that
+  already expired, and the oldest waiting age. Counts, ages and ids only: never
+  command text, params or targets.
+- `ONEMEMORY_RUNNER_STALE_SECONDS` (default 600) sets when the runner counts as stale.
+- One-line notice when commands are waiting and the runner is not online: a
+  `runner_notice` field on `catch_up` (and `GET /catch-up`), a line in the
+  SessionStart recall, and a banner on the dashboard. Absent otherwise, so existing
+  result shapes are unchanged.
+
+### Changed
+- docs/RUNNER.md: the "does not survive the PC being off or asleep" limit now
+  explains the wait, the approval expiry and the new status.
+
 ## [1.3.3] - 2026-10-24
 
 "Who wrote this?" A note now records which connection wrote it, stamped by the

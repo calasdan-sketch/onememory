@@ -150,6 +150,7 @@ async function fetchRecentNotes(opts: RecallOptions): Promise<RecallData> {
   const { DB_PATH } = await import("./config.js");
   const { Store } = await import("./store.js");
   const { listTasks, listHandoffs, buildBoardSummary, TASK_TAG, HANDOFF_TAG } = await import("./tasks.js");
+  const { runnerNotice } = await import("./runner-status.js");
   const limit = clampInt(opts.limit ?? 10, 10, 1, 100);
   const resolution = await resolveRecallNamespace();
   if (resolution.kind === "unresolvable") {
@@ -177,6 +178,9 @@ async function fetchRecentNotes(opts: RecallOptions): Promise<RecallData> {
       const open = listTasks(store, { namespaces: ns, limit: 10 });
       const handoff = listHandoffs(store, { namespaces: ns, limit: 1 })[0] ?? null;
       board = buildBoardSummary(open.tasks, handoff, undefined, open.total);
+      // One line, only when approved commands wait on an offline runner.
+      const notice = runnerNotice(store, ns);
+      if (notice) board = [notice, board].filter(Boolean).join("\n\n");
     } catch (e) {
       // The board is a bonus: never let it cost the recent-notes recall.
       console.error("onememory recall: task board skipped: " + (e as Error).message);

@@ -24,6 +24,7 @@ import { createHash, timingSafeEqual, randomBytes } from "node:crypto";
 import { Store, ValidationError, QuarantinedError, DEFAULT_NAMESPACE, type NoteRecord } from "./store.js";
 import { runChanges, type ChangesResponse } from "./changes.js";
 import { RESERVED_TAG_PREFIX } from "./reserved-tags.js";
+import { runnerNotice } from "./runner-status.js";
 
 /** Update of a task that doesn't exist / isn't yours to touch (REST: 404). */
 export class TaskNotFoundError extends ValidationError {}
@@ -980,6 +981,45 @@ export function queuedCommandTasks(store: Store, namespace: string, maxTotal = 2
   return out;
 }
 
+/** One queued command task whose approval is still waiting for the runner, or has lapsed. */
+export interface WaitingCommand {
+  id: number;
+  namespace: string;
+  /** "waiting" = valid, unexpired approval; "expired" = an approval that lapsed before the runner took it. */
+  state: "waiting" | "expired";
+  /** When the approval stops (or stopped) being valid, ms since epoch. */
+  expires_ms: number;
+  /** When the task last changed; for a waiting task that is when it was approved. */
+  since: string;
+}
+
+/**
+ * Read-only: queued command tasks that carry an approval, in `namespaces`
+ * (undefined = whole store, [] = nothing). Command text and params are NOT
+ * returned -- only ids, namespaces and timing. A tag that fails the MAC and has
+ * not expired (command edited since approval, or forged) is neither waiting nor
+ * expired: it can never run and is not counted.
+ */
+export function waitingCommandTasks(store: Store, namespaces?: string[], now = Date.now(), maxTotal = 2_000): WaitingCommand[] {
+  const out: WaitingCommand[] = [];
+  if (namespaces && namespaces.length === 0) return out;
+  const page = 200;
+  for (let offset = 0; offset < maxTotal; offset += page) {
+    const r = store.list({ namespaces, limit: page, offset, withTags: [TASK_TAG, "status:queued"], withTagPrefix: TAG_APPROVAL });
+    for (const n of r.notes) {
+      if (parseBody(n.body).command === null) continue;
+      const m = APPROVAL_RE.exec(stateOf(n).approval ?? "");
+      if (!m) continue;
+      const expMs = Number(m[2]);
+      if (!Number.isSafeInteger(expMs)) continue;
+      if (expMs <= now) out.push({ id: n.id, namespace: n.namespace, state: "expired", expires_ms: expMs, since: n.updated_at });
+      else if (verifyApproval(store, n, now) === "approved") out.push({ id: n.id, namespace: n.namespace, state: "waiting", expires_ms: expMs, since: n.updated_at });
+    }
+    if (r.notes.length < page) break;
+  }
+  return out;
+}
+
 /**
  * Runner side: queued -> running, only if the task is still at `rev` (CAS).
  * The approval is CONSUMED in this same write, before anything executes: a
@@ -1205,6 +1245,8 @@ export interface CatchUp {
   /** Compact tasks: title / status / owner / next step -- fetch one with task_get. */
   tasks: { open: TaskSummary[]; total: number };
   handoffs: Handoff[];
+  /** One line, present only when approved commands are waiting and the runner looks offline (see runner-status.ts). */
+  runner_notice?: string;
 }
 
 /**
@@ -1245,6 +1287,8 @@ export function catchUp(store: Store, opts: CatchUpOpts = {}): CatchUp {
   const t = listTasks(store, { namespaces: opts.namespaces, limit: opts.tasks ?? 20 });
   out.tasks = { open: t.tasks.map(compactTask), total: t.total };
   out.handoffs = listHandoffs(store, { namespaces: opts.namespaces, limit: opts.handoffs ?? 3 });
+  const notice = runnerNotice(store, opts.namespaces);
+  if (notice) out.runner_notice = notice;
   return out;
 }
 
