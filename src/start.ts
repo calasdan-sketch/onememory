@@ -26,6 +26,7 @@ import {
 } from "./config.js";
 import { autoConsolidateCooperative, AUTO_MERGE_SCORE } from "./consolidate.js";
 import { resolveStartupNamespace } from "./namespace.js";
+import { abortAllWaiters } from "./change-wait.js";
 
 prepareDataDir();
 assertSafeExposure();
@@ -136,10 +137,34 @@ if (AUTO_CONSOLIDATE_INTERVAL_MS && AUTO_CONSOLIDATE_INTERVAL_MS > 0) {
   );
 }
 
+// The change log is pruned (90-day retention) on a timer, not only when
+// someone happens to read the feed. Best-effort, unref'd, and cheap (one
+// indexed DELETE): shortly after start, then hourly. (The interval can be
+// shortened with ONEMEMORY_CHANGE_LOG_PURGE_MS; that is for tests.)
+const purgeEveryMs = (() => {
+  const n = Number(process.env.ONEMEMORY_CHANGE_LOG_PURGE_MS);
+  return Number.isInteger(n) && n >= 100 ? n : 3_600_000;
+})();
+const purgeNow = (): void => {
+  try {
+    store.purgeChangeLog();
+  } catch (e) {
+    console.error(`[onememory] change-log purge failed: ${(e as Error).message}`);
+  }
+};
+const purgeTimer = setInterval(purgeNow, purgeEveryMs);
+purgeTimer.unref();
+setTimeout(purgeNow, Math.min(30_000, purgeEveryMs)).unref();
+
 let closing = false;
 function shutdown(): void {
   if (closing) return;
   closing = true;
+  clearInterval(purgeTimer);
+  // Live waits (memory_since / GET /changes?wait=) end NOW and answer with
+  // timedOut:true, so a restart drains in milliseconds instead of resetting
+  // sockets at the 3s safety net.
+  abortAllWaiters();
   let pending = 2;
   const done = (): void => {
     pending -= 1;
@@ -150,6 +175,14 @@ function shutdown(): void {
   };
   apiServer.close(done);
   mcpServer.close(done);
+  // Keep-alive connections would otherwise hold close() open: as the woken
+  // waiters finish their responses their sockets go idle, so sweep idle
+  // ones every 25ms until the servers are down.
+  const sweep = setInterval(() => {
+    apiServer.closeIdleConnections?.();
+    mcpServer.closeIdleConnections?.();
+  }, 25);
+  sweep.unref();
   // Safety net: don't hang forever if a socket won't drain.
   setTimeout(() => {
     store.close();

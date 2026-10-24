@@ -49,6 +49,18 @@ function usage(): void {
       "  changes --purge             delete the whole change log (titles of past changes) and all markers",
       "            What changed while you were away: created/updated/deleted notes",
       "            grouped by source. --since last uses (and advances) a per-consumer marker.",
+      "  backup [--out <dir>]",
+      "            Consistent hot copy of the database (works while the server runs)",
+      "            into <dir>/state.db, plus a copy of the encryption key (.key) if",
+      "            at-rest encryption is on. Default dir: ./onememory-backup-<time>.",
+      "            WARNING: store the key SEPARATELY from the backup; a backup without",
+      "            its key is unreadable, and one stored with it is not encrypted.",
+      "            When: before upgrades, and on a schedule.",
+      "  watch [--consumer name] [--wait 25] [--namespace ns] [--exec <program> [args...]]",
+      "            Long-poll loop on this store: prints each new change as it happens.",
+      "            With --exec, runs <program> (no shell) per batch with the changes as",
+      "            JSON on stdin and ONEMEMORY_CHANGE_COUNT in the environment.",
+      "            When: you want a script or notifier to react to a phone/other-session write.",
       "  export --format md --dir <path> [--namespace ns] [--no-prune] [--force]",
       "            Write one Markdown file per note (YAML front-matter) into",
       "            namespace folders. Deterministic and git-friendly; prunes",
@@ -690,6 +702,70 @@ function parseFlags(
 
 const str = (v: string | true | undefined): string | undefined => (typeof v === "string" ? v : undefined);
 
+// `onememory backup [--out dir]`: hot copy via VACUUM INTO (see backup.ts).
+async function backupCmd(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const { backupStore } = await import("./backup.js");
+  const { flags } = parseFlags(process.argv.slice(3), { values: ["out"], bools: [] });
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*$/, "").replace("T", "-");
+  const out = str(flags.out) ?? `onememory-backup-${stamp}`;
+  const store = new Store(DB_PATH);
+  try {
+    const r = backupStore(store, DB_PATH, out);
+    console.log(`Backed up ${r.notes} note(s) (${r.bytes} bytes) to ${r.db}`);
+    if (r.key) {
+      console.log(`Copied the encryption key to ${r.key} (mode 0600).`);
+      console.log(
+        "WARNING: this backup is only readable with that key, and anyone holding both can read everything.\n" +
+          "         Move the key out of this folder and store it separately (password manager / another drive)."
+      );
+    }
+  } catch (e) {
+    console.error(`Backup failed: ${(e as Error).message}`);
+    process.exit(1);
+  } finally {
+    store.close();
+  }
+}
+
+// `onememory watch [--consumer c] [--wait 25] [--namespace ns] [--exec prog args...]`
+async function watchCmd(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const { watchLoop } = await import("./watch.js");
+  const argv = process.argv.slice(3);
+  // Everything after --exec is the program and its arguments, verbatim.
+  const at = argv.indexOf("--exec");
+  const exec = at >= 0 ? argv.slice(at + 1) : undefined;
+  if (at >= 0 && (!exec || exec.length === 0)) {
+    console.error("--exec needs a program, e.g. --exec notify-send OneMemory");
+    process.exit(1);
+  }
+  const { flags } = parseFlags(at >= 0 ? argv.slice(0, at) : argv, { values: ["consumer", "wait", "namespace"], bools: [] });
+  const wait = str(flags.wait) !== undefined ? Number(flags.wait) : 25;
+  if (!Number.isInteger(wait) || wait < 1 || wait > 55) {
+    console.error("--wait must be a whole number of seconds from 1 to 55 (25 recommended)");
+    process.exit(1);
+  }
+  const abort = new AbortController();
+  process.on("SIGINT", () => abort.abort());
+  process.on("SIGTERM", () => abort.abort());
+  const store = new Store(DB_PATH);
+  try {
+    console.error(`watching as "${str(flags.consumer) ?? "watch"}" (Ctrl+C to stop)`);
+    await watchLoop(store, {
+      consumer: str(flags.consumer) ?? "watch",
+      waitSeconds: wait,
+      namespaces: str(flags.namespace) ? [str(flags.namespace)!] : undefined,
+      exec,
+      signal: abort.signal,
+    });
+  } finally {
+    store.close();
+  }
+}
+
 // `onememory changes`: the change feed over the local store (full local
 // trust, like every CLI command). Prints every page.
 async function changes(): Promise<void> {
@@ -1089,6 +1165,12 @@ async function main(): Promise<void> {
       break;
     case "changes":
       await changes();
+      break;
+    case "backup":
+      await backupCmd();
+      break;
+    case "watch":
+      await watchCmd();
       break;
     case "export":
       await exportCmd();

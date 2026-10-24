@@ -4,7 +4,7 @@
 // log. All dependency-free on purpose -- this code sits in front of a service
 // that can be exposed over a public tunnel, so less surface is safer.
 
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { IncomingMessage } from "node:http";
@@ -406,6 +406,37 @@ function auditPath(): string {
   return process.env.ONEMEMORY_AUDIT_LOG || join(DATA_DIR, "audit.log");
 }
 
+let auditWrites = 0;
+
+/**
+ * Size-based rotation: when audit.log passes ONEMEMORY_AUDIT_MAX_BYTES
+ * (default 5 MB) it becomes audit.log.1, the old .1 becomes .2, and so on up
+ * to ONEMEMORY_AUDIT_KEEP rotated files (default 5; the oldest is dropped). Checked
+ * every 50 writes (and on the first), so it costs almost nothing per request.
+ */
+function rotateAuditIfNeeded(path: string): void {
+  const max = Number(process.env.ONEMEMORY_AUDIT_MAX_BYTES || 5_000_000);
+  const keep = Math.max(1, Math.floor(Number(process.env.ONEMEMORY_AUDIT_KEEP || 5)));
+  if (!(max > 0)) return;
+  if (auditWrites++ % 50 !== 0) return;
+  let size = 0;
+  try {
+    size = statSync(path).size;
+  } catch {
+    return;
+  }
+  if (size < max) return;
+  for (let i = keep; i >= 1; i--) {
+    const src = i === 1 ? path : `${path}.${i - 1}`;
+    try {
+      if (i === keep) rmSync(`${path}.${i}`, { force: true }); // drop the oldest (Windows can't rename over it)
+      renameSync(src, `${path}.${i}`);
+    } catch {
+      /* a gap in the chain is fine */
+    }
+  }
+}
+
 export function audit(entry: {
   op: string;
   id?: number;
@@ -421,6 +452,7 @@ export function audit(entry: {
   try {
     const path = auditPath();
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    rotateAuditIfNeeded(path);
     appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n", { mode: 0o600 });
   } catch {
     // Audit logging must never break a request.
