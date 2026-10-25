@@ -266,6 +266,35 @@ describe("history and encryption at rest", () => {
     }
   });
 
+  test("turning encryption on later seals the history that was already kept, and turning it off opens it again", () => {
+    const dir = mkdtempSync(join(tmpdir(), "om-hist-later-"));
+    try {
+      const path = join(dir, "state.db");
+      const s = new Store(path);
+      const n = as("alice", () => s.create({ title: "t", body: "OLD-SECRET-TEXT" }));
+      as("bob", () => s.update(n.id, { body: "newer" }));
+      const key = ensureKey(dir);
+      assert.ok(s.encryptAll(key) >= 1);
+      const read = (): { body: string; body_enc: string | null } => {
+        const raw = new DatabaseSync(path, { readOnly: true });
+        try {
+          return raw.prepare("SELECT body, body_enc FROM note_history").get() as { body: string; body_enc: string | null };
+        } finally {
+          raw.close();
+        }
+      };
+      assert.equal(read().body, "");
+      assert.ok(read().body_enc && !read().body_enc!.includes("OLD-SECRET"));
+      assert.equal(s.historyOf(n.id)[0].body, "OLD-SECRET-TEXT");
+      s.decryptAll(key);
+      assert.equal(read().body, "OLD-SECRET-TEXT");
+      assert.equal(read().body_enc, null);
+      s.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("a history body cannot be moved to another row (it is bound to its own row)", () => {
     const dir = mkdtempSync(join(tmpdir(), "om-hist-aad-"));
     try {

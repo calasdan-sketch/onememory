@@ -20,8 +20,8 @@ Closes every gap the 1.5.0 benchmark recorded, without ever changing a memory si
   fails if anything changed in between. On the command line you type the number of notes you are replacing (or `yes`); a script must pass
   `--confirm-token`. There is no `--yes`.
 - **Nothing is deleted.** The old note becomes `superseded` with a `superseded_by` link, leaves search, lists, `relevant` and
-  similar-note suggestions, and shows (always labelled) with `include_superseded`. `supersede undo` brings it back; both are recorded. Hard delete
-  is unchanged. Details: [docs/replacing-memories.md](./docs/replacing-memories.md).
+  similar-note suggestions, and shows (always labelled) with `include_superseded`. `supersede undo` brings it back; both are recorded, and a write token can undo only a replacement it made itself (an administrator can undo any). Hard delete
+  is unchanged, except that hard-deleting a note that *replaced* others brings those back rather than leaving them hidden for good. Details: [docs/replacing-memories.md](./docs/replacing-memories.md).
 - **Trust guard.** A distrusted writer is refused outright; a replacement that claims lower confidence than the note it hides needs an
   administrator and an explicit `acknowledge_risk` (on the CLI, typing `i accept the risk`). Confidence never overrides trust.
 - **Version history.** Every edit keeps the text it replaces (bounded: `ONEMEMORY_HISTORY_VERSIONS` default 20, `ONEMEMORY_HISTORY_MAX_BYTES`;
@@ -37,7 +37,7 @@ Closes every gap the 1.5.0 benchmark recorded, without ever changing a memory si
 - **Ranking.** When two notes are about the same thing and the older one is flagged stale, it now stays behind the newer one in search even if it
   matches the words better (it is still returned and flagged). The retrieval evaluation set is unchanged: best-of-both recall@1 1.000, recall@5 1.000,
   MRR 1.000; keyword-only recall@1 0.700, before and after.
-- **Benchmark: 108 deterministic scenarios** (was 75): A 32, B 30, C 27, D 19. All four known gaps are now `fixed`, and the scenarios that carried them pass
+- **Benchmark: 109 deterministic scenarios** (was 75): A 32, B 31, C 27, D 19. All four known gaps are now `fixed`, and the scenarios that carried them pass
   (A05, A06, A10, A20, B03 include the confirmed replace steps; A11 passes by the ranking fix alone; B08, B09 by history; D10 by confidence). New
   scenarios cover: a preview writes nothing; a confirm needs a valid code; expired, reused, damaged and changed-revision codes fail; a code is useless to
   another writer or tenant; undo; history restore; the trust-guard cases; confidence round trip; and cross-tenant isolation of history, previews and undo.

@@ -264,18 +264,19 @@ export function supersedeConfirm(
 ): SupersedeResult {
   if (!scopeAllows(caller.scope, "write")) throw new SupersedeError("replacing a note needs a write or admin token", 403);
   if (typeof req.token !== "string" || !req.token) throw new SupersedeError("a confirmation code from the preview is required", 400);
+  // ONE message for a damaged code, a made-up code, and a real code made for somebody else (or for another tenant), and the caller is
+  // checked BEFORE the expiry and the used-check, so a code that is not yours tells you nothing, not even whether it is still good.
+  const notValid = (): SupersedeError => new SupersedeError("that is not a valid confirmation code (it may have been copied wrongly); run the preview again", 400);
   const t = store.openToken(TOKEN_DOMAIN, req.token);
-  if (!t) throw new SupersedeError("that is not a valid confirmation code (it may have been copied wrongly); run the preview again", 400);
+  if (!t || t.k !== callerKey(caller)) throw notValid();
   const exp = Number(t.e);
   if (!Number.isFinite(exp) || Date.now() > exp) throw new SupersedeError("that confirmation code has expired; run the preview again", 410);
-  // Not "forbidden": the same text for a wrong person and a made-up code, so a code cannot be probed.
-  if (t.k !== callerKey(caller)) throw new SupersedeError("that is not a valid confirmation code for you; run the preview again", 400);
   const nonce = String(t.x ?? "");
-  if (!/^[0-9a-f]{24}$/.test(nonce)) throw new SupersedeError("that is not a valid confirmation code; run the preview again", 400);
+  if (!/^[0-9a-f]{24}$/.test(nonce)) throw notValid();
   if (store.tokenSpent(nonce)) throw new SupersedeError("that confirmation code was already used; run the preview again if you still want to replace", 410);
 
   const oldPairs = Array.isArray(t.o) ? (t.o as unknown[]).map((p) => (Array.isArray(p) ? [Number(p[0]), Number(p[1])] : [NaN, NaN])) : [];
-  if (oldPairs.length === 0 || oldPairs.some((p) => !Number.isInteger(p[0]) || !Number.isInteger(p[1]))) throw new SupersedeError("that is not a valid confirmation code; run the preview again", 400);
+  if (oldPairs.length === 0 || oldPairs.some((p) => !Number.isInteger(p[0]) || !Number.isInteger(p[1]))) throw notValid();
   const newId = Number(t.ni) || 0;
   const newRev = Number(t.nr) || 0;
   const tokenRisk = Number(t.r) === 1;
@@ -365,6 +366,11 @@ export function supersedeUndo(store: Store, caller: Caller, id: unknown): { ok: 
   const me = writerOf(caller);
   if (me !== "" && store.isDistrusted({ namespace: n.namespace, written_by: me }) && !scopeAllows(caller.scope, "admin")) {
     throw new SupersedeError("a writer on the distrust list cannot bring replaced notes back", 403);
+  }
+  // Bringing a note back undoes somebody's decision to hide it. A write token may only undo ITS OWN replacement; undoing anyone
+  // else's (for example an administrator's, made to hide a bad note) is for an administrator.
+  if (!scopeAllows(caller.scope, "admin") && (n.superseded_by_writer ?? "") !== me) {
+    throw new SupersedeError("this note was replaced by someone else; only an administrator (or the person who replaced it) can bring it back", 403);
   }
   const back = store.supersedeUndo(id, me);
   if (!back) throw new SupersedeError(`note ${id} has not been replaced, so there is nothing to undo`, 409);

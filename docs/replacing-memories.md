@@ -50,8 +50,10 @@ suggestions. To see them anyway, ask for them: `?include_superseded=1` on
 `GET /search` and `GET /notes`, `?superseded=1` for only those, `include_superseded` on `state_search` / `state_list`.
 They are always labelled. A superseded note cannot be edited until it is brought back.
 
-**Undo** brings the note back exactly as it was. Undo is recorded (who, when, which note) like the replacement itself.
-**Hard delete is unchanged**: `DELETE /notes/:id` still deletes for good (admin), and takes the note's history with it.
+**Undo** brings the note back exactly as it was. Undo is recorded (who, when, which note) like the replacement itself. A write token can undo only a replacement
+it made itself; undoing someone else's (for example an administrator's, made to hide a bad note) needs an administrator.
+**Hard delete is unchanged**: `DELETE /notes/:id` still deletes for good (admin), and takes the note's history with it. One exception, so nothing
+is lost by accident: if you hard-delete a note that *replaced* others, those notes come back (logged), because nothing would be left to point at.
 
 ## The trust guard
 

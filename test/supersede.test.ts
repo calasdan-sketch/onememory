@@ -195,7 +195,9 @@ describe("step 2: the confirmation", () => {
     const old = mk("alice", "a", "alpha");
     const nw = mk("alice", "b", "beta");
     const p = preview(write("alice"), [old.id], nw.id);
-    expectErr(() => confirm(write("mallory"), p.token), 400, /not a valid confirmation code for you/);
+    const wrongPerson = expectErr(() => confirm(write("mallory"), p.token), 400, /not a valid confirmation code/);
+    const madeUp = expectErr(() => confirm(write("mallory"), "x.y"), 400);
+    assert.equal(wrongPerson.message, madeUp.message, "a real code made for someone else reads exactly like a made-up one");
     expectErr(() => confirm(admin("alice"), p.token), 400);
     expectErr(() => confirm({ scope: "write", writer: "alice", ownNamespace: "other" }, p.token), 400);
     assert.equal(store.read(old.id)!.superseded_by, undefined, "nothing was replaced");
@@ -213,6 +215,33 @@ describe("step 2: the confirmation", () => {
       msgs.add(e.message.replace(/a confirmation code from the preview is required/, "invalid"));
     }
     assert.ok(msgs.size <= 2, [...msgs].join(" | "));
+    assert.equal(store.read(old.id)!.superseded_by, undefined);
+  });
+
+  test("a code for someone else does not even reveal whether it has expired or been used", async () => {
+    process.env.ONEMEMORY_SUPERSEDE_TTL_SECONDS = "1";
+    try {
+      const old = mk("alice", "a", "alpha");
+      const nw = mk("alice", "b", "beta");
+      const p = preview(write("alice"), [old.id], nw.id);
+      await new Promise((r) => setTimeout(r, 1200));
+      const stranger = expectErr(() => confirm(write("mallory"), p.token), 400);
+      const owner = expectErr(() => confirm(write("alice"), p.token), 410);
+      assert.notEqual(stranger.message, owner.message);
+      assert.match(stranger.message, /not a valid confirmation code/);
+    } finally {
+      delete process.env.ONEMEMORY_SUPERSEDE_TTL_SECONDS;
+    }
+  });
+
+  test("a different kind of signed code (the change-feed acknowledgement) is not accepted as a confirmation", () => {
+    const old = mk("alice", "a", "alpha");
+    const nw = mk("alice", "b", "beta");
+    const p = preview(write("alice"), [old.id], nw.id);
+    const body = p.token.split(".")[0];
+    const payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+    const forged = store.mintToken("onememory-ack-v1", payload);
+    expectErr(() => confirm(write("alice"), forged), 400);
     assert.equal(store.read(old.id)!.superseded_by, undefined);
   });
 
@@ -329,6 +358,48 @@ describe("undo", () => {
     confirm(write("alice"), preview(write("alice"), [old.id], nw.id).token);
     assert.throws(() => store.update(old.id, { body: "sneaky" }), ValidationError);
     assert.throws(() => store.restore(old.id), ValidationError);
+  });
+
+  test("only an administrator, or the person who replaced it, can bring a note back", () => {
+    const old = mk("mallory", "poison", "bad advice");
+    const nw = mk("boss", "good", "good advice");
+    confirm(admin("boss"), preview(admin("boss"), [old.id], nw.id).token);
+    // mallory (a plain writer, not on any list) cannot undo the administrator's decision to hide her note
+    const e = expectErr(() => as("mallory", () => supersedeUndo(store, write("mallory"), old.id)), 403);
+    assert.match(e.message, /replaced by someone else/);
+    assert.equal(store.read(old.id)!.status, "superseded");
+    // another plain writer cannot either
+    expectErr(() => as("carol", () => supersedeUndo(store, write("carol"), old.id)), 403);
+    // the administrator can
+    assert.equal(as("boss", () => supersedeUndo(store, admin("other-admin"), old.id)).note.status, undefined);
+  });
+
+  test("the person who replaced a note can undo it themselves", () => {
+    const old = mk("alice", "a", "alpha");
+    const nw = mk("alice", "b", "beta");
+    confirm(write("alice"), preview(write("alice"), [old.id], nw.id).token);
+    assert.equal(as("alice", () => supersedeUndo(store, write("alice"), old.id)).note.status, undefined);
+  });
+
+  test("hard-deleting the replacement brings what it replaced back, instead of leaving it hidden for good", async () => {
+    const old = mk("alice", "quartz limit", "limit is 5 quartz");
+    const nw = mk("alice", "quartz limit now", "limit is 6 quartz");
+    confirm(write("alice"), preview(write("alice"), [old.id], nw.id).token);
+    assert.equal((await runSearch(store, "quartz limit")).some((n) => n.id === old.id), false);
+    assert.equal(store.delete(nw.id), true);
+    const back = store.read(old.id)!;
+    assert.equal(back.status, undefined);
+    assert.equal(back.superseded_by, undefined);
+    assert.equal((await runSearch(store, "quartz limit")).some((n) => n.id === old.id), true);
+    assert.ok(store.supersedeLog(undefined).some((l) => l.action === "undo" && l.flags === "replacement-deleted" && l.old_id === old.id));
+  });
+
+  test("deleting an ordinary note touches nothing else", () => {
+    const a = mk("alice", "a", "alpha");
+    const b = mk("alice", "b", "beta");
+    assert.equal(store.delete(a.id), true);
+    assert.equal(store.read(b.id)!.rev, 1);
+    assert.equal(store.supersedeLog(undefined).length, 0);
   });
 
   test("a hard delete still deletes a replaced note", () => {

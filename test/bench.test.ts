@@ -387,7 +387,7 @@ describe("against OneMemory", () => {
   });
 
   test("the new replace, history, trust-guard and confidence scenarios exist and pass", () => {
-    const want = ["A21", "A22", "A23", "A24", "A25", "A26", "A27", "A28", "A29", "A30", "A31", "A32", "B21", "B22", "B23", "B24", "B25", "B26", "B27", "B28", "B29", "B30", "C22", "C23", "C24", "C25", "C26", "C27", "D15", "D16", "D17", "D18", "D19"];
+    const want = ["A21", "A22", "A23", "A24", "A25", "A26", "A27", "A28", "A29", "A30", "A31", "A32", "B21", "B22", "B23", "B24", "B25", "B26", "B27", "B28", "B29", "B30", "B31", "C22", "C23", "C24", "C25", "C26", "C27", "D15", "D16", "D17", "D18", "D19"];
     const status = new Map(first.scenarios.map((s) => [s.id, s.status]));
     for (const id of want) assert.equal(status.get(id), "pass", id);
   });

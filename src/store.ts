@@ -3073,7 +3073,38 @@ export class Store {
   }
 
   delete(id: number): boolean {
-    return this.deleteWhere(id, null);
+    const ok = this.deleteWhere(id, null);
+    if (ok) this.reviveAfterReplacementDeleted(id);
+    return ok;
+  }
+
+  /**
+   * An explicit hard delete of a note that REPLACED others must not leave those others hidden for good, pointing at nothing:
+   * whatever it replaced comes back (and is logged). Consolidation deletes its sources through deleteIfRev and is not affected.
+   */
+  private reviveAfterReplacementDeleted(deletedId: number): void {
+    const rows = this.db.prepare("SELECT id, namespace FROM notes WHERE superseded_by = ?").all(deletedId) as Array<{ id: number; namespace: string }>;
+    if (rows.length === 0) return;
+    const now = new Date().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const upd = this.db.prepare("UPDATE notes SET archived_at = NULL, superseded_by = NULL, superseded_at = NULL, superseded_by_writer = '', rev = rev + 1 WHERE id = ? AND superseded_by = ?");
+      const log = this.db.prepare("INSERT INTO supersede_log (at, actor, action, namespace, old_id, new_id, flags) VALUES (?, ?, 'undo', ?, ?, ?, 'replacement-deleted')");
+      for (const r of rows) {
+        upd.run(r.id, deletedId);
+        log.run(now, currentWriter(), r.namespace, r.id, deletedId);
+      }
+      this.db.exec("COMMIT");
+    } catch (e) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* already rolled back */
+      }
+      throw e;
+    }
+    this.edgeIndexes.clear();
+    this.announceChange();
   }
 
   /**
