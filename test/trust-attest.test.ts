@@ -430,7 +430,7 @@ describe("attestations: HTTP export / import and the CLI", () => {
       const first = run("b.db", "import", "--file", out, "--json");
       assert.equal(first.status, 0, first.stderr);
       assert.equal(JSON.parse(first.stdout).attestations.verified, 0);
-      const unpinned = run("b.db", "trust", "attester-add", aid.public_key);
+      const unpinned = run("b.db", "trust", "attester-add", "--public-key", aid.public_key);
       assert.equal(unpinned.status, 1, "a key without a server id is refused");
       assert.match(unpinned.stderr, /server_id is required/);
       const add = run("b.db", "trust", "attester-add", aid.public_key, "--server-id", aid.server_id, "--label", "a");

@@ -268,7 +268,11 @@ function fresh(text: string): { text: string; wasEmpty: boolean } {
   // Empty / whitespace-only file: treat as an empty object.
   const body = text.replace(/^﻿/, "");
   const bare = body.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, "").trim();
-  return bare === "" ? { text: (text.startsWith("﻿") ? "﻿" : "") + "{}" + (body.endsWith("\n") ? "\n" : ""), wasEmpty: true } : { text, wasEmpty: false };
+  if (bare !== "") return { text, wasEmpty: false };
+  if (body.trim() === "") return { text: (text.startsWith("\ufeff") ? "\ufeff" : "") + "{}" + (body.endsWith("\n") ? "\n" : ""), wasEmpty: true };
+  // Only comments in the file: keep them, add the empty object after them.
+  const eol = detectEol(text);
+  return { text: text + (/\n$/.test(text) ? "" : eol) + "{}" + eol, wasEmpty: true };
 }
 
 /**

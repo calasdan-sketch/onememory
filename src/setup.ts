@@ -11,7 +11,7 @@
 // Files are re-read right before the write and the edit is re-applied to what is there NOW, because Claude Code rewrites
 // ~/.claude.json while it runs; a change made in between is kept, not overwritten.
 
-import { copyFileSync, existsSync, fsyncSync, closeSync, openSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeSync, chmodSync, readdirSync } from "node:fs";
+import { copyFileSync, existsSync, fsyncSync, closeSync, openSync, mkdirSync, readFileSync, lstatSync, realpathSync, renameSync, statSync, unlinkSync, writeSync, chmodSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { randomBytes, createHash } from "node:crypto";
@@ -34,6 +34,15 @@ export interface SetupEnv {
   now: () => Date;
 }
 
+/** Expand Windows 8.3 short names (PROGRA~1) and symlinks to the real long path; keep the input if that is impossible. */
+export function longPath(p: string): string {
+  try {
+    return realpathSync.native(p);
+  } catch {
+    return p;
+  }
+}
+
 export function realEnv(version: string, cliPath: string): SetupEnv {
   return {
     home: homedir(),
@@ -41,8 +50,8 @@ export function realEnv(version: string, cliPath: string): SetupEnv {
     env: process.env,
     cwd: process.cwd(),
     nodeVersion: process.versions.node,
-    execPath: process.execPath,
-    cliPath,
+    execPath: longPath(process.execPath),
+    cliPath: longPath(cliPath),
     version,
     now: () => new Date(),
   };
@@ -340,6 +349,8 @@ export function planFile(e: SetupEnv, opts: SetupOptions, target: ClientTarget, 
 }
 
 export const HOOK_MARKER = "recall --budget-ms";
+/** Our own hook: the exact recall command we write, or any command line naming onememory with recall. */
+const HOOK_DETECT = /recall --budget-ms|onememory[^\n]{0,120}\brecall\b/;
 
 export function planHook(e: SetupEnv, opts: SetupOptions, dbForHook?: string): { change: FileChange | null; already: boolean } {
   const file = join(claudeDir(e), "settings.json");
@@ -347,7 +358,7 @@ export function planHook(e: SetupEnv, opts: SetupOptions, dbForHook?: string): {
   if (text && text.trim()) {
     const doc = parseDoc(text);
     const arr = getPath(doc, ["hooks", "SessionStart"]);
-    if (arr && /onememory|cli\.js/.test(text.slice(arr.start, arr.end)) && /\brecall\b/.test(text.slice(arr.start, arr.end))) return { change: null, already: true };
+    if (arr && HOOK_DETECT.test(text.slice(arr.start, arr.end))) return { change: null, already: true };
   }
   const item = { matcher: "startup|clear", hooks: [{ type: "command", command: buildHookCommand(e, opts, dbForHook) }] };
   return {
@@ -366,10 +377,17 @@ export function planHook(e: SetupEnv, opts: SetupOptions, dbForHook?: string): {
 
 // ---- diff (shown to the person) ------------------------------------------------------------------------------------------
 
-const SECRET_LINE = /("[^"\n]*(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD)[^"\n]*"\s*:\s*)"[^"\n]*"/gi;
+const SECRET_LINE = /("[^"\n]*(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[^"\n]*"\s*:\s*)"[^"\n]*"/gi;
+const PLAIN_ENV_KEY = /_(PATH|HOME|DIR|FILE|PORT|HOST|BIND|TIMEZONE)$/;
+const ENV_STYLE_LINE = /("([A-Z][A-Z0-9_]{2,})"\s*:\s*)"[^"\n]*"/g;
+const URL_CREDS = /(\w+:\/\/[^\s:@/"]+:)[^\s@/"]+@/g;
 
+/** Hide values that could be secrets in a diff shown on screen: secret-looking keys, any ALL_CAPS env value that is not a plain path/port/etc., and user:pass@ in URLs. */
 export function redact(s: string): string {
-  return s.replace(SECRET_LINE, '$1"***"');
+  return s
+    .replace(SECRET_LINE, '$1"***"')
+    .replace(ENV_STYLE_LINE, (m, pre: string, key: string) => (PLAIN_ENV_KEY.test(key) ? m : `${pre}"***"`))
+    .replace(URL_CREDS, "$1***@");
 }
 
 /** A small, exact line diff: the unchanged head and tail are trimmed, the middle is shown with 2 lines of context. */
@@ -467,6 +485,13 @@ export function writeChange(e: SetupEnv, change: FileChange): WrittenChange | nu
   try {
     real = realpathSync(file); // a symlinked config is edited at its target, so the link survives
   } catch {
+    let isLink = false;
+    try {
+      isLink = lstatSync(file).isSymbolicLink();
+    } catch {
+      /* not there at all: fine, it will be created */
+    }
+    if (isLink) throw new JsonEditError(`${file} is a link to a file that does not exist; nothing was written (fix or remove the link, then run setup again)`);
     mkdirSync(dirname(file), { recursive: true });
   }
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -674,9 +699,7 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
   }
 
   if (plan.changes.length === 0 && plan.conflicts.length === 0) {
-    for (const a of plan.already) io.out(a);
     if (plan.already.length === 0) io.out("I found no app to connect. Pass --only claude-code (or claude-desktop, cursor) to create its config, or --project for this folder.");
-    else io.out("\nNothing to change: OneMemory is already connected.");
   }
   if (plan.conflicts.length) {
     io.err("Stopped, because:");
@@ -695,6 +718,13 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
       if (opts.hook === "yes") wantHook = true;
       plan.hook = ph.change;
     }
+  }
+
+  if (plan.changes.length === 0 && !plan.hook) {
+    for (const a of plan.already) io.out(`  (already fine) ${a}`);
+    for (const w of plan.warnings) io.out(`  (careful) ${w}`);
+    io.out(plan.already.length ? "\nNothing to change: OneMemory is already connected. To check it, run:  onememory doctor" : "\nNothing was changed.");
+    return 0;
   }
 
   io.out("What I will do:");

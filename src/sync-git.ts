@@ -8,7 +8,7 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { decrypt, encrypt, keyPath } from "./crypto.js";
 
@@ -176,6 +176,18 @@ export async function runGitSync(io: GitSyncIO, o: GitSyncOptions): Promise<numb
   const otherName = o.encrypt ? VAULT_PLAIN : VAULT_ENC;
   const vault = join(repo, vaultName);
   try {
+    // A repository you pulled from elsewhere could contain a link named like our folder that points outside it.
+    for (const nm of [vaultName, otherName]) {
+      const p = join(repo, nm);
+      let st = null;
+      try {
+        st = lstatSync(p);
+      } catch {
+        /* not there yet */
+      }
+      if (st && (st.isSymbolicLink() || !st.isDirectory())) throw new SyncStop(`${nm} in the repository is a link or not a folder; I will not follow it. Nothing was changed.`);
+      if (st && !isInside(top, realpathSync(p))) throw new SyncStop(`${nm} in the repository points outside the repository; stopped.`);
+    }
     if (existsSync(join(repo, otherName)) && readdirSync(join(repo, otherName)).length > 0) {
       throw new SyncStop(`This repository already uses ${otherName}/ (${o.encrypt ? "plain" : "sealed"} files). Mixing the two would leak or lose notes; use the same mode as before${o.encrypt ? " (drop --encrypt)" : " (add --encrypt)"}.`);
     }
@@ -338,8 +350,9 @@ export async function runGitSync(io: GitSyncIO, o: GitSyncOptions): Promise<numb
 function decryptInto(vault: string, work: string, key: Buffer): Map<string, string> {
   const seen = new Map<string, string>();
   if (!existsSync(vault)) return seen;
-  for (const f of readdirSync(vault)) {
-    if (!f.endsWith(".enc")) continue;
+  for (const de of readdirSync(vault, { withFileTypes: true })) {
+    const f = de.name;
+    if (!f.endsWith(".enc") || !de.isFile()) continue; // links and folders are never followed
     let opened: { rel: string; text: string };
     try {
       opened = openFile(f, readFileSync(join(vault, f), "utf8"), key);

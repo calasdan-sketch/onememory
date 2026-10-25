@@ -1872,6 +1872,15 @@ function askYesNo(prompt: string): Promise<boolean> {
 
 async function main(): Promise<void> {
   const cmd = process.argv[2] || "start";
+  // Old Node: say so in plain words BEFORE anything loads node:sqlite (which would crash with a stack trace).
+  if (Number(process.versions.node.split(".")[0]) < 24 && !["help", "--help", "-h"].includes(cmd)) {
+    console.error(
+      `OneMemory needs Node.js 24 or newer, and this computer has Node ${process.versions.node}.\n` +
+        "  Fix: install Node 24 (https://nodejs.org), open a NEW terminal, check with:  node -v\n" +
+        "  Nothing was changed. (No Node 24? Docker works too: see INSTALL.md.)"
+    );
+    process.exit(1);
+  }
   if (cmd === "--version" || cmd === "-v" || cmd === "version") {
     const { PACKAGE_VERSION } = await import("./config.js");
     console.log(PACKAGE_VERSION);
@@ -1879,7 +1888,9 @@ async function main(): Promise<void> {
   }
   // Move 1.0.x state out of the package before anything opens the DB.
   // (`bench` runs on a throwaway store and must never touch the real data directory.)
-  if (!["help", "--help", "-h", "init", "bench", "setup"].includes(cmd)) (await import("./config.js")).prepareDataDir();
+  // A dry run of `import --claude` or `sync` must not create anything, not even the data folder.
+  const dry = process.argv.includes("--dry-run") && ((cmd === "import" && process.argv.includes("--claude")) || cmd === "sync");
+  if (!dry && !["help", "--help", "-h", "init", "bench", "setup"].includes(cmd)) (await import("./config.js")).prepareDataDir();
   // Fixed writer marker for notes this process writes with no token behind
   // them (written_by): the long-running server's own jobs, the stdio MCP
   // server, or an `onememory ...` command run by the machine owner.
