@@ -10,7 +10,7 @@ import { spawnSync } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import path, { dirname, join, relative, resolve, sep } from "node:path";
 import { decrypt, encrypt, keyPath } from "./crypto.js";
 
 export const VAULT_PLAIN = "onememory";
@@ -103,17 +103,40 @@ function createKey(p: string): Buffer {
   return key;
 }
 
+type PathFlavour = Pick<typeof path, "relative" | "isAbsolute" | "resolve">;
+
+/** Pure containment test on two already-resolved paths. Segment based ("..x" is a child, ".." is not); on Windows a different drive
+ * gives an absolute relative path and is refused, and the comparison ignores case (NTFS), which is also what makes C:\\ vs c:\\ agree. */
+export function containedIn(flavour: PathFlavour, dir: string, file: string, ignoreCase: boolean): boolean {
+  const fold = (p: string): string => (ignoreCase ? p.toLowerCase() : p);
+  const rel = flavour.relative(fold(flavour.resolve(dir)), fold(flavour.resolve(file)));
+  if (rel === "") return true;
+  if (flavour.isAbsolute(rel)) return false;
+  const first = rel.split(/[\\/]/)[0];
+  return first !== "..";
+}
+
+/** Real path of `p`: links resolved with the OS's own routine (on Windows that also expands 8.3 short names such as RUNNER~1).
+ * A path that does not exist yet is resolved through its nearest existing parent, so both sides are always in the same form. */
+function realPath(p: string): string {
+  const abs = resolve(p);
+  const tail: string[] = [];
+  let cur = abs;
+  for (;;) {
+    try {
+      return join(realpathSync.native(cur), ...tail.reverse());
+    } catch {
+      const up = dirname(cur);
+      if (up === cur) return abs;
+      tail.push(cur.slice(up.length).replace(/^[\\/]+/, ""));
+      cur = up;
+    }
+  }
+}
+
 /** Is `file` inside `dir` (after resolving links)? */
 export function isInside(dir: string, file: string): boolean {
-  const real = (p: string): string => {
-    try {
-      return realpathSync(p);
-    } catch {
-      return resolve(p);
-    }
-  };
-  const rel = relative(real(dir), real(file));
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  return containedIn(path, realPath(dir), realPath(file), process.platform === "win32");
 }
 
 // ---- sealed files -------------------------------------------------------------------------------------------------------------
@@ -172,7 +195,7 @@ export async function runGitSync(io: GitSyncIO, o: GitSyncOptions): Promise<numb
   const now = o.now ?? (() => new Date());
   let repo: string;
   try {
-    repo = realpathSync(o.repo);
+    repo = realpathSync.native(o.repo);
   } catch {
     io.err(`Not found: ${o.repo}. Create or clone your PRIVATE git repository first, then pass its folder.`);
     return 1;
@@ -187,7 +210,7 @@ export async function runGitSync(io: GitSyncIO, o: GitSyncOptions): Promise<numb
     io.err(`${repo} is not a git repository. Run \`git init\` (or \`git clone <your private repo>\`) there first. Nothing was changed.`);
     return 1;
   }
-  const top = realpathSync(inside.out);
+  const top = realPath(inside.out);
   const vaultName = o.encrypt ? VAULT_ENC : VAULT_PLAIN;
   const otherName = o.encrypt ? VAULT_PLAIN : VAULT_ENC;
   const vault = join(repo, vaultName);
@@ -202,7 +225,7 @@ export async function runGitSync(io: GitSyncIO, o: GitSyncOptions): Promise<numb
         /* not there yet */
       }
       if (st && (st.isSymbolicLink() || !st.isDirectory())) throw new SyncStop(`${nm} in the repository is a link or not a folder; I will not follow it. Nothing was changed.`);
-      if (st && !isInside(top, realpathSync(p))) throw new SyncStop(`${nm} in the repository points outside the repository; stopped.`);
+      if (st && !isInside(top, p)) throw new SyncStop(`${nm} in the repository points outside the repository; stopped.`);
     }
     if (existsSync(join(repo, otherName)) && readdirSync(join(repo, otherName)).length > 0) {
       throw new SyncStop(`This repository already uses ${otherName}/ (${o.encrypt ? "plain" : "sealed"} files). Mixing the two would leak or lose notes; use the same mode as before${o.encrypt ? " (drop --encrypt)" : " (add --encrypt)"}.`);

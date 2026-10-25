@@ -105,7 +105,7 @@ describe("setup: finding the apps", () => {
   });
   test("macOS path", () => {
     const s = sandbox({ platform: "darwin" });
-    assert.match(detectClients(s.e).find((x) => x.id === "claude-desktop")!.file, /Library\/Application Support\/Claude\/claude_desktop_config\.json$/);
+    assert.match(detectClients(s.e).find((x) => x.id === "claude-desktop")!.file.replace(/\\/g, "/"), /Library\/Application Support\/Claude\/claude_desktop_config\.json$/);
   });
   test("CLAUDE_CONFIG_DIR moves the Claude Code config", () => {
     const s = sandbox({}, { CLAUDE_CONFIG_DIR: "/tmp/elsewhere" });

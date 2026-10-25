@@ -1,11 +1,11 @@
 // `onememory sync --git`: two "computers" (two databases) and a private "remote" (a local bare repository).
 import { test, describe, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { blobName, isInside, openFile, runGitSync, safeRelPath, sealFile, syncKeyPath, type GitSyncOptions } from "../src/sync-git.js";
+import path, { join } from "node:path";
+import { blobName, containedIn, isInside, openFile, runGitSync, safeRelPath, sealFile, syncKeyPath, type GitSyncOptions } from "../src/sync-git.js";
 import { Store } from "../src/store.js";
 import { createHash, randomBytes } from "node:crypto";
 
@@ -365,5 +365,36 @@ describe("sync --git: the sealed-file format", () => {
     assert.equal(isInside(join(base, "a"), join(base, "a")), true);
     assert.equal(isInside(join(base, "a"), join(base, "ab")), false);
     assert.equal(isInside(join(base, "a"), base), false);
+  });
+  test("isInside treats a child named ..x as inside and follows links out", () => {
+    const base = mkdtempSync(join(tmpdir(), "om-inside-"));
+    roots.push(base);
+    mkdirSync(join(base, "a", "..x"), { recursive: true });
+    mkdirSync(join(base, "out"));
+    assert.equal(isInside(join(base, "a"), join(base, "a", "..x", "f")), true);
+    assert.equal(isInside(join(base, "a"), join(base, "a", "..", "out")), false);
+    assert.equal(isInside(join(base, "a"), join(base, "a", "new", "deeper", "f.md")), true);
+    try {
+      symlinkSync(join(base, "out"), join(base, "a", "link"), "dir");
+    } catch {
+      return; // no link privilege (Windows without developer mode)
+    }
+    assert.equal(isInside(join(base, "a"), join(base, "a", "link")), false);
+    assert.equal(isInside(join(base, "a"), join(base, "a", "link", "x.md")), false);
+  });
+  test("containedIn: Windows flavour (mixed separators, case, drives, 8.3 already expanded)", () => {
+    const w = (d: string, f: string): boolean => containedIn(path.win32, d, f, true);
+    assert.equal(w("C:\\Users\\runneradmin\\repo", "C:/Users/runneradmin/repo/onememory"), true);
+    assert.equal(w("c:\\users\\RunnerAdmin\\Repo", "C:\\Users\\runneradmin\\repo\\a\\b"), true);
+    assert.equal(w("C:\\Users\\runneradmin\\repo", "C:\\Users\\runneradmin\\repo"), true);
+    assert.equal(w("C:\\repo", "C:\\repo\\..x\\f"), true);
+    assert.equal(w("C:\\repo", "C:\\repo\\..\\other"), false);
+    assert.equal(w("C:\\repo", "C:/repo/../other"), false);
+    assert.equal(w("C:\\repo", "D:\\repo\\a"), false);
+    assert.equal(w("C:\\repo", "C:\\repository"), false);
+    assert.equal(w("C:\\repo", "\\\\server\\share\\repo"), false);
+    assert.equal(containedIn(path.posix, "/a/b", "/a/b/c", false), true);
+    assert.equal(containedIn(path.posix, "/a/b", "/a/bc", false), false);
+    assert.equal(containedIn(path.posix, "/a/b", "/a/b/../c", false), false);
   });
 });

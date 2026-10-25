@@ -6,6 +6,17 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.7.2] - 2026-10-25
+
+Windows fixes only. **No schema change** (still v15).
+
+### Fixed
+- **`sync --git` stopped on Windows** with "points outside the repository": Git reports the repository's long name (`C:/Users/runneradmin/...`) while the
+  link check saw the 8.3 short name (`RUNNER~1`), so the two never matched. Both sides now go through the operating system's own real-path routine, a
+  folder that does not exist yet is resolved through its nearest existing parent, and the comparison is segment based and ignores case on Windows.
+  Links and `..` that leave the repository are still refused (tests added).
+- The macOS path test in `setup.test` now accepts Windows separators.
+
 ## [1.7.1] - 2026-10-25
 
 Fixes from an independent review of 1.7.0. **No schema change** (still v15).
