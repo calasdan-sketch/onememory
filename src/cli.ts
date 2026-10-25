@@ -60,8 +60,9 @@ function usage(): void {
       "            WARNING: store the key SEPARATELY from the backup; a backup without",
       "            its key is unreadable, and one stored with it is not encrypted.",
       "            --include-attest-key also copies the signing key (.attest-key) so a restore keeps",
-      "            this server's signing identity. --prune-premigration deletes the copies an",
-      "            upgrade left next to the database (<db>.pre-v*-backup).",
+      "            this server's signing identity. --prune-premigration deletes EVERY copy an",
+      "            upgrade left next to the database: <db>.pre-v*-backup and the dated copies",
+      "            (<db>.pre-v*-backup-YYYYMMDD-HHMMSS) kept from earlier upgrades.",
       "            When: before upgrades, and on a schedule.",
       "  runner-status [--namespace ns] [--json]",
       "            Is the PC's command runner listening, and how many approved commands are",
@@ -1182,7 +1183,7 @@ async function importJsonFile(file: string, dedupe: boolean, json: boolean, requ
   const { DB_PATH } = await import("./config.js");
   const { Store, ValidationError, attestationsToShow } = await import("./store.js");
   const { printable } = await import("./security.js");
-  const { streamBackupNotes, StreamJsonError } = await import("./stream-json.js");
+  const { streamBackupNotes, StreamJsonError, checkBackupNote } = await import("./stream-json.js");
   const { statSync } = await import("node:fs");
   try {
     statSync(file);
@@ -1190,6 +1191,30 @@ async function importJsonFile(file: string, dedupe: boolean, json: boolean, requ
     console.error(`Cannot read ${file}: ${(e as Error).message}`);
     process.exit(1);
   }
+  // PASS 1, before anything is written (or the database is even opened): stream the WHOLE file and check its structure and
+  // the shape of every note (valid JSON to the end, depth, element size, text fields, tag lists). A truncated, corrupt or
+  // hostile file therefore imports NOTHING, and says so. Memory stays flat: one note at a time.
+  let elements = 0;
+  let notObjects = 0;
+  const scalarStats = { scalars: 0 };
+  try {
+    for await (const note of streamBackupNotes(file, scalarStats)) {
+      const bad = checkBackupNote(note);
+      if (bad === "skip") {
+        notObjects++;
+        continue;
+      }
+      elements++;
+      if (bad) throw new StreamJsonError(`note #${elements}: ${bad}`);
+    }
+  } catch (e) {
+    if (e instanceof StreamJsonError) {
+      console.error(`Cannot import ${file}: ${e.message}. Nothing was imported: the whole file is checked before anything is written.`);
+      process.exit(1);
+    }
+    throw e;
+  }
+  notObjects += scalarStats.scalars;
   const store = new Store(DB_PATH);
   // The file is STREAMED: notes are read, parsed and written IMPORT_FILE_BATCH at a time, so memory stays flat
   // however big the backup is (both shapes: {"notes":[...]} with or without the `export` header, and a bare [...]).
@@ -1199,6 +1224,12 @@ async function importJsonFile(file: string, dedupe: boolean, json: boolean, requ
   let imported = 0;
   let skipped = 0;
   let batch: import("./store.js").ImportNote[] = [];
+  let batchWeight = 0;
+  let handled = 0; // elements that went through importNotes (imported, skipped or rejected)
+  // A batch is also bounded by size, not only by count: 500 notes of several MB each would otherwise sit in memory at once.
+  const IMPORT_FILE_BATCH_CHARS = 32_000_000;
+  const weigh = (n: import("./store.js").ImportNote): number =>
+    (typeof n.title === "string" ? n.title.length : 0) + (typeof n.body === "string" ? n.body.length : 0) + (Array.isArray(n.tags) ? n.tags.reduce((a, t) => a + String(t).length + 4, 0) : 0) + 400;
   let batches = 0;
   let deferred = false;
   const flush = async (last: boolean): Promise<void> => {
@@ -1210,7 +1241,9 @@ async function importJsonFile(file: string, dedupe: boolean, json: boolean, requ
     const report: import("./store.js").ImportReport = { quarantined: [], rejected: [] };
     const created = await store.importNotes(batch, { report, dedupe, deferEdges: defer, ...(requireAttestation ? { requireAttestation: true } : {}) });
     batches++;
+    handled += batch.length;
     batch = [];
+    batchWeight = 0;
     imported += created.length;
     skipped += report.skipped ?? 0;
     total.quarantined.push(...report.quarantined);
@@ -1231,24 +1264,35 @@ async function importJsonFile(file: string, dedupe: boolean, json: boolean, requ
   try {
     try {
       for await (const note of streamBackupNotes(file)) {
+        if (checkBackupNote(note) === "skip") continue;
         batch.push(note as import("./store.js").ImportNote);
-        if (batch.length >= IMPORT_FILE_BATCH) await flush(false);
+        batchWeight += weigh(note as import("./store.js").ImportNote);
+        if (batch.length >= IMPORT_FILE_BATCH || batchWeight >= IMPORT_FILE_BATCH_CHARS) await flush(false);
       }
       await flush(true);
     } catch (e) {
-      if (e instanceof StreamJsonError) {
-        console.error(`Cannot import ${file}: ${e.message}`);
-        process.exit(1);
-      }
-      throw e;
+      // The file passed the whole-file check, so this is a fault while writing (the disk, a lock) or a file that changed
+      // since. Batches written earlier stay written: say exactly how far it got and how to continue safely.
+      const msg = e instanceof Error ? e.message : String(e);
+      const left = Math.max(0, elements - handled);
+      console.error(
+        `Import stopped: ${msg}\n` +
+          `${imported} note(s) were imported before the error, ${left} were not. ` +
+          (imported + (skipped || 0) > 0 || handled > 0
+            ? "Nothing is rolled back. Fix the cause and run the SAME command again with --dedupe: it skips the notes already imported (it recognises them by title, body and created_at, which every export carries) instead of duplicating them."
+            : "Nothing was written.") +
+          (deferred ? " Run `onememory rebuild-edges` afterwards." : "")
+      );
+      process.exit(1);
     }
     total.attestations = { verified: att.verified, unverified: att.unverified, reasons: att.reasons, untrusted_keys: [...att.untrusted_keys.values()] };
     if (skipped) total.skipped = skipped;
     if (json) {
-      console.log(JSON.stringify({ imported, ...total, attestations: attestationsToShow(total.attestations) }, null, 2));
+      console.log(JSON.stringify({ imported, ...total, ...(notObjects ? { ignored_entries: notObjects } : {}), attestations: attestationsToShow(total.attestations) }, null, 2));
       return;
     }
     console.log(`Imported ${imported} note(s)${total.skipped ? `, skipped ${total.skipped} already present` : ""}.`);
+    if (notObjects) console.log(`${notObjects} entr${notObjects === 1 ? "y" : "ies"} in the file ${notObjects === 1 ? "was" : "were"} not a note (not an object) and ${notObjects === 1 ? "was" : "were"} ignored.`);
     const a = attestationsToShow(total.attestations);
     if (a) {
       console.log(`Attestations: ${a.verified} verified, ${a.unverified} unverified (stamped as imported by this command, flagged imported_unverified).`);
@@ -1289,8 +1333,8 @@ function trustHelp(): void {
       "        <writer> is a token label, or a writer id <server_id>/<label>. Quote the star: --namespace '*'.",
       "  trust attester-add <public-key> --server-id <id> [--label text] [--not-after <ISO time>] [--any-server]",
       "        Believe signed exports from that server. A key is trusted for ONE server (--server-id);",
-      "        --any-server accepts a key for any server id (discouraged). --not-after ends trust for",
-      "        exports signed after that time (planned rotation). A key starting with '-': --public-key <key>.",
+      "        --any-server accepts a key for any server id (discouraged). --not-after ends trust in the key",
+      "        at that time: afterwards it is believed for nothing, old exports too (re-import first, or keep the key without it). A key starting with '-': --public-key <key>.",
       "  trust attester-remove <key-id>",
       "  trust attester-revoke <key-id> [--reason text]   stop believing anything signed by that key, whatever date it claims",
       "        (not_after only EXPIRES trust; a leaked key needs revoking). trust attester-unrevoke <key-id> undoes it.",
@@ -1445,7 +1489,7 @@ async function trustCmd(): Promise<void> {
         show(
           r,
           `Trusting key ${r.key_id}${r.server_id ? ` for server ${r.server_id}` : " for ANY server id (the key's holder can claim to be any peer)"}` +
-            `${r.not_after ? `, for exports signed up to ${r.not_after}` : ""}.` +
+            `${r.not_after ? `, until ${r.not_after} (afterwards for nothing, old exports included)` : ""}.` +
             (r.replaced ? ` (This replaced an earlier entry: pin ${r.replaced.server_id || "any"}, not_after ${r.replaced.not_after || "none"}.)` : "")
         );
         return;

@@ -846,6 +846,13 @@ export function claimTask(
       return { task: taskFromNote(note, store, now), heartbeat, released };
     } catch (e) {
       if (e instanceof ValidationError && e.message.startsWith("stale write:")) continue; // lost a race: re-read and re-decide
+      // A claim is a tags-only update; when the actor is on the distrust list the store's refusal talks about "tags, source or
+      // namespace". Say what the caller actually tried.
+      if (e instanceof ValidationError && /is on the distrust list for namespace/.test(e.message)) {
+        throw new ValidationError(
+          e.message.replace(/: it may not change the tags, source or namespace of note \d+, which it did not write$/, `: it may not ${input.release ? "release" : "claim"} task #${existing.id}, which it did not write`)
+        );
+      }
       throw e;
     }
   }

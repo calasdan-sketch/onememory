@@ -13,16 +13,24 @@ distrust list and writer labels are the stable part. See [trust.md](./trust.md).
    (new columns, three small tables, an index over note writers). No note text is touched. An older
    version cannot open a v14 database.
 2. **A backup is made first.** Before migrating, OneMemory writes a verified copy to
-   `<database>.pre-v14-backup` (it is built as `.partial`, checked for the same number of notes, the old
-   schema version and an integrity check, then renamed). If a valid copy from an earlier attempt exists it
-   is kept under a dated name and a fresh one is made. The upgrade refuses to start when the disk has no
-   room for the copy: **free about the size of the database plus its WAL**.
+   `<database>.pre-v14-backup` (it is built as `.partial`, then checked: it must hold the same number of notes
+   as the database, have the old schema version and pass an integrity check; only then is it renamed). If a
+   valid copy from an earlier attempt exists it is kept under a dated name and a fresh one is made; a copy
+   that cannot be read (permissions) is never deleted, only moved aside. **The upgrade does not run when the
+   copy cannot be made** (for example the disk has no room: free about the size of the database plus its
+   WAL). It stops with an error and the database is untouched. To upgrade anyway, take your own
+   `onememory backup` and set `ONEMEMORY_SKIP_PREMIGRATION_BACKUP=1` for that start; there is then no way
+   back to the older version.
 3. **Expect a delay on the first start** of a large database: building the index takes a few seconds per
    hundred thousand notes. In Docker or a service manager, give the health check a start period
-   (the image uses `--start-period=60s`; use a longer one for a very large database) so the container is not killed
-   mid-migration.
+   (the image uses `--start-period=60s`; use a longer one for a very large database) so the container is not reported
+   unhealthy (and restarted by an orchestrator) mid-migration.
 4. **The data directory must be writable** (the migration, the backup copy and the signing key all write
-   there). On a read-only mount OneMemory now stops with a readable message naming the directory.
+   there). On a read-only mount OneMemory stops with a readable message naming the directory (for new and existing databases alike).
+5. **Stored writer labels are cleaned once.** Labels are compared after Unicode normalisation (NFKC) and with
+   invisible format characters (zero-width joiner, bidi marks) removed. The first start of 1.4.2 re-writes
+   the stored labels of older notes (and any distrust rule) that this changes, so a rule keeps matching them.
+   It is automatic, runs once and touches only rows that change.
 
 Run `onememory doctor` afterwards: it lists the pre-migration copies with size and age, and warns about
 leftover `.partial` files.

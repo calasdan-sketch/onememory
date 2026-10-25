@@ -186,7 +186,7 @@ to the store's own key). If any file is `rejected`, the command prints a loud co
 on stderr and exits with status 1.
 
 **Distrusted writers (1.4.1).** An export leaves out notes touched by a writer on the distrust list
-([trust.md](./trust.md)) and removes their earlier files with `--prune`, so a vault synced to another
+([trust.md](./trust.md)) and removes their earlier files (pruning is the default; `--no-prune` keeps them), so a vault synced to another
 machine or an editor plugin does not carry the content an agent is told not to trust. `--include-distrusted`
 writes them anyway, with `distrusted: true` in the front matter. A file's `origin_writer` is a claim, not a
 proof; on import it is recorded as `imported_written_by` and added to the note's taint set, so a distrust

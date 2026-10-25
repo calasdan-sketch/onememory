@@ -187,11 +187,11 @@ safe, and it loses the information. An attestation brings it back **for servers 
   this database's own server id. A server's own key is trusted for its own server id only. An entry (or env
   entry) naming **this** server's id is accepted when it is a *retired own key*; the current key cannot be
   added, it is already trusted. `ONEMEMORY_TRUSTED_ATTESTERS` and `attester-add` follow the same rules.
-- **Expiry is not revocation.** `--not-after <ISO time>` trusts a key only for exports it signed up to that
-  time. It is judged against the **time of verification** as well as the signed `exported_at`: once the
-  date has passed, an import done today rejects everything that key signed, whatever date the file claims
+- **Expiry is not revocation.** `--not-after <ISO time>` ends trust in a key **at that time**. It is judged
+  against the **time of verification**, not the date an export claims: once the date has passed, the key is
+  not believed for anything, old exports included, so an import done today rejects everything that key signed, whatever date the file claims
   (a v1 attestation has no signed export time, so it is rejected too). But before that date a key whose
-  holder has misbehaved is still believed. To stop trusting a key **now**, use `trust attester-revoke
+  holder has misbehaved is still believed. For a planned rotation do not set `--not-after` on the old key (`trust rotate` keeps it trusted without one). To stop trusting a key **now**, use `trust attester-revoke
   <key-id>` (a list kept in the database that wins over every other source, including
   `ONEMEMORY_TRUSTED_ATTESTERS`; `attester-unrevoke` lifts it). Notes already imported keep their
   recorded provenance either way.
@@ -286,12 +286,13 @@ The step-by-step version is [upgrading.md](./upgrading.md). In short:
 
 Schema v14 adds columns and three small tables; no note text is touched. The first time a database at
 v1 to v13 is opened by 1.4.x, OneMemory writes a consistent snapshot to
-`<database>.pre-v14-backup.<pid>.partial`, **checks it** (non-empty, the old schema version, the same
-number of notes, an integrity check) and only then renames it to `<database>.pre-v14-backup`. A crash
-leaves a `.partial` file (swept at the next upgrade), never a half-written backup under the real name.
-A valid copy already there is kept (it is the original pre-upgrade state); an empty, truncated or
-unreadable one is replaced. The upgrade refuses to start when the disk lacks room for the copy. The
-upgrade runs in one transaction. `onememory doctor` lists the copies with size and age. To roll back:
+`<database>.pre-v14-backup.<pid><random>.partial`, **checks it** (non-empty, the old schema version, the same
+number of notes as the database, an integrity check) and only then renames it to `<database>.pre-v14-backup`.
+A crash leaves a `.partial` file (swept at the next upgrade), never a half-written backup under the real name.
+A valid copy already there is kept when it holds the same notes, otherwise it is moved to a dated name; an
+empty or garbage one is replaced, and one that merely cannot be read is moved aside, never deleted. The upgrade
+**refuses to run** when the copy cannot be made (for example no room on the disk): it stops with an error and
+the database is untouched; `ONEMEMORY_SKIP_PREMIGRATION_BACKUP=1` upgrades without a copy. The upgrade runs in one transaction. `onememory doctor` lists the copies with size and age. To roll back:
 stop every onememory process, **move** the backup file over the database (remove its `-wal` / `-shm`
 files; a copy would leave the original), install the older version. Writes made after the upgrade are
 not in the backup. When you are happy: `onememory backup --prune-premigration`. If you later turn on

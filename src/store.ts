@@ -1094,16 +1094,17 @@ export class Store {
     } catch (e) {
       throw new Error(Store.explainOpenError(e, dbPath));
     }
-    // busy_timeout FIRST: switching to WAL and migrating both need a lock
-    // another process may be holding at the same moment.
-    this.db.exec(`PRAGMA busy_timeout = ${Store.BUSY_TIMEOUT_MS};`);
-    this.db.exec("PRAGMA journal_mode = WAL;");
-    this.db.exec("PRAGMA foreign_keys = ON;");
-    // Load the at-rest key before migrations so a v10 upgrade on an encrypted
-    // store can read existing rows. loadKey throws on a corrupt key file
-    // rather than silently degrading -- see crypto.ts.
     this.keyDir = dirname(dbPath);
     try {
+      // busy_timeout FIRST: switching to WAL and migrating both need a lock
+      // another process may be holding at the same moment. The pragmas are INSIDE the try: on a read-only mount the first
+      // failure of an existing database is exactly here (the WAL switch), and it must get the readable message too.
+      this.db.exec(`PRAGMA busy_timeout = ${Store.BUSY_TIMEOUT_MS};`);
+      this.db.exec("PRAGMA journal_mode = WAL;");
+      this.db.exec("PRAGMA foreign_keys = ON;");
+      // Load the at-rest key before migrations so a v10 upgrade on an encrypted
+      // store can read existing rows. loadKey throws on a corrupt key file
+      // rather than silently degrading -- see crypto.ts.
       this.lastKey = loadKey(this.keyDir);
       if (!this.lastKey) this.recoverStrandedKey();
       this.keyStamp = this.stampOf();
@@ -1173,6 +1174,7 @@ export class Store {
     }
     if (found >= SCHEMA_VERSION) {
       this.ensureV14Extras();
+      this.cleanStoredLabels();
       Store.sweepStalePartials(this.dbPath); // an unfinished upgrade copy (a killed process) does not sit there forever
       return;
     }
@@ -1184,6 +1186,7 @@ export class Store {
         this.migrate(v);
         this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
         this.ensureV14Extras();
+        this.cleanStoredLabels();
       }
       this.db.exec("COMMIT");
     } catch (e) {
@@ -1220,6 +1223,79 @@ export class Store {
   }
 
   /**
+   * 1.4.2: writer labels are compared in their cleaned form (NFKC, invisible format characters removed, see cleanWriter).
+   * Rows written by 1.4.1 and earlier still hold the raw spelling, so a rule typed in the cleaned form would no longer
+   * match them (a fail-open of the distrust list for labels such as an emoji with a zero-width joiner, or "Dan(tm) bot").
+   * This one-time, idempotent pass re-writes every stored label whose cleaned form differs, merges rules that become
+   * identical, and records `labels_clean_v1` in _meta. Only rows that actually change are touched; a read-only database
+   * skips it and a writer does it at its next open.
+   */
+  private cleanStoredLabels(): void {
+    if (this.getMeta("labels_clean_v1") === "1") return;
+    const own = !this.db.isTransaction;
+    try {
+      if (own) this.db.exec("BEGIN IMMEDIATE");
+      try {
+        const plain: Array<[string, string]> = [
+          ["notes", "written_by"],
+          ["notes", "created_by"],
+          ["notes", "attested_writer"],
+          ["notes", "attested_by"],
+          ["notes", "imported_written_by"],
+          ["notes", "imported_created_by"],
+          ["change_log", "written_by"],
+          ["change_log", "note_written_by"],
+          ["change_log", "note_attested_writer"],
+          ["change_log", "note_attested_by"],
+          ["quarantine", "written_by"],
+        ];
+        for (const [table, col] of plain) {
+          if (!this.hasColumn(table, col)) continue;
+          const vals = this.db.prepare(`SELECT DISTINCT ${col} AS v FROM ${table} WHERE ${col} <> ''`).all() as Array<{ v: string }>;
+          const upd = this.db.prepare(`UPDATE ${table} SET ${col} = ? WHERE ${col} = ?`);
+          for (const { v } of vals) {
+            if (typeof v !== "string") continue;
+            const c = cleanWriter(v);
+            if (c !== v) upd.run(c, v);
+          }
+        }
+        for (const [table, col] of [["notes", "merged_from_writers"], ["change_log", "note_merged_from"]] as Array<[string, string]>) {
+          if (!this.hasColumn(table, col)) continue;
+          const vals = this.db.prepare(`SELECT DISTINCT ${col} AS v FROM ${table} WHERE ${col} <> ''`).all() as Array<{ v: string }>;
+          const upd = this.db.prepare(`UPDATE ${table} SET ${col} = ? WHERE ${col} = ?`);
+          for (const { v } of vals) {
+            const list = parseMerged(v);
+            if (list.every((x) => cleanWriter(x) === x)) continue;
+            upd.run(mergedToStorage(list), v);
+          }
+        }
+        const rules = this.db.prepare("SELECT namespace, writer FROM trust_distrust").all() as Array<{ namespace: string; writer: string }>;
+        for (const r of rules) {
+          const canon = canonicalRuleWriter(r.writer);
+          if (!canon.ok || canon.writer === r.writer) continue;
+          this.db
+            .prepare("INSERT OR IGNORE INTO trust_distrust (namespace, writer, added_at, added_by) SELECT namespace, ?, added_at, added_by FROM trust_distrust WHERE namespace = ? AND writer = ?")
+            .run(canon.writer, r.namespace, r.writer);
+          this.db.prepare("DELETE FROM trust_distrust WHERE namespace = ? AND writer = ?").run(r.namespace, r.writer);
+        }
+        this.setMeta("labels_clean_v1", "1");
+        if (own) this.db.exec("COMMIT");
+      } catch (e) {
+        if (own) {
+          try {
+            this.db.exec("ROLLBACK");
+          } catch {
+            /* nothing to roll back */
+          }
+        }
+        throw e;
+      }
+    } catch {
+      /* read-only database or a lock held elsewhere: tried again at the next open */
+    }
+  }
+
+  /**
    * Before the first upgrade of a non-empty file (v1..v13 -> v14), keep one
    * copy of the pre-upgrade database next to it: `<db>.pre-v14-backup`. It is a
    * consistent snapshot (VACUUM INTO) still at the OLD schema version, so an
@@ -1227,7 +1303,9 @@ export class Store {
    * back as the database, install the older version). Never overwrites an
    * existing copy, so a second attempt cannot replace the real original.
    * 1.3.x named its copy `.pre-v13-backup`; that file is left alone.
-   * Best effort: a failure is reported and the upgrade continues.
+   * The copy is REQUIRED: when it cannot be made (no room on the disk, a failed or unverifiable copy) the upgrade does
+   * not run and the error says how to proceed; ONEMEMORY_SKIP_PREMIGRATION_BACKUP=1 migrates without one (take your
+   * own `onememory backup` first).
    */
   private preMigrationBackup(from: number): void {
     if (this.dbPath === ":memory:") return;
@@ -1244,8 +1322,20 @@ export class Store {
         }
       }
     };
+    const skip = ["1", "true", "yes"].includes((process.env.ONEMEMORY_SKIP_PREMIGRATION_BACKUP ?? "").trim().toLowerCase());
+    const refuse = (why: string): never => {
+      throw Object.assign(new Error(
+        `onememory: the database was not upgraded, because the safety copy made before the upgrade could not be completed (${why}). ` +
+          `Free some disk space or fix the problem and start again, make your own copy first (onememory backup --out <dir>), ` +
+          "or set ONEMEMORY_SKIP_PREMIGRATION_BACKUP=1 to upgrade without a copy (there is then no way back to the older version)."
+      ), { preMigration: true });
+    };
     try {
       if (!this.db.prepare("SELECT 1 FROM notes LIMIT 1").get()) return;
+      if (skip) {
+        console.error("[onememory] ONEMEMORY_SKIP_PREMIGRATION_BACKUP is set: upgrading WITHOUT a pre-upgrade copy.");
+        return;
+      }
       const have = Number((this.db.prepare("SELECT COUNT(*) AS c FROM notes").get() as { c: number }).c);
       if (existsSync(dest)) {
         // A copy from an earlier attempt: keep it only if it is a complete, readable
@@ -1266,9 +1356,18 @@ export class Store {
           for (let i = 2; existsSync(kept); i++) kept = `${dest}-${stamp}-${i}`;
           renameSync(dest, kept);
           console.error(`[onememory] the existing pre-upgrade copy held ${check.notes} notes but the database now holds ${have}; it was kept as ${kept} and a fresh copy is made.`);
-        } else {
+        } else if (check.kind === "empty" || check.kind === "garbage") {
+          // Positively known to be worthless (zero bytes, not a database, no schema): the only case where a copy is deleted.
           console.error(`[onememory] the existing pre-upgrade copy ${dest} is not usable (${check.reason}); replacing it.`);
           unlinkSync(dest);
+        } else {
+          // It could not be judged (no permission to open it, busy, a failed integrity check): it may well be the real
+          // original, so it is moved aside under a dated name, never deleted.
+          const stamp = new Date(statSync(dest).mtimeMs).toISOString().replace(/[-:]/g, "").replace(/\..*$/, "").replace("T", "-");
+          let kept = `${dest}-${stamp}`;
+          for (let i = 2; existsSync(kept); i++) kept = `${dest}-${stamp}-${i}`;
+          renameSync(dest, kept);
+          console.error(`[onememory] the existing pre-upgrade copy could not be checked (${check.reason}); it was kept as ${kept} and a fresh copy is made.`);
         }
       }
       dropPartial();
@@ -1276,21 +1375,18 @@ export class Store {
       // Room for the copy (about the size of the database) plus a margin.
       try {
         const dbSize = statSync(this.dbPath).size;
-        const st = statfsSync(dirname(this.dbPath));
-        const free = Number(st.bavail) * Number(st.bsize);
+        const free = Store.freeBytes(dirname(this.dbPath));
         if (free < dbSize * 1.1 + 1_000_000) {
-          console.error(
-            `[onememory] not enough free disk space to copy the database before upgrading (need about ${Math.ceil(dbSize / 1e6)} MB, ${Math.floor(free / 1e6)} MB free); ` +
-              "continuing WITHOUT a pre-upgrade copy. Make your own backup first if you need one (onememory backup)."
-          );
-          return;
+          refuse(`not enough free disk space: it needs about ${Math.ceil(dbSize / 1e6)} MB, ${Math.floor(free / 1e6)} MB is free`);
         }
-      } catch {
+      } catch (e) {
+        if ((e as { preMigration?: boolean }).preMigration) throw e;
         /* statfs unavailable: try the copy anyway */
       }
-      // VACUUM INTO is one consistent snapshot even while an older onememory is still writing to this file, so the copy never
-      // needs to match the live note count: it is checked for integrity, and if the source moved during the copy that is said
-      // out loud. Written under a temporary name and renamed only when complete and verified (retried once; a rename that an
+      // VACUUM INTO is one consistent snapshot even while an older onememory is still writing to this file. The copy is checked
+      // for integrity AND for its note count: it must hold the number of notes the database held when the copy started or
+      // when it finished (a writer that is active in between is allowed for; a copy outside that range is a bad copy and is
+      // retried, then refused). Written under a temporary name and renamed only when complete and verified (retried once; a rename that an
       // antivirus scanner briefly blocks, as on Windows, is retried too).
       let copyNotes = 0;
       let lastReason = "";
@@ -1298,13 +1394,17 @@ export class Store {
       for (let attempt = 1; attempt <= 2 && !ok; attempt++) {
         dropPartial();
         try {
+          const countNotes = (): number => Number((this.db.prepare("SELECT COUNT(*) AS c FROM notes").get() as { c: number }).c);
+          const before = countNotes();
           this.db.exec(`VACUUM INTO '${part.replace(/'/g, "''")}'`);
           chmodQuiet(part, 0o600);
           const done = Store.verifyBackupFile(part);
-          if (done.ok) {
+          const after = countNotes();
+          if (done.ok && done.notes >= Math.min(before, after) && done.notes <= Math.max(before, after)) {
             ok = true;
             copyNotes = done.notes;
-          } else lastReason = done.reason;
+          } else if (done.ok) lastReason = `the copy holds ${done.notes} notes but the database held ${before === after ? before : `${before} to ${after}`}`;
+          else lastReason = done.reason;
         } catch (e) {
           lastReason = (e as Error).message;
         }
@@ -1343,9 +1443,16 @@ export class Store {
       }
     } catch (e) {
       dropPartial();
-      console.error(`[onememory] could not copy the database before upgrading (${(e as Error).message}); continuing.`);
+      if ((e as { preMigration?: boolean }).preMigration) throw e;
+      refuse((e as Error).message);
     }
   }
+
+  /** Free bytes on the volume holding `dir`. A static so a test can simulate a full disk. */
+  static freeBytes: (dir: string) => number = (dir) => {
+    const st = statfsSync(dir);
+    return Number(st.bavail) * Number(st.bsize);
+  };
 
   /** Leftovers of a pre-upgrade copy that was killed: `*.partial` files (and their journal/wal/shm sidecars) older than 10 minutes. */
   static sweepStalePartials(dbPath: string): void {
@@ -1367,20 +1474,28 @@ export class Store {
    * schema version, that `notes` is readable, optionally that it holds exactly
    * `expectNotes` rows, and runs SQLite's quick integrity check.
    */
-  static verifyBackupFile(path: string, expectNotes?: number): { ok: true; notes: number; version: number } | { ok: false; reason: string } {
+  static verifyBackupFile(
+    path: string,
+    expectNotes?: number
+  ): { ok: true; notes: number; version: number } | { ok: false; reason: string; kind: "empty" | "garbage" | "unreadable" } {
+    // `kind` says whether a bad file is POSITIVELY worthless ("empty", "garbage": not a database / no schema) or merely could
+    // not be judged ("unreadable": permissions, a busy file, a failed integrity check). Only the first two may be deleted.
     let db: DatabaseSync | null = null;
     try {
-      if (statSync(path).size === 0) return { ok: false, reason: "the file is empty" };
+      if (statSync(path).size === 0) return { ok: false, reason: "the file is empty", kind: "empty" };
       db = new DatabaseSync(path, { readOnly: true });
       const version = Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
-      if (version < 1) return { ok: false, reason: "no schema version (an incomplete copy)" };
+      if (version < 1) return { ok: false, reason: "no schema version (an incomplete copy)", kind: "garbage" };
       const notes = Number((db.prepare("SELECT COUNT(*) AS c FROM notes").get() as { c: number }).c);
-      if (expectNotes !== undefined && notes !== expectNotes) return { ok: false, reason: `it holds ${notes} notes, expected ${expectNotes}` };
+      if (expectNotes !== undefined && notes !== expectNotes) return { ok: false, reason: `it holds ${notes} notes, expected ${expectNotes}`, kind: "unreadable" };
       const qc = db.prepare("PRAGMA quick_check(1)").get() as { quick_check?: string } | undefined;
-      if (qc && qc.quick_check !== undefined && qc.quick_check !== "ok") return { ok: false, reason: `integrity check: ${String(qc.quick_check).slice(0, 80)}` };
+      if (qc && qc.quick_check !== undefined && qc.quick_check !== "ok") return { ok: false, reason: `integrity check: ${String(qc.quick_check).slice(0, 80)}`, kind: "unreadable" };
       return { ok: true, notes, version };
     } catch (e) {
-      return { ok: false, reason: (e as Error).message.slice(0, 120) };
+      const m = (e as Error).message;
+      const code = (e as { code?: string }).code ?? "";
+      const garbage = /file is not a database|no such table: notes|malformed database schema|disk image is malformed/i.test(m) && !["EACCES", "EPERM", "EBUSY"].includes(code);
+      return { ok: false, reason: m.slice(0, 120), kind: garbage ? "garbage" : "unreadable" };
     } finally {
       try {
         db?.close();
@@ -3376,7 +3491,12 @@ export class Store {
       const batch = notes.slice(start, start + IMPORT_INSERT_BATCH);
       const insertBatch = (): void => {
         for (const note of batch) {
-          if (!note || !note.title || !note.title.trim()) continue;
+          if (!note || typeof note !== "object") continue;
+          if (note.title !== undefined && note.title !== null && typeof note.title !== "string") {
+            opts.report?.rejected.push({ title: String(typeof note.title).slice(0, 40), error: "title must be text" });
+            continue;
+          }
+          if (!note.title || !note.title.trim()) continue;
           // A tolerant export marks bodies it could not decrypt; restoring one
           // would silently replace a recoverable note with an empty one.
           if ((note as { unreadable?: unknown }).unreadable === true) {
@@ -5026,9 +5146,22 @@ export class Store {
     if (this.signingKey && stamp !== "" && stamp === this.signingStamp) return this.signingKey;
     const existed = stamp !== "";
     const before = this.signingKey?.keyId;
-    const key = loadOrCreateSigningKey(this.keyDir);
+    // The stamp is taken BEFORE the key is read and that stamp is what gets cached: a rotation landing between the read and
+    // a later stat can then never leave the old key cached under the new file's stamp (the next call sees the mismatch and
+    // reloads). If the file changed during the read, read again (a couple of times at most).
+    let key: SigningKey = loadOrCreateSigningKey(this.keyDir);
+    let seen = stamp;
+    for (let i = 0; i < 3; i++) {
+      const now = keyFileStamp(this.keyDir);
+      if (seen === "" || now === seen) {
+        seen = seen === "" ? now : seen;
+        break;
+      }
+      seen = now;
+      key = loadOrCreateSigningKey(this.keyDir);
+    }
     this.signingKey = key;
-    this.signingStamp = keyFileStamp(this.keyDir);
+    this.signingStamp = seen;
     if (before && before !== key.keyId) {
       console.error(`[onememory] the signing key file changed on disk (${before} -> ${key.keyId}); this process now signs with the new key.`);
     }
@@ -5099,27 +5232,49 @@ export class Store {
     const old = peekSigningKey(this.keyDir);
     if (existsSync(p) && !old) throw new ValidationError(`the attestation key ${p} is unreadable; restore it or move it aside before rotating`);
     const oldFile = old && opts.keepOldPrivate ? `${p}.${old.keyId}.old` : null;
-    let k!: SigningKey;
-    this.transaction(() => {
-      if (old) {
-        // Recorded first: if the file swap below fails the old key stays in use AND stays recognised.
-        this.db
+    // Order matters, so no failure can lose the retired PUBLIC key (an attestation carries only the key id, so once the old
+    // private key is gone this row is the only way earlier exports can ever be verified again):
+    //  1. the retired key is recorded and COMMITTED on its own;
+    //  2. only then is the key file swapped (if the swap fails, the old key stays in use and the row is taken back out);
+    //  3. the audit line and the key-id marker are written last, in their own transaction; if that fails the rotation still
+    //     stands (the key HAS changed) and a warning is printed, instead of an error that would hide it.
+    let recordedNow = false;
+    if (old) {
+      this.transaction(() => {
+        const r = this.db
           .prepare(
             `INSERT INTO trust_attesters (key_id, public_key, server_id, label, added_at, added_by, not_after) VALUES (?, ?, ?, ?, ?, ?, '')
              ON CONFLICT(key_id) DO NOTHING`
           )
           .run(old.keyId, old.publicKey, this.serverId(), "retired key of this server", new Date().toISOString(), this.trustActor());
-      }
+        recordedNow = Number(r.changes) > 0;
+      });
+    }
+    let k!: SigningKey;
+    try {
       k = replaceSigningKey(this.keyDir, oldFile ?? undefined);
-      this.logTrust("key-rotate", "*", `${old?.keyId ?? "-"} -> ${k.keyId}`);
-      try {
-        this.setMeta("attest_key_id", k.keyId);
-      } catch {
-        /* recorded by the next writer */
+    } catch (e) {
+      if (old && recordedNow) {
+        try {
+          this.db.prepare("DELETE FROM trust_attesters WHERE key_id = ? AND label = 'retired key of this server'").run(old.keyId);
+        } catch {
+          /* harmless: the current key listed as trusted */
+        }
       }
-    });
-    this.signingKey = k;
-    this.signingStamp = keyFileStamp(this.keyDir);
+      throw e;
+    }
+    this.signingKey = null; // the next use re-reads the file and its stamp
+    this.signingStamp = "";
+    try {
+      this.transaction(() => {
+        this.logTrust("key-rotate", "*", `${old?.keyId ?? "-"} -> ${k.keyId}`);
+        this.setMeta("attest_key_id", k.keyId);
+      });
+    } catch (e) {
+      console.error(
+        `[onememory] the signing key WAS rotated (${old?.keyId ?? "-"} -> ${k.keyId}) and the old public key is recorded, but the audit line could not be written (${(e as Error).message}).`
+      );
+    }
     return { old_key_id: old?.keyId ?? null, new_key_id: k.keyId, public_key: k.publicKey, old_key_file: oldFile, old_public_key: old?.publicKey ?? null };
   }
 

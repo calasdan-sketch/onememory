@@ -42,6 +42,20 @@ change in a minor release.
   task as its parent or blocker (same error as a missing one); writer labels are NFKC-normalised with
   zero-width characters removed (case is still exact); a library `notWrittenBy: ""` no longer hides every note.
 - `distrust` reports `matched_notes`, so a typo in a label (0 matches) is visible.
+- **`POST /relevant`: one namespace for the gate and the search.** `?namespace=work` with `include_distrusted`
+  in the body and no body namespace used to pass the pinned-admin check on the query namespace while the search
+  fanned out over every readable namespace. The body namespace (else the query one) is now used for both.
+- **Stored writer labels are cleaned once on open** (an idempotent migration, flag `labels_clean_v1` in `_meta`):
+  rows written by 1.4.1 and earlier whose label NFKC or zero-width stripping changes (an emoji with a joiner, a
+  trademark sign) are re-written, and distrust rules are re-stored in canonical form, so a rule keeps matching
+  old notes. The cleaning itself is now idempotent (`e` + zero-width + accent used to give a different result on
+  the second pass, leaving a rule that could never match).
+- **`trust rotate` cannot lose the retired public key.** The retired key is committed first, then the key file is
+  swapped, then the audit line is written; a failure at any step leaves the old key recognised. A rotation
+  landing while a server loads its signing key can no longer leave the old key cached.
+- A distrusted writer claiming a task now gets a refusal that says "claim"; `--not-after` is documented
+  and described in the CLI help as what it is: from that time the key is believed for nothing, old exports
+  included.
 
 ### Performance
 - The distrust predicate uses **one `json_each` membership test per row** instead of one `instr` probe per
@@ -54,7 +68,19 @@ change in a minor release.
 ### Changed
 - Backups: the copy is built as `state.db.partial`, verified and renamed; stale `-journal` sidecars, partial
   copies and an existing pre-upgrade copy of a different state are handled (the old one is kept under a dated
-  name); a source that changes during the copy is reported. A read-only data directory gets a readable error.
+  name); a copy is checked for integrity and for its note count. A read-only data directory gets a readable error
+  for an existing database too (the WAL switch is inside the guarded block).
+- **The upgrade now refuses to run when the pre-upgrade copy cannot be made** (no room on the disk, a failed
+  copy), with an error that says what to do; `ONEMEMORY_SKIP_PREMIGRATION_BACKUP=1` upgrades without a copy.
+  This is what docs/upgrading.md and docs/trust.md always said; the code used to continue with a warning.
+  An existing copy that cannot be opened (permissions) is moved aside under a dated name, never deleted; only a
+  file that is empty or not a database is replaced. `backup --prune-premigration` says it removes the dated
+  copies too.
+- **`import --file` is all-or-nothing on a bad file.** The whole file is checked first (valid JSON to the end,
+  nesting depth, element size, text fields, tag lists and their limit) before the database is opened: a
+  truncated or hostile file imports nothing and says so. If a later write fails, the message reports how many
+  notes were imported and how many were not, and to re-run with `--dedupe`. Batches are also bounded by size
+  (32 MB of text), and entries that are not objects are reported instead of silently ignored.
 - `.github/workflows/publish.yml` waits for the full build and test matrix (ubuntu, windows, macos).
 - The test script preloads `test/setup-env.ts`, so a developer's `ONEMEMORY_*` environment cannot change a
   result. The gate-guard test has positive controls, matches any receiver, uses a keyed allow-list and an admin
@@ -68,10 +94,10 @@ change in a minor release.
   fallback text matches the code (`COMPUTERNAME`, then `HOSTNAME`, then `default`).
 
 ### Tests
-- 1237 -> 1285 tests (new: `test/trust-142.test.ts`, the rewritten gate guard); `npx tsc --noEmit` clean; the full suite, including the packed-tarball smoke test, passed three times in a row.
+- 1237 -> 1313 tests (new: `test/trust-142.test.ts`, `test/rv6-fixes.test.ts`, the rewritten gate guard); `npx tsc --noEmit` clean; the full suite, including the packed-tarball smoke test, passed three times in a row.
 
 ### Not done
-- A lock for two processes migrating at once, `ONEMEMORY_REQUIRE_PREMIGRATION_BACKUP`, an admin
+- A lock for two processes migrating at once, an admin
   `clear-taint` command, hiding admin-only tools from a non-admin `tools/list`, and reserving the runner
   namespace were reviewed and left for a later version.
 

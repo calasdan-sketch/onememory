@@ -55,8 +55,17 @@ export function squashWriter(s: unknown): string {
   // are the same label; then invisible format characters (zero-width space/joiner, bidi marks, BOM)
   // go, so they cannot make two labels that look identical differ. Letter case is NOT folded:
   // labels are exact (`Alice` and `alice` are two writers).
-  // eslint-disable-next-line no-control-regex
-  return s.normalize("NFKC").replace(/\p{Cf}/gu, "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\s]+/g, " ").trim();
+  // Dropping a format character can make a base letter and a combining mark adjacent ("e" + ZWSP + U+0301), which a second NFKC
+  // would then recompose; so the pass repeats until nothing changes (it settles in two rounds), which makes this idempotent:
+  // squash(squash(x)) === squash(x), and a rule typed with or without the invisible character matches the same stored label.
+  let t = s;
+  for (let i = 0; i < 6; i++) {
+    // eslint-disable-next-line no-control-regex
+    const next = t.normalize("NFKC").replace(/\p{Cf}/gu, "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\s]+/g, " ").trim();
+    if (next === t) break;
+    t = next;
+  }
+  return t;
 }
 
 /**

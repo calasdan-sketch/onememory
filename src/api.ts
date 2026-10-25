@@ -881,7 +881,10 @@ export function createApiServer(
         // Same default as the MCP tool: a relevance probe returns a handful
         // of notes, not a page.
         const relLimit = typeof parsed.limit === "number" ? parsed.limit : 5;
-        const relNs = typeof parsed.namespace === "string" ? parsed.namespace : undefined;
+        // ONE resolved namespace (body wins, then the query string) feeds BOTH the include_distrusted gate and the search, so
+        // the gate can never judge one namespace while the search reads another.
+        const relNs =
+          typeof parsed.namespace === "string" ? parsed.namespace : url.searchParams.get("namespace") ?? undefined;
         // Writer / trust filters: in the JSON body, or (like /search) in the query string.
         const bodyStr = (k: string): string | undefined => {
           const v = (parsed as Record<string, unknown>)[k];
@@ -894,7 +897,7 @@ export function createApiServer(
           ...(bodyStr("not_written_by") ? { notWrittenBy: bodyStr("not_written_by") } : {}),
           ...(["1", "true", "yes"].includes(String((parsed as Record<string, unknown>).include_distrusted ?? "").toLowerCase()) ? { includeDistrusted: true } : {}),
         };
-        if (rwf.includeDistrusted && refuseDistrustedOptIn(relNs ?? url.searchParams.get("namespace"))) return;
+        if (rwf.includeDistrusted && refuseDistrustedOptIn(relNs)) return;
         // Results carry the same staleness fields as /search (the
         // vague-message path is the most likely to act on outdated facts).
         const withStaleness = (r: { keywords: string[]; results: NoteRecord[] }) => ({
