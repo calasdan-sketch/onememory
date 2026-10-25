@@ -316,7 +316,7 @@ or legal hold); *confidence*: **no**.
 | `GAP-SUPERSEDE` | No "this replaces that" link. Edit a note in place and the old value is gone; write a second note and leave the first, and search returns both in relevance order, the old one often first. | A05, A06, A10, A20, B03 |
 | `GAP-RECENCY` | Staleness is a flag plus a mild ranking penalty (x0.95 per 90 days); a 200-day-old note with better keyword overlap can still outrank the current one (flagged, but not second). | A11 |
 | `GAP-HISTORY` | No version history of bodies. After a bad overwrite, or an overwrite followed by distrusting the overwriter, the trusted original text is not recoverable from OneMemory (backups are). | B08, B09 |
-| `GAP-REST-CAS` | The MCP tool `state_write` takes `if_rev` (refuses an edit made on a stale copy); the REST `PUT /notes/:id` ignored it. | B16 |
+| `GAP-REST-CAS` | **Fixed in 1.5.0.** The MCP tool `state_write` took `if_rev` (refuses an edit made on a stale copy) but the REST `PUT /notes/:id` ignored it; it now takes `if_rev` and answers 409. | B16 (now passes) |
 | `GAP-CONFIDENCE` | No confidence field; a client can send one but it is dropped silently. | D10 |
 
 ## Security in one paragraph

@@ -123,6 +123,10 @@ immediately visible through the others:
 `GET /health` (liveness) and `GET /ready` (DB-touch readiness, used by the
 Docker healthcheck) and the dashboard at `/`. Every route except `/health`,
 `/ready`, and the dashboard requires `Authorization: Bearer <token>`.
+
+`PUT /notes/:id` takes an optional `if_rev` (the `rev` you last read), as the MCP tool `state_write` does: if the note has
+been changed since, the edit is refused with `409 { error: "stale write: ..." }` instead of replacing the newer write. Without
+`if_rev` the last write wins, as before.
 `POST /relevant` takes `{ message, limit?, namespace? }` and mirrors the
 `state_relevant` tool (read-scoped, despite the POST method).
 `GET /stats` mirrors the `memory_stats` tool (read scope, namespace-gated

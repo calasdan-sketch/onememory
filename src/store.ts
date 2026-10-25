@@ -131,6 +131,13 @@ export function coerceNumeric(v: unknown): unknown {
 }
 
 /**
+ * A compare-and-swap update was refused because the note moved on since the caller read it
+ * (`ifRev` no longer matches). A ValidationError subclass so every surface keeps its message;
+ * the REST layer answers 409 so a client can tell "re-read and retry" from "bad request".
+ */
+export class StaleWriteError extends ValidationError {}
+
+/**
  * A rebuild was requested while another one is already running in this
  * process (single-flight). A ValidationError subclass so every surface maps
  * it to a clean caller-facing error; the REST layer answers 409.
@@ -2812,7 +2819,7 @@ export class Store {
         this.db.exec("ROLLBACK");
         const current = this.read(id);
         if (!current) return null; // deleted concurrently -> not found
-        throw new ValidationError(
+        throw new StaleWriteError(
           `stale write: note ${id} is at rev ${current.rev} (you have ${opts.ifRev}); re-read and retry`
         );
       }

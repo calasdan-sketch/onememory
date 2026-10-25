@@ -16,8 +16,9 @@
   },
   "GAP-REST-CAS": {
     "title": "REST updates have no compare-and-swap",
-    "summary": "The MCP tool state_write accepts if_rev and refuses an edit made on an out-of-date copy. The REST PUT /notes/:id ignored it, so a stale REST edit silently replaced a newer one.",
-    "status": "roadmap"
+    "summary": "The MCP tool state_write accepts if_rev and refuses an edit made on an out-of-date copy. The REST PUT /notes/:id ignored it, so a stale REST edit silently replaced a newer one. Fixed in 1.5.0: PUT now takes if_rev and answers 409.",
+    "status": "fixed",
+    "fixed_in": "1.5.0"
   },
   "GAP-CONFIDENCE": {
     "title": "No confidence field",

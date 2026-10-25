@@ -18,7 +18,6 @@
     "cas",
     "read"
   ],
-  "known_gap": "GAP-REST-CAS",
   "steps": [
     {
       "op": "write",

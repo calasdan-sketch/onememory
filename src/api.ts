@@ -17,6 +17,7 @@ import {
   ValidationError,
   QuarantinedError,
   RebuildBusyError,
+  StaleWriteError,
   NoteUnreadableError,
   type ImportReport,
   attestationsToShow,
@@ -135,7 +136,9 @@ function sendError(res: ServerResponse, e: unknown): void {
     sendJson(res, 202, { quarantined: { id: e.quarantineId, reasons: e.findings } });
     return;
   }
-  if (e instanceof ValidationError) {
+  if (e instanceof StaleWriteError) {
+    sendJson(res, 409, { error: e.message });
+  } else if (e instanceof ValidationError) {
     sendJson(res, 400, { error: e.message });
   } else if (e instanceof NoteUnreadableError) {
     console.error("[onememory] " + e.message);
@@ -559,6 +562,20 @@ export function createApiServer(
           return;
         }
         if (parsed && parsed.forget_after !== undefined) parsed.forget_after = coerceNumeric(parsed.forget_after) as number;
+        // Compare-and-swap, as in the MCP tool state_write: `if_rev` is the revision the caller last read; the edit is
+        // refused (409) when the note has moved on, instead of silently replacing a newer write.
+        let ifRev: number | undefined;
+        if (parsed && typeof parsed === "object" && "if_rev" in parsed) {
+          const raw = coerceNumeric((parsed as { if_rev?: unknown }).if_rev);
+          delete (parsed as { if_rev?: unknown }).if_rev;
+          if (raw !== undefined && raw !== null) {
+            if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) {
+              sendJson(res, 400, { error: "if_rev must be a whole number (the rev you last read)" });
+              return;
+            }
+            ifRev = raw;
+          }
+        }
         try {
           if (nsCtx.active) {
             // The client-supplied namespace is dropped (the note keeps its
@@ -576,7 +593,7 @@ export function createApiServer(
           }
           if (parsed && parsed.tags !== undefined) assertPlainWriteTags(parsed.tags, store.read(id)?.tags); // gate-ok: tag-guard lookup only (no content returned)
           const warnings: LintFinding[] = [];
-          const note = store.update(id, parsed, { lintWarnings: warnings });
+          const note = store.update(id, parsed, { lintWarnings: warnings, ...(ifRev !== undefined ? { ifRev } : {}) });
           if (!note) {
             sendJson(res, 404, { error: "not found" });
             return;

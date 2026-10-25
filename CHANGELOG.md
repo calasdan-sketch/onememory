@@ -20,8 +20,15 @@ schema change, no change to any existing result shape or default.
   audit log). Scenarios are JSON files in `bench/scenarios/` (shipped in the package), and a small adapter interface
   (write, update, delete, search, plus actor) lets the same scenarios run against another memory system.
   See [docs/BENCHMARK.md](./docs/BENCHMARK.md).
+
+### Fixed
+- **REST `PUT /notes/:id` now honours `if_rev`** (compare-and-swap), as the MCP tool `state_write` already did. An edit made on
+  an out-of-date copy is refused with `409` ("stale write: ... re-read and retry") instead of silently replacing a newer write.
+  Without `if_rev` nothing changes (last write wins). Found by benchmark scenario B16.
+
+### Known gaps
 - **Known gaps are recorded, not hidden.** Scenarios that fail because OneMemory lacks the behaviour carry a `known_gap`
-  marker and are listed in the README: `GAP-SUPERSEDE`, `GAP-RECENCY`, `GAP-HISTORY`, `GAP-REST-CAS`, `GAP-CONFIDENCE`.
+  marker and are listed in the README: `GAP-SUPERSEDE`, `GAP-RECENCY`, `GAP-HISTORY`, `GAP-CONFIDENCE` (a fifth, `GAP-REST-CAS`, was found and fixed in this release).
   They do not fail the run; a marked scenario that starts to pass does.
 
 ## [1.4.2] - 2026-10-24
