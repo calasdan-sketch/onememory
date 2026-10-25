@@ -17,6 +17,16 @@ MCP-capable agent. They all launch it the same way — a local command over
 
 ---
 
+## The easy way: `onememory setup`
+
+```bash
+npx onememory-mcp setup --dry-run     # shows exactly what it would change; writes nothing
+npx onememory-mcp setup               # does it, after you type y; backs up every file; --undo reverses it
+```
+
+It finds Claude Code, Claude Desktop and Cursor, adds only the OneMemory entry, and can move an old `claude-bridge` entry across keeping your data.
+Details and troubleshooting: [docs/live-claude-code.md](./docs/live-claude-code.md). The manual steps for each app follow.
+
 ## Claude Code
 
 ```bash

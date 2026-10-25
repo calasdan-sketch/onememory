@@ -12,6 +12,7 @@
 // It also runs standalone when invoked directly (node dist/src/mcp-http.js).
 
 import "./quiet-sqlite.js"; // first: hide the node:sqlite ExperimentalWarning
+import "./legacy-env.js"; // second: read the old CLAUDE_BRIDGE_* variables as ONEMEMORY_*
 import { createServer, IncomingMessage, Server, ServerResponse } from "node:http";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";

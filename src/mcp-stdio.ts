@@ -3,6 +3,7 @@
 // or the default <data dir>/state.db, see config.ts) so state written here is immediately
 // visible to the API and vice versa.
 import "./quiet-sqlite.js"; // first: hide the node:sqlite ExperimentalWarning
+import "./legacy-env.js"; // second: read the old CLAUDE_BRIDGE_* variables as ONEMEMORY_*
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { Store } from "./store.js";
 import { createMcpServer } from "./mcp-server-core.js";

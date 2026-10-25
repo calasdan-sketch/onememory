@@ -20,6 +20,24 @@ that speaks MCP or HTTP.
 > `node:sqlite`, which does not exist in Node 22 or older. Check with
 > `node -v`. Can't upgrade? Use [Docker](#docker) instead.
 
+### Install in 60 seconds
+
+```bash
+npx onememory-mcp setup
+```
+
+`setup` finds Claude Code, Claude Desktop and Cursor on this computer, shows you in plain words what it will do and the exact
+lines it will change, saves a backup of each file, and writes only after you type `y`. Then it writes a first test note, reads it
+back, runs `onememory doctor` and tells you how to check it inside Claude Code (type `/mcp`). To look first: `npx onememory-mcp setup
+--dry-run`. To go back: `onememory setup --undo`. It changes only the OneMemory entry; your other servers and settings stay as they
+are. **Coming from claude-bridge** (the old name)? It offers to move that entry across and keeps your data. Step by step, with
+troubleshooting: [docs/live-claude-code.md](./docs/live-claude-code.md).
+
+Already have notes in Claude Code? `onememory import --claude --dry-run` shows what could be brought in from your `CLAUDE.md` files and
+Claude Code's auto memory (secrets are skipped, nothing leaves your computer).
+
+The manual way, if you prefer:
+
 ```bash
 npm i -g onememory-mcp                           # 1. install
 claude mcp add onememory -- onememory mcp        # 2. wire it into Claude Code (stdio)
@@ -242,6 +260,9 @@ REST mirrors them (`/notes`, `/search`, `/relevant`, `/changes`, `/tasks`, `/han
 
 ```
 onememory start | mcp | doctor | init
+onememory setup [--dry-run] [--yes] [--only claude-code,claude-desktop,cursor] [--hook] [--undo]   # connect your apps; safe, backed up, undoable
+onememory import --claude [--dry-run] [--update] [--project <folder>]   # bring in CLAUDE.md files and Claude Code auto memory
+onememory sync --git ~/my-private-memory-repo [--encrypt]   # keep your computers in step through YOUR private git repository
 onememory changes --since last --consumer laptop
 onememory runner-status                           # is each PC's runner listening? commands waiting?
 onememory trust [list | distrust <w> | undistrust <w> | identity | attester-add <key> --server-id <id> | attester-remove <id> | attester-revoke <id>]
@@ -364,7 +385,8 @@ recall@1 on it. See [docs/encryption-retention.md](./docs/encryption-retention.m
 | [docs/change-feed.md](./docs/change-feed.md) | `memory_since` / `GET /changes` |
 | [docs/tasks.md](./docs/tasks.md) | task board, claims, command tasks, handoffs, one-call catch-up |
 | [docs/memory-linter.md](./docs/memory-linter.md) | `ONEMEMORY_LINT`, detection rules, quarantine |
-| [docs/file-sync.md](./docs/file-sync.md) | Markdown export/import, GitHub and Syncthing workflows |
+| [docs/live-claude-code.md](./docs/live-claude-code.md) | `onememory setup` step by step, moving from claude-bridge, checking it in live Claude Code, troubleshooting |
+| [docs/file-sync.md](./docs/file-sync.md) | Markdown export/import, `sync --git` (optionally sealed), GitHub and Syncthing workflows |
 | [docs/sessionstart-hook.md](./docs/sessionstart-hook.md) | automatic recall at Claude Code session start |
 | [docs/encryption-retention.md](./docs/encryption-retention.md) | at-rest encryption, retention (TTL + archive), retrieval visibility |
 | [docs/provenance.md](./docs/provenance.md) | who wrote a note: server-stamped `written_by`, filters, what is and is not trusted |

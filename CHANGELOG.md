@@ -6,6 +6,38 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-10-25
+
+Easy, safe connection to Claude Code and an easy way in for what Claude Code already knows. **No schema change** (still v15).
+
+### Added
+- **`onememory setup`** (also `npx onememory-mcp setup`). Finds Claude Code (`~/.claude.json`), Claude Desktop (per OS) and Cursor, shows a plain-language
+  plan and the exact lines it will change (secrets masked), writes only after you type `y` (`--yes` for scripts), saves a timestamped backup of every
+  file, and writes atomically. It edits the file *in place*: only the OneMemory entry changes; other servers, comments, number formats, line endings,
+  BOM, indentation and key order stay byte for byte. It re-reads the file right before writing and applies its change to what is there now (Claude Code
+  rewrites `~/.claude.json` while it runs), reads it back afterwards and checks again a moment later. Symlinked configs are edited at their target.
+  Opens the database and writes/reads back a test note before touching any config. `--dry-run`, `--undo`, `--only`, `--project`, `--db`, `--hook`/`--no-hook`.
+  Checks the Node version with a plain message. The optional SessionStart hook is merged (never overwritten) and only with your agreement.
+- **Moving from claude-bridge.** An old `claude-bridge` entry (by name, path or `CLAUDE_BRIDGE_*` variables, including per-project entries) is replaced by
+  `onememory` in the same place; `CLAUDE_BRIDGE_DB_PATH` becomes `ONEMEMORY_DB_PATH` with the same value; the old install folder is never touched; the
+  database upgrade keeps its verified `.pre-v15-backup`.
+- **The old `CLAUDE_BRIDGE_*` variables now work** (every `CLAUDE_BRIDGE_<NAME>` is read as `ONEMEMORY_<NAME>`; the new name wins). Before this release they
+  were silently ignored, so a client still configured with `CLAUDE_BRIDGE_DB_PATH` would have started on an empty database. `doctor` says when it maps one.
+- **`onememory import --claude [--dry-run]`.** Imports `CLAUDE.md` files (user, project, local) and Claude Code auto memory
+  (`~/.claude/projects/*/memory/*.md`), cut at headings, tagged with source and project, written by `import:claude`, idempotent by a stable key. The
+  secret linter runs on every section; flagged sections are skipped and counted, never printed. Refuses links that leave the memory folder or do not lead
+  to Markdown, does not follow `@imports`, never opens the network. A dry run never creates or upgrades a database.
+- **`onememory sync --git <repo>`.** The Markdown export/import over a private git repository you own: fetch, merge, three-way merge into the database,
+  write back, commit, push, with a retry if another computer pushed first. `--encrypt` seals every file (AES-256-GCM, opaque names) before commit; the key
+  stays in a file on your computers and a key inside the repository is refused. No hosted server. Deletes do not propagate (as with file sync).
+- **Dashboard "Review" view**: notes agents wrote that nobody has looked at (filter by writer; Accept adds the tag `reviewed` without changing the author;
+  delete). The page now says OneMemory instead of claude-bridge.
+- `onememory recall --db <file>` (used by the hook that setup writes when your database is not in the default place).
+- Docs: README "Install in 60 seconds", [docs/live-claude-code.md](./docs/live-claude-code.md), a git section in docs/file-sync.md.
+
+### Changed
+- `doctor` recognises hooks written by `setup` (which call `node <cli.js> recall`) as well as `onememory recall`.
+
 ## [1.6.0] - 2026-10-25
 
 Closes every gap the 1.5.0 benchmark recorded, without ever changing a memory silently. **Schema v15** (a verified

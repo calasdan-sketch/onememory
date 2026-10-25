@@ -55,12 +55,13 @@ export const DASHBOARD_HTML = `<!doctype html>
 <body>
 <div id="app" style="display:none">
 <header>
-  <h1>claude<span>-bridge</span></h1>
+  <h1>one<span>memory</span></h1>
   <input id="q" class="grow" placeholder="Search notes...">
   <input id="ns" placeholder="namespace" style="width:130px">
   <button class="ghost" onclick="toggleNew()">+ New</button>
   <button class="ghost" onclick="load()">Refresh</button>
   <button class="ghost" onclick="loadChanges()" title="What changed in the last 24 hours">Changes</button>
+  <button class="ghost" onclick="loadReview()" title="Notes written by agents that you have not looked at yet">Review</button>
   <label class="chk" title="Also show notes written by writers an admin distrusts (marked DISTRUSTED)"><input type="checkbox" id="inc" onchange="load()"> distrusted</label>
 </header>
 <main>
@@ -89,8 +90,8 @@ export const DASHBOARD_HTML = `<!doctype html>
 </div>
 
 <div id="gate" class="gate">
-  <h1>claude<span style="color:var(--accent)">-bridge</span></h1>
-  <p class="muted">Paste your bridge token to view the store.</p>
+  <h1>one<span style="color:var(--accent)">memory</span></h1>
+  <p class="muted">Paste your OneMemory token to view the store.</p>
   <input id="tok" type="password" placeholder="ONEMEMORY_TOKEN" onkeydown="if(event.key==='Enter')saveTok()">
   <button onclick="saveTok()">Open</button>
   <p id="gate_err" class="err"></p>
@@ -172,7 +173,9 @@ function incRefused(e){
   if(inc() && /admin/i.test(String(e && e.message))){ document.getElementById("inc").checked = false; }
 }
 
+var VIEW = "list";
 function load(){
+  VIEW = "list";
   loadRunner();
   var q = document.getElementById("q").value.trim();
   var ns = document.getElementById("ns").value.trim();
@@ -207,6 +210,50 @@ function loadChanges(){
   }).catch(function(e){ incRefused(e); document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
 }
 
+// ---- Review queue: notes an AI agent wrote that nobody has looked at yet ----
+// "Accepted" is the tag "reviewed" (tags do not change who wrote a note). Notes you or the server wrote yourself (cli,
+// server, import:claude) are not queued. A writer the admin distrusts stays hidden, as everywhere else.
+var HUMAN_WRITERS = { "cli": 1, "server": 1, "import:claude": 1, "": 1 };
+function reviewQueue(notes, writer){
+  return (notes || []).filter(function(n){
+    if(HUMAN_WRITERS[n.written_by || ""]){ return false; }
+    if((n.tags || []).indexOf("reviewed") >= 0){ return false; }
+    return !writer || n.written_by === writer;
+  });
+}
+function loadReview(){
+  VIEW = "review";
+  var ns = document.getElementById("ns").value.trim();
+  var sel = document.getElementById("rv_writer");
+  var writer = sel ? sel.value : "";
+  api("/notes?limit=500" + (ns ? ("&namespace=" + encodeURIComponent(ns)) : "")).then(function(j){
+    var all = reviewQueue(j.notes || []);
+    var writers = {};
+    all.forEach(function(n){ writers[n.written_by] = (writers[n.written_by] || 0) + 1; });
+    var opts = "<option value=''>all writers (" + all.length + ")</option>" + Object.keys(writers).sort().map(function(w){
+      return "<option value='" + esc(w) + "'" + (w === writer ? " selected" : "") + ">" + esc(w) + " (" + writers[w] + ")</option>"; }).join("");
+    var shown = reviewQueue(j.notes || [], writer);
+    document.getElementById("count").textContent = shown.length + " to review";
+    var rows = shown.map(function(n){
+      var tags = (n.tags||[]).map(function(t){ return "<span class='tag'>"+esc(t)+"</span>"; }).join("");
+      return "<div class='card'><div class='cardhead'><div><h3>"+esc(n.title)+"</h3><div class='meta'>#"+n.id+" &middot; "+esc(n.namespace)+
+        " &middot; written by "+esc(n.written_by)+" &middot; "+esc((n.updated_at||"").slice(0,16).replace("T"," "))+"</div>"+tags+"</div>"+
+        "<div><button onclick='acceptNote("+n.id+")'>Accept</button> <button class='danger' onclick='del("+n.id+")'>delete</button></div></div>"+
+        (n.body ? "<div class='body'>"+esc(n.body)+"</div>" : "")+"</div>";
+    }).join("");
+    document.getElementById("list").innerHTML = "<div class='row'><select id='rv_writer' onchange='loadReview()'>"+opts+"</select>"+
+      "<span class='muted'>Accept keeps a note and marks it reviewed. Delete removes it.</span></div>" +
+      (rows || "<p class='muted'>Nothing waiting for review.</p>");
+  }).catch(function(e){ document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
+}
+function acceptNote(id){
+  api("/notes/" + id).then(function(j){
+    var n = j.note || j;
+    var tags = (n.tags || []).filter(function(t){ return t !== "reviewed"; }).concat(["reviewed"]);
+    return api("/notes/" + id, { method:"PUT", body: JSON.stringify({ tags: tags, if_rev: n.rev }) });
+  }).then(loadReview).catch(function(e){ alert(e.message); });
+}
+
 function addNote(){
   var title = document.getElementById("n_title").value.trim();
   var err = document.getElementById("n_err"); err.textContent = "";
@@ -223,7 +270,7 @@ function addNote(){
 
 function del(id){
   if(!confirm("Delete note #" + id + "?")){ return; }
-  api("/notes/" + id, { method:"DELETE" }).then(load).catch(function(e){ alert(e.message); });
+  api("/notes/" + id, { method:"DELETE" }).then(function(){ if(VIEW === "review"){ loadReview(); } else { load(); } }).catch(function(e){ alert(e.message); });
 }
 
 function doExport(){

@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-for (const k of Object.keys(process.env)) if (k.startsWith("ONEMEMORY_")) delete process.env[k];
+for (const k of Object.keys(process.env)) if (k.startsWith("ONEMEMORY_") || k.startsWith("CLAUDE_BRIDGE_")) delete process.env[k];
 const home = mkdtempSync(join(tmpdir(), "onememory-test-home-"));
 process.env.ONEMEMORY_HOME = home;
 process.on("exit", () => {

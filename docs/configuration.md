@@ -75,6 +75,7 @@ All environment variables are optional. This table lists **every** `ONEMEMORY_*`
 | `ONEMEMORY_ACCESS_BOOST` | on | Set to `0` to turn off the access-count boost and staleness penalty in search ranking (results then follow native relevance only, as in 1.0.0); access counts are still recorded |
 | `ONEMEMORY_ENCRYPT` | unset | `0` = hard-disable at-rest encryption even if a key file exists (used by tests). It never turns encryption **on**: that is decided by the presence of the key file, created by `onememory encrypt enable`. See [encryption-retention.md](./encryption-retention.md) |
 | `ONEMEMORY_KEY_FILE` | `<data dir>/.key` | Path of the 32-byte encryption key file. Keep it with the same care as the database: anyone holding both can read the notes |
+| `ONEMEMORY_SYNC_KEY_FILE` | your at-rest key if you have one, else `<data dir>/.sync-key` | The 32-byte key file `onememory sync --git --encrypt` seals files with (see [file-sync.md](./file-sync.md)). It must be outside the repository (a key inside it is refused); copy it to your other computers yourself |
 | `ONEMEMORY_IMPORT_MAX_BYTES` | `268435456` (256 MB) | Request-body cap for `POST /import` (clamped to 1 MB - 2 GB). Other routes keep the 1 MB cap |
 | `ONEMEMORY_URL` | unset | Base URL (e.g. `http://localhost:8790`) used only by the runner signing helper's `--post` mode, together with `ONEMEMORY_TOKEN`. Not read by the server |
 | `ONEMEMORY_LINT` | `secrets=block,injection=quarantine` | Write-time memory linter policy: `block`, `quarantine`, `warn`, or per category (`secrets=block,injection=warn`). See [memory-linter.md](./memory-linter.md) |
@@ -124,3 +125,5 @@ How it works:
   exactly as before (model-supplied namespaces keep working). Invalid
   JSON/shape is logged to stderr and disables the feature. `onememory
   doctor` validates that configured space paths exist on disk.
+
+**Old names.** OneMemory used to be called claude-bridge. Every `CLAUDE_BRIDGE_<NAME>` variable is read as the matching `ONEMEMORY_<NAME>` one (for example `CLAUDE_BRIDGE_DB_PATH` as the database path), so an old client configuration keeps its data. When both are set the new name wins. `onememory doctor` says when it mapped an old name, and `onememory setup` rewrites an old claude-bridge entry with the new names.

@@ -718,10 +718,10 @@ describe("the command line", () => {
 });
 
 describe("shipping and docs", () => {
-  test("the package is 1.6.0 and ships the scenarios and the new docs", () => {
+  test("the package is 1.7.0 and ships the scenarios and the new docs", () => {
     const pkg = JSON.parse(read("package.json")) as { version: string; files: string[]; scripts: Record<string, string> };
-    assert.equal(pkg.version, "1.6.0");
-    assert.equal(PACKAGE_VERSION, "1.6.0");
+    assert.equal(pkg.version, "1.7.0");
+    assert.equal(PACKAGE_VERSION, "1.7.0");
     assert.ok(pkg.files.includes("bench/scenarios/*.json"));
     assert.ok(pkg.files.includes("docs/*.md"));
     assert.match(pkg.scripts.bench, /bench/);

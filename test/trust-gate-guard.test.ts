@@ -55,6 +55,7 @@ const EXPECTED_SITES: Record<string, string[]> = {
     "consolidation candidates (admin): filtered with filterVisible",
     "admin consolidate: namespace check only",
   ],
+  "setup.ts": ["setup reads back the test note it wrote a moment ago"],
   "sync.ts": [
     "the vault export skips hidden notes itself (hiddenIds) unless --include-distrusted",
     "existence check only (deleted here?)",
