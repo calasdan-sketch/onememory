@@ -126,8 +126,11 @@ test("the packed tarball starts: every relative import resolves, runner-status a
             const msg = JSON.parse(line);
             if (msg.id === 2 && msg.result) {
               clearTimeout(timer);
+              const names = (msg.result.tools as Array<{ name: string }>).map((t) => t.name);
+              // Wait for the child to be really gone: on Windows a live process
+              // keeps its cwd (the extracted package) locked and the cleanup fails.
+              child.once("close", () => res(names));
               child.kill();
-              res((msg.result.tools as Array<{ name: string }>).map((t) => t.name));
             }
           } catch {
             /* partial line */
@@ -148,6 +151,12 @@ test("the packed tarball starts: every relative import resolves, runner-status a
     assert.ok(tools.includes("runner_status"), "runner_status is served by the packed server");
     assert.ok(tools.includes("state_write"));
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    // Best effort: a Windows antivirus/indexer can briefly hold files. A failed
+    // cleanup of a temp dir must never fail the smoke test itself.
+    try {
+      rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    } catch {
+      /* temp dir is left behind, harmless */
+    }
   }
 });
