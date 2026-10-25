@@ -361,7 +361,7 @@ describe("against OneMemory", () => {
 
   test("the stale-memory numbers are reported and the gaps behind them are named", () => {
     const m = first.suites.stale.metrics as Record<string, { count: number; of: number; rate: number }>;
-    assert.ok(m["stale-hit-rate@1"].of >= 15);
+    assert.ok(m["stale-hit-rate@1"].of >= 12, "enough stale queries behind the rate");
     assert.ok(m["current-recall@1"].of >= 10);
     for (const k of ["stale-hit-rate@1", "stale-hit-rate@5", "current-recall@1"]) assert.ok(k in m, k);
     // Every scenario that fails does so under a named, documented gap.
@@ -406,6 +406,62 @@ describe("against OneMemory", () => {
     assert.equal(m["fields-lost"], 1);
     const lost = first.scenarios.flatMap((s) => s.checks.filter((c) => c.metric === "field" && !c.pass).map(() => s.id));
     assert.deepEqual(lost, ["D10"]);
+  });
+});
+
+describe("the real scenarios catch a broken OneMemory (mutation checks)", () => {
+  /** OneMemory with its tenant pins removed: every token can see every tenant. */
+  class NoTenants extends OneMemoryAdapter {
+    override async open(world: WorldSpec): Promise<void> {
+      const actors: WorldSpec["actors"] = {};
+      for (const [k, a] of Object.entries(world.actors)) actors[k] = { scope: a.scope, writer: a.writer, server: a.server };
+      return super.open({ actors, grants: {} });
+    }
+  }
+  /** OneMemory where every token is an admin: scopes mean nothing. */
+  class AllAdmin extends OneMemoryAdapter {
+    override async open(world: WorldSpec): Promise<void> {
+      const actors: WorldSpec["actors"] = {};
+      for (const [k, a] of Object.entries(world.actors)) actors[k] = { ...a, scope: "admin" };
+      return super.open({ actors, grants: world.grants });
+    }
+  }
+
+  test("with tenant pins removed, the isolation suite reports leaks", async () => {
+    const { report } = await runBench({ adapter: new NoTenants(), suites: ["isolation"] });
+    assert.equal(report.ok, false);
+    assert.ok((report.suites.isolation.metrics["leakage-count"] as number) >= 10, `leaks: ${report.suites.isolation.metrics["leakage-count"]}`);
+    const failed = new Set(report.scenarios.filter((s) => s.status === "fail").map((s) => s.id));
+    for (const id of ["C01", "C03", "C04", "C05", "C06", "C07", "C11", "C20"]) assert.ok(failed.has(id), `${id} must fail when tenants are not isolated`);
+  });
+
+  test("with every token an admin, the scope and trust scenarios fail", async () => {
+    const { report } = await runBench({ adapter: new AllAdmin(), only: ["B06", "B10", "C09", "C10"] });
+    assert.equal(report.ok, false);
+    const failed = new Set(report.scenarios.filter((s) => s.status === "fail").map((s) => s.id));
+    for (const id of ["B06", "B10", "C09"]) assert.ok(failed.has(id), `${id} must fail when scopes are not enforced`);
+  });
+});
+
+describe("scenario validation (more)", () => {
+  const base = (): Scenario => sc({ steps: [{ op: "write", as: "alice", ref: "n", title: "t", body: "b" }, { op: "read", as: "alice", ref: "n", id: "r" }, { op: "search", as: "alice", q: "t", id: "s" }], expect: [{ check: "top", step: "s", ref: "n", desc: "the note is first" }] });
+  test("a compare-and-swap step must point at an earlier read", () => {
+    const s = base();
+    s.steps.push({ op: "update", as: "alice", ref: "n", body: "x", if_rev_of: "nope" });
+    assert.match(validateScenario(s) ?? "", /if_rev_of/);
+    s.steps[s.steps.length - 1] = { op: "update", as: "alice", ref: "n", body: "x", if_rev_of: "r" };
+    assert.equal(validateScenario(s), null);
+  });
+  test("same_as and differs_from must name real steps and refs", () => {
+    const s = base();
+    s.expect = [{ check: "field", step: "r", path: "title", same_as: { step: "ghost", path: "title" }, desc: "compare" }];
+    assert.match(validateScenario(s) ?? "", /step "ghost" does not exist/);
+    s.expect = [{ check: "field", step: "r", path: "title", differs_from: { step: "r", of: "ghost", path: "title" }, desc: "compare" }];
+    assert.match(validateScenario(s) ?? "", /ref "ghost"/);
+  });
+  test("distractors are bounded, and known_gap cannot be a prototype key", () => {
+    assert.match(validateScenario({ ...base(), distractors: 100000 }) ?? "", /distractors/);
+    assert.match(validateScenario({ ...base(), known_gap: "toString" }, gaps) ?? "", /not listed/);
   });
 });
 
@@ -600,6 +656,18 @@ describe("shipping and docs", () => {
     assert.match(section, /not a retrieval|not a semantic|does not measure/i);
     assert.match(section, /known gaps/i);
     for (const id of Object.keys(gaps)) assert.ok(section.includes(id), `README lists ${id}`);
+  });
+
+  test("the README table states the real scenario counts per suite", () => {
+    const all = loadScenarios(DIR, gaps);
+    const section = read("README.md").slice(read("README.md").indexOf("## Benchmark"));
+    const rows: Array<[string, string]> = [["A  Stale memory", "stale"], ["B  Contradiction recovery", "contradiction"], ["C  Permission isolation", "isolation"], ["D  Provenance retention", "provenance"]];
+    for (const [label, suite] of rows) {
+      const m = new RegExp(`\\| ${label} \\| (\\d+) \\|`).exec(section);
+      assert.ok(m, `README row for ${label}`);
+      assert.equal(Number(m![1]), all.filter((s) => s.suite === suite).length, `${label} count`);
+    }
+    assert.match(read("CHANGELOG.md"), new RegExp(`${all.length} deterministic`), "CHANGELOG states the total");
   });
 
   test("docs/BENCHMARK.md explains the scenario format and the adapter", () => {

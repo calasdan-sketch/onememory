@@ -94,6 +94,8 @@ export class OneMemoryAdapter implements MemoryAdapter {
   async open(world: WorldSpec): Promise<void> {
     await this.close();
     this.dir = mkdtempSync(join(tmpdir(), "onememory-bench-"));
+    // Ctrl-C or a crash must not leave the throwaway folder behind (best effort: the exit handler can only do sync work).
+    process.once("exit", this.onExit);
     this.grants = world.grants;
     // The per-token rate limit (120 requests / 10 s) is a protection for a public server, not something to measure.
     // The audit log goes into the throwaway folder: the benchmark's traffic must never reach the user's own audit.log.
@@ -124,7 +126,17 @@ export class OneMemoryAdapter implements MemoryAdapter {
     }
   }
 
+  private onExit = (): void => {
+    if (!this.dir) return;
+    try {
+      rmSync(this.dir, { recursive: true, force: true });
+    } catch {
+      /* nothing more can be done at exit */
+    }
+  };
+
   async close(): Promise<void> {
+    process.removeListener("exit", this.onExit);
     for (const s of this.servers.values()) {
       await new Promise<void>((resolve) => {
         s.http.closeAllConnections();

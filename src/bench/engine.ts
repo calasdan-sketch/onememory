@@ -97,6 +97,7 @@ export function validateScenario(s: Scenario, gaps: Record<string, KnownGap> = {
       if (!Array.isArray(rs) || rs.some((r) => typeof r !== "string" || !refs.has(r))) return `step ${i + 1} (merge): refs must name earlier writes`;
     }
     if (raw.op === "import" && !stepIds.has(raw.from as string)) return `step ${i + 1} (import): "from" must be the id of an earlier export step`;
+    if (raw.op === "update" && raw.if_rev_of !== undefined && !stepIds.has(raw.if_rev_of as string)) return `step ${i + 1} (update): if_rev_of must be the id of an earlier read step`;
     const needsId = ["search", "list", "recall", "changes", "sweep", "export", "import"].includes(raw.op);
     if (needsId && typeof raw.id !== "string") return `step ${i + 1} (${raw.op}): id is required`;
     const id = defaultStepId(raw);
@@ -108,9 +109,11 @@ export function validateScenario(s: Scenario, gaps: Record<string, KnownGap> = {
     if (typeof c.desc !== "string" || !c.desc.trim()) return `check ${i + 1}: desc is required`;
     for (const sid of [c.step, ...(c.steps ?? [])]) if (sid !== undefined && !stepIds.has(sid)) return `check ${i + 1}: step "${sid}" does not exist`;
     if (c.check !== "same_response" && c.step === undefined && !(c.check === "contains_text" && c.steps?.length)) return `check ${i + 1} (${c.check}): step is required`;
-    for (const r of [c.ref, c.of, c.current, ...(c.stale ?? [])]) if (r !== undefined && !refs.has(r)) return `check ${i + 1}: ref "${r}" was not created by a write`;
+    for (const r of [c.ref, c.of, c.current, c.same_as?.of, c.differs_from?.of, ...(c.stale ?? [])]) if (r !== undefined && !refs.has(r)) return `check ${i + 1}: ref "${r}" was not created by a write`;
+    for (const o of [c.same_as, c.differs_from]) if (o && !stepIds.has(o.step)) return `check ${i + 1}: step "${o.step}" does not exist`;
   }
-  if (s.known_gap !== undefined && Object.keys(gaps).length > 0 && !gaps[s.known_gap]) return `known_gap ${s.known_gap} is not listed in known-gaps.json`;
+  if (s.known_gap !== undefined && Object.keys(gaps).length > 0 && !Object.hasOwn(gaps, s.known_gap)) return `known_gap ${s.known_gap} is not listed in known-gaps.json`;
+  if (s.distractors !== undefined && (!Number.isInteger(s.distractors) || s.distractors < 0 || s.distractors > 500)) return "distractors must be a whole number from 0 to 500";
   return null;
 }
 
@@ -384,7 +387,8 @@ function judge(run: Run, c: Check): CheckResult {
         `no old value in the top 5 unless it is flagged stale`;
       const flaggedNote = top5.some((h) => isOld(h) && h.stale === true) ? " (an old one is flagged stale)" : "";
       const got = `${hits.length ? `first is ${name(hits[0]?.id)}` : "no results"}; old values in top 5: ${top5.filter(isOld).map((h) => name(h.id)).join(", ") || "none"}${flaggedNote}`;
-      const measure: Record<string, boolean> = { stale_at_1: stale1, stale_at_5: stale5, unflagged_stale_at_5: unflagged5.length > 0 };
+      // Only a query that names an old value can have a stale hit; the rates are over those queries.
+      const measure: Record<string, boolean> = { has_old_value: staleIds.size > 0 || oldTexts.length > 0, stale_at_1: stale1, stale_at_5: stale5, unflagged_stale_at_5: unflagged5.length > 0 };
       if (c.current !== undefined) measure.current_at_1 = current1;
       return mk(pass, want, got, measure);
     }

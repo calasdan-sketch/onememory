@@ -54,10 +54,11 @@ function suiteMetrics(suite: Suite, results: ScenarioResult[]): Record<string, u
   const fresh = measures(results).filter((c) => c.check === "fresh_answer");
   if (suite === "stale") {
     const withCurrent = fresh.filter((c) => c.measure!.current_at_1 !== undefined);
-    out.queries = fresh.length;
-    out["stale-hit-rate@1"] = rate(fresh.filter((c) => c.measure!.stale_at_1).length, fresh.length);
-    out["stale-hit-rate@5"] = rate(fresh.filter((c) => c.measure!.stale_at_5).length, fresh.length);
-    out["unflagged-stale-hit-rate@5"] = rate(fresh.filter((c) => c.measure!.unflagged_stale_at_5).length, fresh.length);
+    const withOld = fresh.filter((c) => c.measure!.has_old_value); // only a query that names an old value can hit one
+    out.queries = withOld.length;
+    out["stale-hit-rate@1"] = rate(withOld.filter((c) => c.measure!.stale_at_1).length, withOld.length);
+    out["stale-hit-rate@5"] = rate(withOld.filter((c) => c.measure!.stale_at_5).length, withOld.length);
+    out["unflagged-stale-hit-rate@5"] = rate(withOld.filter((c) => c.measure!.unflagged_stale_at_5).length, withOld.length);
     out["current-recall@1"] = rate(withCurrent.filter((c) => c.measure!.current_at_1).length, withCurrent.length);
   }
   const tagged = (m: Metric): CheckResult[] => results.flatMap((r) => r.checks).filter((c) => c.metric === m);

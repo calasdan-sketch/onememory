@@ -30,8 +30,9 @@ Four suites, written as plain JSON files in [`bench/scenarios/`](https://github.
 
 - A "stale hit" is a result whose title or body still carries the old value (or that is the old note), and an
   *unflagged* stale hit is one the system did not mark as stale. `stale-hit-rate@1` is the share of
-  stale-memory queries whose first result is stale, `@5` the share with a stale value anywhere in the top five.
-  `current-recall@1` is the share of queries where the current note is first.
+  queries that name an old value whose first result is stale, `@5` the share with a stale value anywhere in the top five.
+  `current-recall@1` is the share of queries (with a current note) where the current note is first. These are
+  rates over a small, hand-written set (14 and 13 queries at 1.5.0): read them as a checklist, not as statistics.
 - A scenario passes only if all its checks hold. For stale-memory queries that means: current value first (when
   there is one) and no old value in the top five unless it is flagged stale.
 - `leakage-count` is the number of failed attack probes (a cross-tenant read that worked, a secret that
@@ -105,7 +106,7 @@ instance (default `main`), which is how a note is moved between two servers.
 
 | `op` | Fields | What it does |
 |---|---|---|
-| `write` | `ref`, `title`, `body`, `tags`, `source`, `confidence`, `forget_after`, `namespace`, `age_days`, `expires_in_days` | Create a note. `ref` names it for later steps. `age_days` / `expires_in_days` (negative = already past) place it in time (needs `restore`). `namespace` is a claim that a tenant-confined system must ignore. |
+| `write` | `ref`, `title`, `body`, `tags`, `source`, `confidence`, `forget_after`, `namespace`, `age_days`, `expires_in_days` | Create a note. `ref` names it for later steps. `age_days` / `expires_in_days` (negative = already past) place it in time (needs `restore`). `namespace` is a claim that a tenant-confined system must ignore. `age_days` and `expires_in_days` go through the admin restore path, so the actor must be an admin (and is then the stamped writer). |
 | `update` | `ref`, `title`, `body`, `tags`, `source`, `if_rev_of` | Partial update. `if_rev_of` is the id of an earlier `read` step whose revision is sent as a compare-and-swap guard. |
 | `delete`, `archive`, `unarchive`, `read` | `ref` (`read` also `include_distrusted`) | Act on a note. |
 | `search` | `q`, `id`, `limit`, `include_distrusted`, `namespace` | Search, best first. |
