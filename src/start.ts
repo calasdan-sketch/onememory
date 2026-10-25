@@ -9,6 +9,7 @@
 // has an MCP endpoint there, not a dead port.
 
 import "./quiet-sqlite.js"; // first: hide the node:sqlite ExperimentalWarning
+import "./legacy-env.js"; // second: read the old CLAUDE_BRIDGE_* variables as ONEMEMORY_*
 import { Store } from "./store.js";
 import { createApiServer } from "./api.js";
 import { createMcpHttpServer } from "./mcp-http.js";

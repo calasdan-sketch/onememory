@@ -2,6 +2,7 @@
 // MCP server, and the HTTP/SSE MCP server so all three point at the same
 // state file and accept the same token.
 
+import "./legacy-env.js"; // first: CLAUDE_BRIDGE_* (the old name) are read as ONEMEMORY_*
 import { randomBytes } from "node:crypto";
 import {
   chmodSync,

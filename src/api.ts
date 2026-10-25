@@ -96,7 +96,7 @@ import {
 } from "./tasks.js";
 import { ackChanges } from "./changes.js";
 import { SupersedeError, supersedePreview, supersedeConfirm, supersedeUndo, noteHistory, restoreVersion, purgeNoteHistory, type Caller } from "./supersede.js";
-import { assertPlainWriteTags } from "./reserved-tags.js";
+import { assertPlainWriteTags, assertReviewedTag } from "./reserved-tags.js";
 import { waitForChanges, parseWait, WaitBusyError } from "./change-wait.js";
 import type { LintFinding } from "./lint.js";
 
@@ -510,6 +510,7 @@ export function createApiServer(
           // is untrusted: writes always land in the server-resolved namespace.
           if (nsCtx.active) parsed.namespace = nsCtx.ownNamespace;
           assertPlainWriteTags(parsed.tags);
+          assertReviewedTag(parsed.tags, undefined, isAdmin);
           const warnings: LintFinding[] = [];
           const note = store.create(parsed, { lintWarnings: warnings });
           await maybeEmbed(store, note);
@@ -610,7 +611,11 @@ export function createApiServer(
             sendJson(res, 404, { error: "not found" });
             return;
           }
-          if (parsed && parsed.tags !== undefined) assertPlainWriteTags(parsed.tags, store.read(id)?.tags); // gate-ok: tag-guard lookup only (no content returned)
+          if (parsed && parsed.tags !== undefined) {
+            const currentTags = store.read(id)?.tags; // gate-ok: tag-guard lookup only (no content returned)
+            assertPlainWriteTags(parsed.tags, currentTags);
+            assertReviewedTag(parsed.tags, currentTags, isAdmin);
+          }
           const warnings: LintFinding[] = [];
           const note = store.update(id, parsed, { lintWarnings: warnings, ...(ifRev !== undefined ? { ifRev } : {}) });
           if (!note) {

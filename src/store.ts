@@ -1428,7 +1428,7 @@ export class Store {
    * copy of the pre-upgrade database next to it: `<db>.pre-v15-backup`. It is a
    * consistent snapshot (VACUUM INTO) still at the OLD schema version, so an
    * older onememory can open it (rollback = stop everything, put this file
-   * back as the database, install the older version). Never overwrites an
+   * back as the database, delete the -wal and -shm files beside it, install the older version). Never overwrites an
    * existing copy, so a second attempt cannot replace the real original.
    * 1.3.x named its copy `.pre-v13-backup`; that file is left alone.
    * The copy is REQUIRED: when it cannot be made (no room on the disk, a failed or unverifiable copy) the upgrade does
@@ -1560,7 +1560,7 @@ export class Store {
       const nowHave = Number((this.db.prepare("SELECT COUNT(*) AS c FROM notes").get() as { c: number }).c);
       console.error(
         `[onememory] upgrading the database from schema v${from} to v${SCHEMA_VERSION}; the original was copied to ${dest} ` +
-          "(to roll back: stop every onememory process, MOVE that file over the database, install the older version). " +
+          "(to roll back: stop every onememory process, MOVE that file over the database, DELETE the database's -wal and -shm files next to it, then install the older version). " +
           "It holds your notes as they were before the upgrade, including any you later delete or forget: remove it once you are happy " +
           "(`onememory backup --prune-premigration`)."
       );

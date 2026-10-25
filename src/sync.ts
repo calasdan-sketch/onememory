@@ -253,7 +253,7 @@ function claimNames(raw: string): string[] {
 export function renderNoteFile(
   note: NoteRecord,
   identity: { origin: string; id: number },
-  extra: { distrusted?: boolean } = {}
+  extra: { distrusted?: boolean; foreign?: boolean } = {}
 ): string {
   const fm: Record<(typeof KEYS)[number], unknown> = {
     id: identity.id,
@@ -265,7 +265,9 @@ export function renderNoteFile(
     created_at: note.created_at,
     updated_at: note.updated_at,
     rev: note.rev,
-    origin_writer: note.writer_id || note.written_by || "",
+    // A note that came from another computer keeps the writer its file came with. Writing this computer's importer
+    // name instead made every computer rewrite every file on every sync (endless commits).
+    origin_writer: extra.foreign ? note.imported_written_by || "" : note.writer_id || note.written_by || "",
     hash: contentHash(note),
   };
   const lines = KEYS.map((k) => `${k}: ${JSON.stringify(fm[k])}`);
@@ -438,7 +440,7 @@ export function exportMarkdown(
     const base = store.syncBase(note.id);
     exported.set(note.id, [base, hash]);
     try {
-      const text = renderNoteFile(note, identity, { distrusted: marked.has(note.id) });
+      const text = renderNoteFile(note, identity, { distrusted: marked.has(note.id), foreign: identity.origin !== self });
       const current = safeRead(dir, path);
       if (current === text) {
         store.setSyncBase(note.id, hash);

@@ -36,7 +36,7 @@ import {
 import { ackChanges } from "./changes.js";
 import { supersedePreview, supersedeConfirm, supersedeUndo, noteHistory, restoreVersion, purgeNoteHistory, SupersedeError, type Caller } from "./supersede.js";
 import { runnerStatus } from "./liveness.js";
-import { assertPlainWriteTags } from "./reserved-tags.js";
+import { assertPlainWriteTags, assertReviewedTag } from "./reserved-tags.js";
 import { waitForChanges, parseWait, WAIT_MAX_SECONDS, WAIT_RECOMMENDED_SECONDS } from "./change-wait.js";
 import { type Scope, PACKAGE_VERSION } from "./config.js";
 export { PACKAGE_VERSION };
@@ -384,7 +384,11 @@ export function createMcpServer(
         const denied = denyIfUnder("write");
         if (denied) return errorResult(denied);
         // task / handoff / task.* tags belong to task_put and session_handoff.
-        if (tags !== undefined) assertPlainWriteTags(tags, id !== undefined ? store.read(id)?.tags : undefined); // gate-ok: tag-guard lookup only (no content returned)
+        if (tags !== undefined) {
+          const currentTags = id !== undefined ? store.read(id)?.tags : undefined; // gate-ok: tag-guard lookup only (no content returned)
+          assertPlainWriteTags(tags, currentTags);
+          assertReviewedTag(tags, currentTags, false);
+        }
         if (id !== undefined) {
           // When namespace resolution is active the model-supplied namespace
           // is dropped entirely (the note keeps its existing namespace), and

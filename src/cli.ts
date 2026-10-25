@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import "./quiet-sqlite.js"; // first: hide the node:sqlite ExperimentalWarning
+import "./legacy-env.js"; // second: read the old CLAUDE_BRIDGE_* variables as ONEMEMORY_*
 import readline from "node:readline";
+import { fileURLToPath } from "node:url";
 import { setProcessWriter } from "./actor.js";
 // onememory CLI: one command to run, check, or wire up the bridge.
 //   onememory [start]   start the API + dashboard AND MCP-over-HTTP (default)
@@ -22,7 +24,12 @@ function usage(): void {
       "  doctor    Check Node, database, token, namespace config, and the recall hook.",
       "            When: something isn't working, or after changing config.",
       "  init      Print the config snippet to wire onememory into your agent.",
-      "            When: first-time setup of a new agent client.",
+      "            When: you want to see the config before using it, or to copy it by hand.",
+      "  setup [--dry-run] [--yes] [--only claude-code,claude-desktop,cursor] [--project] [--hook|--no-hook] [--db <file>] [--undo]",
+      "            Connect onememory to Claude Code / Claude Desktop / Cursor for you. Shows the plan and the exact lines it will",
+      "            change, saves a backup of each file first, writes only after you type y. An old \"claude-bridge\" entry is offered",
+      "            for migration with your data kept. --dry-run only shows; --undo puts back what it changed.",
+      "            When: first install (npx onememory-mcp setup), or moving from claude-bridge.",
       "  reindex   Backfill semantic embeddings for notes missing them.",
       "            When: after enabling embeddings, or after changing the embedding model.",
       "  recall [--limit 10] [--written-by w] [--not-written-by w] [--include-distrusted]",
@@ -92,6 +99,14 @@ function usage(): void {
       "         | export-key --out file | rotate] [--json]   (onememory trust --help)",
       "            The trust policy: writers whose notes are left out of every read (and never run),",
       "            and the other servers whose signed exports an import will believe. See docs/trust.md.",
+      "  sync --git <repo-folder> [--remote name] [--encrypt] [--key-file f] [--dry-run] [--no-push] [--yes]",
+      "            Keep your notes in step across your own computers through a PRIVATE git repository you own: fetch, merge,",
+      "            three-way merge into the database, write back, commit, push. No OneMemory server. --encrypt seals every",
+      "            file before it is committed; the key stays on your computers and never goes in the repository.",
+      "  import --claude [--dry-run] [--yes] [--update] [--project <folder>[,<folder>]] [--namespace ns] [--include-index]",
+      "            Import what Claude Code already remembers: CLAUDE.md files (user, this folder or --project) and auto memory",
+      "            (~/.claude/projects/*/memory). Cut into separate notes at headings, tagged with their source file and project; running",
+      "            it again adds only what is new. Anything that looks like a secret is skipped and never shown. Local only.",
       "  import --dir <path> [--dry-run] [--allow-move]",
       "            Merge Markdown files back: newer side wins, conflicts are",
       "            reported and the losing version is saved under <dir>/.conflicts/.",
@@ -160,6 +175,13 @@ async function doctor(): Promise<void> {
         ? "git checkout with an existing ./data/state.db — kept as-is; set ONEMEMORY_HOME to move it"
         : "default";
   ok(`data dir ${DATA_DIR} (${why})`);
+  const { MAPPED_LEGACY_ENV } = await import("./legacy-env.js");
+  if (MAPPED_LEGACY_ENV.length) {
+    warn(
+      `old-style setting(s) ${MAPPED_LEGACY_ENV.join(", ")} (from claude-bridge) are being read as ONEMEMORY_*; they still work. ` +
+        "Rename them to ONEMEMORY_* when convenient (`onememory setup` does this for an old claude-bridge entry)."
+    );
+  }
   if (insideNodeModules(DB_PATH) || insideNodeModules(DATA_DIR)) {
     warn(
       "your data is inside node_modules — npm update / npx cache cleanup will delete it. " +
@@ -326,7 +348,7 @@ async function doctor(): Promise<void> {
     const entries = parsed?.hooks?.SessionStart;
     const wired =
       Array.isArray(entries) &&
-      JSON.stringify(entries).includes("onememory recall");
+      /(onememory|cli\.js)[\s\S]{0,60}\brecall\b/.test(JSON.stringify(entries));
     if (wired) {
       ok("SessionStart hook wired in ~/.claude/settings.json");
     } else {
@@ -441,6 +463,7 @@ async function recall(): Promise<void> {
       a.startsWith("-") &&
       !a.startsWith("--budget-ms") &&
       !a.startsWith("--limit") &&
+      !a.startsWith("--db") &&
       !a.startsWith("--written-by") &&
       !a.startsWith("--not-written-by") &&
       a !== "--include-distrusted"
@@ -468,6 +491,7 @@ async function recall(): Promise<void> {
       writtenBy: flag("--written-by"),
       notWrittenBy: flag("--not-written-by"),
       includeDistrusted: args.includes("--include-distrusted"),
+      ...(flag("--db") ? { dbPath: flag("--db") } : {}),
     })
   );
   process.exit(0);
@@ -806,10 +830,10 @@ function parseFlags(
       }
     } else if (name && spec.bools.includes(name)) {
       flags[name] = true;
-    } else if (a.startsWith("-")) {
+    } else if (a.startsWith("--") || (a.startsWith("-") && a.length === 2)) {
       console.error(`Unknown option: ${a}`);
       process.exit(1);
-    } else rest.push(a);
+    } else rest.push(a); // a base64url key id may start with a single "-"; that is a value, not an option
   }
   return { flags, rest };
 }
@@ -1142,9 +1166,25 @@ async function importCmd(): Promise<void> {
   const { Store, ValidationError } = await import("./store.js");
   const { importMarkdown } = await import("./sync.js");
   const { flags } = parseFlags(process.argv.slice(3), {
-    values: ["dir", "file"],
-    bools: ["dry-run", "json", "allow-move", "dedupe", "require-attestation"],
+    values: ["dir", "file", "project", "namespace"],
+    bools: ["dry-run", "json", "allow-move", "dedupe", "require-attestation", "claude", "yes", "update", "include-index"],
   });
+  if (flags.claude === true) {
+    const { runClaudeImport } = await import("./claude-import.js");
+    const { realEnv } = await import("./setup.js");
+    const { PACKAGE_VERSION } = await import("./config.js");
+    const e = realEnv(PACKAGE_VERSION, fileURLToPath(import.meta.url));
+    process.exitCode = await runClaudeImport(e, terminalIO(), {
+      dryRun: flags["dry-run"] === true,
+      yes: flags.yes === true,
+      update: flags.update === true,
+      projects: (str(flags.project) ?? "").split(",").map((x) => x.trim()).filter(Boolean),
+      namespace: str(flags.namespace),
+      includeIndex: flags["include-index"] === true,
+      dbPath: DB_PATH,
+    });
+    return;
+  }
   if (str(flags.file)) {
     await importJsonFile(str(flags.file)!, flags["dedupe"] === true, flags.json === true, flags["require-attestation"] === true);
     return;
@@ -1741,6 +1781,83 @@ async function supersedeCmd(kind: "supersede" | "history"): Promise<void> {
 }
 
 /** TTY yes/no prompt; anything but y/yes aborts. */
+function terminalIO(): import("./setup.js").SetupIO {
+  return {
+    out: (l) => console.log(l),
+    err: (l) => console.error(l),
+    interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+    ask: (prompt) =>
+      new Promise((resolve) => {
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        rl.question(prompt, (a: string) => {
+          rl.close();
+          resolve(a);
+        });
+      }),
+  };
+}
+
+// `onememory sync --git <repo>`: see sync-git.ts.
+async function syncCmd(): Promise<void> {
+  const { flags } = parseFlags(process.argv.slice(3), {
+    values: ["git", "remote", "key-file"],
+    bools: ["encrypt", "dry-run", "no-push", "yes"],
+  });
+  if (!str(flags.git)) {
+    console.error("Usage: onememory sync --git <repo-folder> [--remote name] [--encrypt] [--key-file f] [--dry-run] [--no-push] [--yes]");
+    process.exit(1);
+  }
+  const { DB_PATH, DATA_DIR } = await import("./config.js");
+  const { runGitSync } = await import("./sync-git.js");
+  const io = terminalIO();
+  process.exitCode = await runGitSync(io, {
+    repo: str(flags.git)!,
+    remote: str(flags.remote),
+    encrypt: flags.encrypt === true,
+    keyFile: str(flags["key-file"]),
+    dryRun: flags["dry-run"] === true,
+    noPush: flags["no-push"] === true,
+    yes: flags.yes === true,
+    dataDir: DATA_DIR,
+    dbPath: DB_PATH,
+    env: process.env,
+  });
+}
+
+// `onememory setup`: see setup.ts.
+async function setupCmd(): Promise<void> {
+  const { runSetup, realEnv, DEFAULT_OPTIONS } = await import("./setup.js");
+  const { flags } = parseFlags(process.argv.slice(3), {
+    values: ["only", "db", "command"],
+    bools: ["dry-run", "yes", "undo", "hook", "no-hook", "project", "no-test-note", "no-doctor", "force-empty"],
+  });
+  const command = str(flags.command) ?? "auto";
+  if (!["auto", "node", "npx"].includes(command)) {
+    console.error("--command must be auto, node or npx");
+    process.exit(1);
+  }
+  if (flags.hook === true && flags["no-hook"] === true) {
+    console.error("Choose one of --hook and --no-hook");
+    process.exit(1);
+  }
+  const { PACKAGE_VERSION } = await import("./config.js");
+  const e = realEnv(PACKAGE_VERSION, fileURLToPath(import.meta.url));
+  process.exitCode = await runSetup(e, terminalIO(), {
+    ...DEFAULT_OPTIONS,
+    dryRun: flags["dry-run"] === true,
+    yes: flags.yes === true,
+    undo: flags.undo === true,
+    hook: flags.hook === true ? "yes" : flags["no-hook"] === true ? "no" : "ask",
+    project: flags.project === true,
+    noTestNote: flags["no-test-note"] === true,
+    noDoctor: flags["no-doctor"] === true,
+    forceEmpty: flags["force-empty"] === true,
+    only: str(flags.only)?.split(",").map((x) => x.trim()).filter(Boolean),
+    db: str(flags.db),
+    command: command as "auto" | "node" | "npx",
+  });
+}
+
 function askYesNo(prompt: string): Promise<boolean> {
   return new Promise((resolve) => {
     const rl = readline.createInterface({
@@ -1756,6 +1873,15 @@ function askYesNo(prompt: string): Promise<boolean> {
 
 async function main(): Promise<void> {
   const cmd = process.argv[2] || "start";
+  // Old Node: say so in plain words BEFORE anything loads node:sqlite (which would crash with a stack trace).
+  if (Number(process.versions.node.split(".")[0]) < 24 && !["help", "--help", "-h"].includes(cmd)) {
+    console.error(
+      `OneMemory needs Node.js 24 or newer, and this computer has Node ${process.versions.node}.\n` +
+        "  Fix: install Node 24 (https://nodejs.org), open a NEW terminal, check with:  node -v\n" +
+        "  Nothing was changed. (No Node 24? Docker works too: see INSTALL.md.)"
+    );
+    process.exit(1);
+  }
   if (cmd === "--version" || cmd === "-v" || cmd === "version") {
     const { PACKAGE_VERSION } = await import("./config.js");
     console.log(PACKAGE_VERSION);
@@ -1763,7 +1889,9 @@ async function main(): Promise<void> {
   }
   // Move 1.0.x state out of the package before anything opens the DB.
   // (`bench` runs on a throwaway store and must never touch the real data directory.)
-  if (!["help", "--help", "-h", "init", "bench"].includes(cmd)) (await import("./config.js")).prepareDataDir();
+  // A dry run of `import --claude` or `sync` must not create anything, not even the data folder.
+  const dry = process.argv.includes("--dry-run") && ((cmd === "import" && process.argv.includes("--claude")) || cmd === "sync");
+  if (!dry && !["help", "--help", "-h", "init", "bench", "setup"].includes(cmd)) (await import("./config.js")).prepareDataDir();
   // Fixed writer marker for notes this process writes with no token behind
   // them (written_by): the long-running server's own jobs, the stdio MCP
   // server, or an `onememory ...` command run by the machine owner.
@@ -1784,6 +1912,12 @@ async function main(): Promise<void> {
       break;
     case "init":
       await init();
+      break;
+    case "setup":
+      await setupCmd();
+      break;
+    case "sync":
+      await syncCmd();
       break;
     case "reindex":
       await reindex();
