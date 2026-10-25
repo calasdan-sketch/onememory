@@ -883,7 +883,12 @@ describe("backup: --include-attest-key", () => {
       const readme = files2.find((f) => /README/i.test(f));
       assert.match(readFileSync(join(o2, readme!), "utf8"), /attest/i);
       void mkdirSync;
-      assert.equal(peekSigningKey(join(dir, "db"))?.keyId, new Store(path).peekIdentity().key_id);
+      const reopened = new Store(path);
+      try {
+        assert.equal(peekSigningKey(join(dir, "db"))?.keyId, reopened.peekIdentity().key_id);
+      } finally {
+        reopened.close(); // Windows cannot delete a directory that holds an open database
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -1356,7 +1356,8 @@ export class Store {
           for (let i = 2; existsSync(kept); i++) kept = `${dest}-${stamp}-${i}`;
           renameSync(dest, kept);
           console.error(`[onememory] the existing pre-upgrade copy held ${check.notes} notes but the database now holds ${have}; it was kept as ${kept} and a fresh copy is made.`);
-        } else if (check.kind === "empty" || check.kind === "garbage") {
+        } else if ((check.kind === "empty" || check.kind === "garbage") && statSync(dest).isFile()) {
+          // (A directory or other non-regular entry is never deleted here, whatever the platform says about opening it: it goes to the aside branch.)
           // Positively known to be worthless (zero bytes, not a database, no schema): the only case where a copy is deleted.
           console.error(`[onememory] the existing pre-upgrade copy ${dest} is not usable (${check.reason}); replacing it.`);
           unlinkSync(dest);
@@ -1482,7 +1483,10 @@ export class Store {
     // not be judged ("unreadable": permissions, a busy file, a failed integrity check). Only the first two may be deleted.
     let db: DatabaseSync | null = null;
     try {
-      if (statSync(path).size === 0) return { ok: false, reason: "the file is empty", kind: "empty" };
+      const st = statSync(path);
+      // A directory (Windows reports size 0 for one) or any other non-regular entry is never "empty": it cannot be judged.
+      if (!st.isFile()) return { ok: false, reason: "it is not a regular file", kind: "unreadable" };
+      if (st.size === 0) return { ok: false, reason: "the file is empty", kind: "empty" };
       db = new DatabaseSync(path, { readOnly: true });
       const version = Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
       if (version < 1) return { ok: false, reason: "no schema version (an incomplete copy)", kind: "garbage" };
