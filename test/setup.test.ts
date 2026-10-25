@@ -3,7 +3,7 @@ import { test, describe, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, lstatSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import {
@@ -109,7 +109,7 @@ describe("setup: finding the apps", () => {
   });
   test("CLAUDE_CONFIG_DIR moves the Claude Code config", () => {
     const s = sandbox({}, { CLAUDE_CONFIG_DIR: "/tmp/elsewhere" });
-    assert.equal(detectClients(s.e).find((x) => x.id === "claude-code")!.file, join("/tmp/elsewhere", ".claude.json"));
+    assert.equal(detectClients(s.e).find((x) => x.id === "claude-code")!.file, join(resolve("/tmp/elsewhere"), ".claude.json"));
   });
   test("an app that is not installed is not touched; naming it creates its config", async () => {
     const s = sandbox();
