@@ -5,9 +5,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isInside, openFile, runGitSync, safeRelPath, sealFile, syncKeyPath, type GitSyncOptions } from "../src/sync-git.js";
+import { blobName, isInside, openFile, runGitSync, safeRelPath, sealFile, syncKeyPath, type GitSyncOptions } from "../src/sync-git.js";
 import { Store } from "../src/store.js";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 const haveGit = spawnSync("git", ["--version"]).status === 0;
 const roots: string[] = [];
@@ -335,7 +335,7 @@ describe("sync --git: the sealed-file format", () => {
   const key = randomBytes(32);
   test("sealing and opening round-trips; the name is bound to the path", () => {
     const blob = sealFile("default/note--1.md", "hello", key);
-    const name = (blob && require_name("default/note--1.md"));
+    const name = (blob && blobName("default/note--1.md", key));
     const opened = openFile(name, blob, key);
     assert.deepEqual(opened, { rel: "default/note--1.md", text: "hello" });
   });
@@ -343,9 +343,15 @@ describe("sync --git: the sealed-file format", () => {
     const blob = sealFile("a/b.md", "x", key);
     assert.throws(() => openFile("0".repeat(32) + ".enc", blob, key));
   });
+  test("file names depend on the key, so a known note path cannot be recognised from the repository", () => {
+    const k2 = randomBytes(32);
+    assert.notEqual(blobName("a/b.md", key), blobName("a/b.md", k2));
+    assert.notEqual(blobName("a/b.md", key), createHash("sha256").update("a/b.md").digest("hex").slice(0, 32) + ".enc");
+    assert.match(blobName("a/b.md", key), /^[0-9a-f]{32}\.enc$/);
+  });
   test("a different key will not open it", () => {
     const blob = sealFile("a/b.md", "x", key);
-    assert.throws(() => openFile(require_name("a/b.md"), blob, randomBytes(32)));
+    assert.throws(() => openFile(blobName("a/b.md", key), blob, randomBytes(32)));
   });
   test("paths coming out of a sealed file are checked (no .., absolute, drive letters, dot folders)", () => {
     for (const bad of ["../x.md", "/etc/x.md", "C:/x.md", "a\\b.md", ".conflicts/x.md", "a/b/c/d.md", "x.txt", "", "a//b.md", "a/./b.md"]) assert.equal(safeRelPath(bad), null, bad);
@@ -361,8 +367,3 @@ describe("sync --git: the sealed-file format", () => {
     assert.equal(isInside(join(base, "a"), base), false);
   });
 });
-
-import { createHash } from "node:crypto";
-function require_name(rel: string): string {
-  return createHash("sha256").update(rel).digest("hex").slice(0, 32) + ".enc";
-}

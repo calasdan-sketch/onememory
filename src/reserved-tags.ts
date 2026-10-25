@@ -50,3 +50,18 @@ export function assertPlainWriteTags(next: readonly string[] | undefined, existi
       `Reserved: "task", "handoff" and anything starting with "${RESERVED_TAG_PREFIX}".`
   );
 }
+
+/** The tag the dashboard's Review view sets when an admin accepts a note. Only an admin write may add or remove it. */
+export const REVIEWED_TAG = "reviewed";
+
+/**
+ * A write-scoped token (an agent) must not be able to mark its own note "reviewed" and so slip out of the review queue.
+ * `admin` is true for the admin-scope REST caller (the dashboard); the MCP tools pass false.
+ */
+export function assertReviewedTag(next: readonly string[] | undefined, existing: readonly string[] | undefined, admin: boolean): void {
+  if (next === undefined || admin) return;
+  const want = next.some((t) => t.trim() === REVIEWED_TAG);
+  const have = (existing ?? []).some((t) => t.trim() === REVIEWED_TAG);
+  if (want === have) return;
+  throw new ValidationError(`the tag "${REVIEWED_TAG}" is set only by an administrator accepting a note in the dashboard's Review view`);
+}

@@ -6,6 +6,38 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-10-25
+
+Fixes from an independent review of 1.7.0. **No schema change** (still v15).
+
+### Fixed
+- **`import --claude` could hang** on a Markdown line such as `# a` followed by thousands of spaces (a regular expression that backtracked). Headings
+  are now found with plain string steps (lines over 500 characters are text), HTML comments are removed in one pass, and every pattern on the
+  import, setup, linter and secret-masking paths was run against 1 MB hostile lines with time limits in the tests.
+- **`sync --git --dry-run` created things**: it opened the database (making the data folder and possibly running the one-way upgrade). It now only
+  looks; an old or missing database is not opened.
+- **Endless sync commits with two computers**: each computer rewrote every file's `origin_writer` with its own name. A note from another computer
+  now keeps the name its file came with, so once both agree a sync says "nothing new to commit".
+- `import --claude` queued a section the memory linter held again on every run. It now remembers it (`claude-import-held.json` beside the database).
+- Rolling back: the notes on restoring `.pre-v15-backup` now say to also delete `state.db-wal` and `state.db-shm`; `setup --undo` no longer says
+  "your notes were not touched" when an old claude-bridge entry came back after its database was upgraded, and prints the exact steps (and that the old
+  program cannot open an upgraded database).
+- Migration prefers `ONEMEMORY_DB_PATH` over `CLAUDE_BRIDGE_DB_PATH` when an old entry has both (as at run time), and reads old entries that contain
+  comments or trailing commas (otherwise it says plainly how to migrate by hand).
+- Secret detection now catches `Authorization: Bearer <token>`, `Bearer <20+ characters>` and a password written as plain words (`password: correcthorsebatterystaple`).
+- Review queue: only an administrator can add or remove the `reviewed` tag; `import:claude` can no longer be used as a token label; the queue pages
+  through every note instead of the newest 500.
+- Setup refuses to replace an existing 0-byte config file (it may have been cut off while saving); `--force-empty` overrides.
+- The file rename retry is about 2 seconds (about 7 on Windows); the docs said half a minute.
+- Sealed git file names are now a keyed hash (HMAC with the sync key) instead of an unkeyed one, so a known note path cannot be confirmed from the repository.
+  (1.7.0 was not released; repositories sealed by a 1.7.0 build must be sealed again.)
+- `sync --git` refuses a remote whose address has a password or token inside it, and hides `user:pass@` in any address it prints.
+- The `cmd /c npx` note is worded as commonly needed on native Windows and not confirmed by the Claude Code MCP docs.
+
+### Documented
+- Setup's backups and `setup-history.json` can hold the same secrets as your config: `0600` on macOS/Linux, and on Windows they use your profile's
+  normal permissions (docs/live-claude-code.md, section 6).
+
 ## [1.7.0] - 2026-10-25
 
 Easy, safe connection to Claude Code and an easy way in for what Claude Code already knows. **No schema change** (still v15).

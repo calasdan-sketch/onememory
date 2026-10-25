@@ -53,7 +53,7 @@ using `CLAUDE_BRIDGE_*` settings), setup offers to **replace it with `onememory`
 **The database is upgraded the first time it is opened** (the "schema" changes to v15). Before that, a verified safety copy is saved next to
 it as `state.db.pre-v15-backup`, and the upgrade does not run if that copy cannot be made. The upgrade is one-way: an older program cannot open
 the upgraded file. So **close Claude Code, Claude Desktop and anything else that uses the old database before you run setup**. To roll
-back: stop everything, put the `.pre-v15-backup` file back as `state.db`, and run `onememory setup --undo` so the old entry returns.
+back: stop everything, **move** the `.pre-v15-backup` file over `state.db`, **delete `state.db-wal` and `state.db-shm`** next to it (they belong to the upgraded file, and an old program would try to replay them), and run `onememory setup --undo` so the old entry returns. Notes written after the upgrade are not in the safety copy; run `onememory backup --out <folder>` first if you want them. `onememory setup --undo` prints these exact steps when it brings back an old claude-bridge entry whose database was upgraded; it never touches a database itself.
 When you are happy, `onememory backup --prune-premigration` removes the safety copy.
 
 ## 3. Check that it works in live Claude Code
@@ -73,13 +73,14 @@ When you are happy, `onememory backup --prune-premigration` removes the safety c
 | `/mcp` shows onememory as failed | Run the command from the entry yourself: `node "<path to cli.js>" mcp`. It should sit silently waiting (press Ctrl+C). An error there is the real problem. `onememory doctor` checks Node, the database and the token. |
 | onememory is not in `/mcp` at all | Claude Code was still running and rewrote its file. Close it completely, run `onememory setup` again, then open Claude Code. In a project, a `.mcp.json` server must be approved the first time Claude Code asks. |
 | "needs Node.js 24 or newer" | Install Node 24 from nodejs.org, open a **new** terminal, check `node -v`, run setup again. |
-| Windows: a server started through `npx` fails | Windows needs `cmd /c npx ...` in a config file. Setup writes that form for you when it is run through npx. |
+| Windows: a server started through `npx` fails | On native Windows, `npx` is a `.cmd` script, and wrapping it as `cmd /c npx ...` is commonly needed; the Claude Code MCP docs do not say so (checked), so this is not confirmed there. Setup writes that form when it is run through npx; check with `/mcp`. |
 | Windows: path with spaces or a short `PROGRA~1` name | Setup stores the path exactly as it found it and Claude Code starts the program without a shell, so spaces are safe. In a hook, the path is quoted. |
 | "the database is at schema v15 ... newer" | The database came from a newer OneMemory. Install the newest `onememory-mcp`. |
 | An old claude-bridge process still runs | Close Claude Code first. A process of the old program that has the database open will fail once it is upgraded; that is expected. |
 | `Stopped: ... keeps being rewritten by another program` | Close Claude Code (and Claude Desktop), then run setup again. |
-| Rename refused (`EPERM`/`EBUSY`) on Windows | Antivirus or a file indexer had the file open. Setup retries for about half a minute; if it still fails, nothing was changed. |
+| Rename refused (`EPERM`/`EBUSY`) on Windows | Antivirus or a file indexer had the file open. Setup retries for about 2 seconds (about 7 on Windows); if it still fails, nothing was changed. |
 | The hook shows nothing | `onememory doctor` reports whether the hook is wired and whether it runs. Hooks that fail stay silent by design. Check `claude --version` supports `SessionStart` hooks. |
+| `... exists but is completely empty (0 bytes)` | Setup will not replace an empty config file, because a program may have been cut off while saving it. Look for a backup beside it; if you are sure, run setup again with `--force-empty`. |
 | I want it all gone | `onememory setup --undo`; delete `~/.onememory` only if you also want to delete your notes. |
 
 ## 5. Bringing in what Claude Code already remembers
@@ -98,3 +99,14 @@ cut into notes at its `#` and `##` headings. Notes are tagged `claude-import`, w
 left alone unless you pass `--update`. Anything the secret linter flags (API keys, tokens, private keys, long random credentials) is
 skipped; the count is shown but never the text or the heading. `@file` imports inside a file are not followed. A link that leads
 outside the memory folder, or to something that is not a Markdown file, is refused.
+
+## 6. Where secrets can end up, and how to keep them in
+
+- `~/.claude.json` and your other config files may hold tokens (in `env` or headers). Before it changes a file, setup saves a full copy beside
+  it (`.onememory-backup-<time>`), and `~/.onememory/setup-history.json` keeps the **old and new OneMemory entry** so `--undo` can take out only
+  our change. Both can therefore contain the same secrets as your config. On macOS and Linux setup creates them readable by you only (`0600`;
+  the folder `0700`). **On Windows those modes do not apply**: the files get your user folder's normal permissions, so keep them in your own
+  profile, do not sync or share them, and delete old backups once you are happy (`setup --undo` needs the newest one).
+- The diff setup prints hides the value of secret-looking settings and passwords inside URLs.
+- Sealed git sync (`sync --git --encrypt`) names each file with a keyed hash of the note's path, so the repository does not reveal your note
+  titles or let anyone confirm a guessed path. It still shows how many notes you have and when they change; use a private repository.

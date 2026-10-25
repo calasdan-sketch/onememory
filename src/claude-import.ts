@@ -12,8 +12,8 @@
 // Markdown file are not followed, and `@imports` inside a file are not followed (they are counted).
 
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { basename, join, relative, resolve, sep } from "node:path";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { lintContent } from "./lint.js";
 import { LIMITS } from "./security.js";
 import type { SetupEnv, SetupIO } from "./setup.js";
@@ -168,7 +168,41 @@ export function parseFrontmatter(text: string): { fm: Record<string, string>; bo
   return { fm, body: after < 0 ? "" : t.slice(after + 1) };
 }
 
-const HEADING = /^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$/;
+/** Longest line that can be a heading. A longer line is body text, so a hostile file cannot make heading detection slow. */
+const MAX_HEADING_LINE = 500;
+
+/** `# Title` .. `###### Title`, found with plain string steps (no regex that can backtrack). */
+export function parseHeading(line: string): { level: number; text: string } | null {
+  if (line.length > MAX_HEADING_LINE || line.charCodeAt(0) !== 35) return null;
+  let n = 0;
+  while (n < line.length && line.charCodeAt(n) === 35) n++;
+  if (n > 6 || n >= line.length) return null;
+  const sep = line.charCodeAt(n);
+  if (sep !== 32 && sep !== 9) return null;
+  let end = line.length;
+  while (end > n && (line.charCodeAt(end - 1) === 32 || line.charCodeAt(end - 1) === 9)) end--;
+  while (end > n && line.charCodeAt(end - 1) === 35) end--; // optional closing #s
+  while (end > n && (line.charCodeAt(end - 1) === 32 || line.charCodeAt(end - 1) === 9)) end--;
+  let start = n;
+  while (start < end && (line.charCodeAt(start) === 32 || line.charCodeAt(start) === 9)) start++;
+  if (start >= end) return null;
+  return { level: n, text: line.slice(start, end) };
+}
+
+/** Remove <!-- ... --> comments in one pass; an unterminated one is kept as text. */
+export function stripHtmlComments(s: string): string {
+  let out = "";
+  let i = 0;
+  for (;;) {
+    const a = s.indexOf("<!--", i);
+    if (a < 0) break;
+    const b = s.indexOf("-->", a + 4);
+    if (b < 0) break;
+    out += s.slice(i, a);
+    i = b + 3;
+  }
+  return out + s.slice(i);
+}
 
 export function splitSections(markdown: string, fallbackTitle: string): { sections: Section[]; imports: number } {
   const lines = markdown.replace(/^﻿/, "").replace(/\r\n?/g, "\n").split("\n");
@@ -185,11 +219,11 @@ export function splitSections(markdown: string, fallbackTitle: string): { sectio
     }
     if (fence === null) {
       if (/^@\S+/.test(line.trim())) imports++;
-      const m = HEADING.exec(line);
-      if (m && m[1].length <= 2) {
+      const m = parseHeading(line);
+      if (m && m.level <= 2) {
         raw.push(cur);
-        if (m[1].length === 1) h1 = m[2].trim();
-        cur = { level: m[1].length, heading: m[2].trim(), h1: m[1].length === 2 ? h1 : "", lines: [] };
+        if (m.level === 1) h1 = m.text;
+        cur = { level: m.level, heading: m.text, h1: m.level === 2 ? h1 : "", lines: [] };
         continue;
       }
     }
@@ -199,7 +233,7 @@ export function splitSections(markdown: string, fallbackTitle: string): { sectio
   const counts = new Map<string, number>();
   const sections: Section[] = [];
   for (const r of raw) {
-    const body = r.lines.join("\n").replace(/<!--[\s\S]*?-->/g, "").trim();
+    const body = stripHtmlComments(r.lines.join("\n")).trim();
     if (!body) continue;
     const path = r.h1 && r.h1 !== r.heading ? `${r.h1} / ${r.heading}` : r.heading;
     const n = counts.get(path) ?? 0;
@@ -238,8 +272,14 @@ export function chunkBody(body: string, max = LIMITS.body - 2000): string[] {
 const CREDENTIAL_ASSIGNMENT = /(?<![A-Za-z0-9])(?:[A-Za-z0-9]{1,30}[_-]){0,4}(?:pass(?:word|wd|phrase)?|pwd|secret|token|api[_ -]?key|access[_ -]?key|private[_ -]?key|auth(?:orization)?|bearer|credentials?)\b["'`]?[ \t]{0,4}(?::|=|is)[ \t]{0,4}["'`]?(?=[^\s"'`<>]{0,80}\d)(?=[^\s"'`<>]{0,80}[A-Za-z])(?![^\s"'`<>]{0,80}(?:xxx|\*\*\*|example|placeholder|your[_-]|changeme))[^\s"'`<>$]{8,200}/i;
 const URL_PASSWORD = /\b[a-z][a-z0-9+.-]{0,20}:\/\/[^\s/:@]{1,64}:[^\s/@]{3,64}@/i;
 
+// Two more shapes: a Bearer/Basic header value, and a password written as plain words (no digit needed: "correcthorsebatterystaple").
+const NOT_A_PLACEHOLDER = /(?![^\s"'`<>]{0,200}(?:xxx|\*\*\*|example|placeholder|your[_-]|changeme|redacted|\$\{?[A-Za-z_]))/i;
+const AUTH_HEADER = new RegExp("\\bauthorization[ \\t]{0,4}[:=][ \\t]{0,4}[\"'`]?(?:bearer|basic|token)[ \\t]{1,4}" + NOT_A_PLACEHOLDER.source + "[A-Za-z0-9._~+/=-]{16,300}", "i");
+const BEARER_VALUE = new RegExp("\\bbearer[ \\t]{1,4}" + NOT_A_PLACEHOLDER.source + "(?=[A-Za-z0-9._~+/=-]{0,300}\\d)[A-Za-z0-9._~+/=-]{20,300}", "i");
+const PASSWORD_WORDS = new RegExp("(?<![A-Za-z0-9])(?:pass(?:word|wd|phrase)|pwd|secret)\\b[\"'`]?[ \\t]{0,4}[:=][ \\t]{0,4}[\"'`]?" + NOT_A_PLACEHOLDER.source + "[A-Za-z0-9_.@#%^&*+!~-]{12,200}(?![A-Za-z0-9_.@#%^&*+!~-])", "i");
+
 export function looksLikeCredential(text: string): boolean {
-  return CREDENTIAL_ASSIGNMENT.test(text) || URL_PASSWORD.test(text);
+  return CREDENTIAL_ASSIGNMENT.test(text) || URL_PASSWORD.test(text) || AUTH_HEADER.test(text) || BEARER_VALUE.test(text) || PASSWORD_WORDS.test(text);
 }
 
 // ---- candidates --------------------------------------------------------------------------------------------------------------
@@ -255,6 +295,31 @@ export interface Candidate {
   content: string;
   source: string;
   secret: boolean;
+}
+
+// ---- sections the memory linter held: remembered, so a second run does not queue them again ---------------------------
+
+const HELD_FILE = "claude-import-held.json";
+
+function heldPath(dbPath: string): string {
+  return join(dirname(dbPath), HELD_FILE);
+}
+
+export function readHeld(dbPath: string): Set<string> {
+  try {
+    const j = JSON.parse(readFileSync(heldPath(dbPath), "utf8")) as unknown;
+    return new Set(Array.isArray(j) ? j.filter((x): x is string => typeof x === "string" && x.length < 100) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function writeHeld(dbPath: string, held: Set<string>): void {
+  try {
+    writeFileSync(heldPath(dbPath), JSON.stringify([...held].slice(-5000)), { mode: 0o600 });
+  } catch {
+    /* best effort: worst case the section is queued again next time */
+  }
 }
 
 export function sourceKey(loc: string, content: string): string {
@@ -382,6 +447,8 @@ export async function runClaudeImport(e: Pick<SetupEnv, "home" | "env" | "cwd">,
       }
       if (page.notes.length < 500) break;
     }
+    const heldBefore = readHeld(opts.dbPath);
+    let heldSkipped = 0;
     const perFile = new Map<SourceFile, Row>();
     const todo: Array<{ c: Candidate; action: "create" | "refresh"; id?: number }> = [];
     for (const c of candidates) {
@@ -396,6 +463,10 @@ export async function runClaudeImport(e: Pick<SetupEnv, "home" | "env" | "cwd">,
         continue;
       }
       const k = known.get(c.loc);
+      if (!k && heldBefore.has(c.source)) {
+        heldSkipped++; // the linter held this exact text on an earlier run; it stays in `onememory quarantine`
+        continue;
+      }
       if (!k) {
         r.create++;
         todo.push({ c, action: "create" });
@@ -411,6 +482,7 @@ export async function runClaudeImport(e: Pick<SetupEnv, "home" | "env" | "cwd">,
     const tot = rows.reduce((a, r) => ({ s: a.s + r.sections, c: a.c + r.create, same: a.same + r.same, ch: a.ch + r.changed, sec: a.sec + r.secrets }), { s: 0, c: 0, same: 0, ch: 0, sec: 0 });
     io.out(`\n${tot.s} section(s): ${tot.c} new, ${tot.same} already imported, ${tot.ch} changed since, ${tot.sec} skipped because they look like a secret.`);
     if (tot.sec) io.out("  Skipped sections are not stored and not shown. Take the secret out of the file (or keep it in a password manager) and run again.");
+    if (heldSkipped) io.out(`  ${heldSkipped} section(s) were held by the memory linter on an earlier run and are not queued again (see \`onememory quarantine\`; change the text to try again).`);
     if (tot.ch && !opts.update) io.out("  Changed sections were left as they are; add --update to refresh them.");
     if (imports) io.out(`  ${imports} "@file" import line(s) were not followed (the imported file is read only if it is one of the files above).`);
     for (const s of skipped) io.out(`  skipped ${s.display}: ${s.why}`);
@@ -446,10 +518,13 @@ export async function runClaudeImport(e: Pick<SetupEnv, "home" | "env" | "cwd">,
           refreshed++;
         }
       } catch (err) {
-        if ((err as Error).constructor.name === "QuarantinedError") held++;
-        else failed++;
+        if ((err as Error).constructor.name === "QuarantinedError") {
+          held++;
+          heldBefore.add(t.c.source);
+        } else failed++;
       }
     }
+    if (held) writeHeld(opts.dbPath, heldBefore);
     io.out(`\nImported ${created} new note(s)${refreshed ? `, refreshed ${refreshed}` : ""}. They are tagged "${IMPORT_TAG}" and written by "${IMPORT_WRITER}".`);
     if (held) io.out(`${held} section(s) were held by the memory linter (it saw something that reads like an instruction to an AI): see \`onememory quarantine\`.`);
     if (failed) {

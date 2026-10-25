@@ -179,12 +179,14 @@ not touched. A push that loses a race with another computer is retried once afte
 - **Readable or sealed.** Without `--encrypt` the repository holds your notes as readable Markdown (the command asks you to confirm the
   repository is private; from a script pass `--yes`). With `--encrypt` every file is sealed with AES-256-GCM (the same primitives as
   [at-rest encryption](./encryption-retention.md)) before it is committed: the repository holds only opaque file names and ciphertext,
-  not even titles. The sealed text is kept byte-for-byte when a note did not change, so git history stays small.
+  not even titles. File names are a keyed hash (HMAC-SHA-256 with the sync key) of the note's path, so a name cannot be matched to a guessed note title without the key; the number of notes, their approximate sizes and when they change are still visible. (Files sealed by the unreleased 1.7.0 build used an unkeyed hash and are not readable by 1.7.1: seal them again from a plain vault.) The sealed text is kept byte-for-byte when a note did not change, so git history stays small.
 - **The key stays out of the repository.** It is a 32-byte file on your computers: your at-rest key if you use one, otherwise
   `<data folder>/.sync-key`, created on the first `--encrypt` run (or `--key-file`, or `ONEMEMORY_SYNC_KEY_FILE`). A key file inside
   the repository is refused. **Copy the key to your other computers yourself, never through the repository.** A computer without the
   key is told so and does not invent a new one over sealed notes; the wrong key stops everything before the database is changed.
   Lose the key and the sealed copies cannot be read: keep a copy of it somewhere safe, apart from the repository.
+- **Remote addresses.** Sync refuses a remote whose address has a password or token inside it (`https://user:pass@host/...`), because git saves that in `.git/config` in plain text; use a credential helper or an SSH key. Any address in text sync prints has its `user:pass@` part replaced by `***`.
+- **Two computers settle.** A note that came from another computer keeps the writer name its file came with (`origin_writer`), so once both computers agree, a sync commits nothing.
 - **While it runs**, the readable notes of a sealed sync exist only in a temporary folder inside the data folder, removed afterwards.
 - **Conflicts.** A note edited on two computers keeps one version and saves the other (under `<data folder>/sync-conflicts/` for a sealed
   sync, `.conflicts/` otherwise); nothing is lost silently.

@@ -584,3 +584,37 @@ export function opsAreApplied(text: string, ops: readonly Op[]): boolean {
   }
   return true;
 }
+
+/** Parse JSON that may hold // and /* *\/ comments and trailing commas (what Claude Code and editors tolerate). Throws on anything else. */
+export function parseJsonc(text: string): unknown {
+  let out = "";
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i];
+    if (c === '"') {
+      let j = i + 1;
+      while (j < n && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
+      out += text.slice(i, j + 1);
+      i = j + 1;
+    } else if (c === "/" && text[i + 1] === "/") {
+      while (i < n && text[i] !== "\n") i++;
+    } else if (c === "/" && text[i + 1] === "*") {
+      const e = text.indexOf("*/", i + 2);
+      if (e < 0) throw new JsonEditError("unterminated comment");
+      i = e + 2;
+    } else if (c === ",") {
+      let j = i + 1;
+      while (j < n && /\s/.test(text[j])) j++;
+      if (text[j] === "}" || text[j] === "]") i++; // trailing comma
+      else {
+        out += c;
+        i++;
+      }
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return JSON.parse(out.replace(/^\ufeff/, ""));
+}

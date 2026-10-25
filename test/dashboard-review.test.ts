@@ -42,6 +42,12 @@ function page(notes: any[]) {
         store.notes = store.notes.filter((x) => x.id !== Number(m[1]));
         json = { ok: true };
       }
+      const q = /^\/notes\?(.*)$/.exec(path);
+      if (q) {
+        const sp = new URLSearchParams(q[1]);
+        const off = Number(sp.get("offset") ?? 0);
+        json = { notes: store.notes.slice(off, off + Number(sp.get("limit") ?? 50)) };
+      }
       if (path.startsWith("/runner/status")) json = {};
       return { ok: true, status: 200, json: async () => json };
     },
@@ -156,5 +162,26 @@ describe("dashboard review queue against the real REST API", () => {
       await new Promise<void>((r) => server.close(() => r()));
       store.close();
     }
+  });
+});
+
+describe("dashboard review queue: paging", () => {
+  test("a note past the first 500 is still found", async () => {
+    const notes = Array.from({ length: 1203 }, (_, i) => N(i + 1, "cli"));
+    notes.push(N(5000, "agent-x"));
+    const { ctx, calls, el } = page(notes);
+    ctx.loadReview();
+    await settle();
+    await settle();
+    assert.equal(el("count").textContent, "1 to review");
+    assert.ok(calls.filter((c) => c.path.startsWith("/notes?")).length >= 3, "three pages were fetched");
+    assert.match(calls.find((c) => c.path.includes("offset=1000"))?.path ?? "", /limit=500/);
+  });
+  test("exactly 500 notes costs one extra empty page, not a hang", async () => {
+    const { ctx, el } = page(Array.from({ length: 500 }, (_, i) => N(i + 1, "agent-y")));
+    ctx.loadReview();
+    await settle();
+    await settle();
+    assert.equal(el("count").textContent, "500 to review");
   });
 });

@@ -7,7 +7,8 @@
 // ciphertext; the key stays in a file on your computers and is never written inside the repository.
 
 import { spawnSync } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
+import { tmpdir } from "node:os";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { decrypt, encrypt, keyPath } from "./crypto.js";
@@ -39,6 +40,20 @@ export interface GitSyncOptions {
 
 class SyncStop extends Error {}
 
+const URL_USERINFO = /(\b[a-z][a-z0-9+.-]{0,20}:\/\/)[^\s/@'"]{1,200}@/gi;
+
+/** Hide the user:password@ (or token@) part of any address in text that is about to be printed. */
+export function scrubUrls(text: string): string {
+  return text.replace(URL_USERINFO, "$1***@");
+}
+
+/** A remote address with a password or token inside it would be saved in .git/config and echoed by git errors. */
+function addressHasSecret(url: string): boolean {
+  const m = /^([a-z][a-z0-9+.-]{0,20}):\/\/([^\s/@]{1,200})@/i.exec(url.trim());
+  if (!m) return false;
+  return /^(https?|ftps?)$/i.test(m[1]) || m[2].includes(":");
+}
+
 function git(repo: string, args: string[], env: NodeJS.ProcessEnv, input?: string): { ok: boolean; out: string; err: string; code: number | null } {
   const r = spawnSync("git", args, {
     cwd: repo,
@@ -53,7 +68,7 @@ function git(repo: string, args: string[], env: NodeJS.ProcessEnv, input?: strin
 
 function mustGit(repo: string, args: string[], env: NodeJS.ProcessEnv, what: string): string {
   const r = git(repo, args, env);
-  if (!r.ok) throw new SyncStop(`${what} failed: ${r.err || r.out || `git exited with ${r.code}`}`);
+  if (!r.ok) throw new SyncStop(`${what} failed: ${scrubUrls(r.err) || r.out || `git exited with ${r.code}`}`);
   return r.out;
 }
 
@@ -103,8 +118,9 @@ export function isInside(dir: string, file: string): boolean {
 
 // ---- sealed files -------------------------------------------------------------------------------------------------------------
 
-function blobName(rel: string): string {
-  return createHash("sha256").update(rel).digest("hex").slice(0, 32) + ".enc";
+/** The file name is a keyed hash of the note path: without the key it cannot be guessed from known note names. */
+export function blobName(rel: string, key: Buffer): string {
+  return createHmac("sha256", key).update("onememory-git-sync-name|" + rel).digest("hex").slice(0, 32) + ".enc";
 }
 
 /** Relative paths we accept from a decrypted blob: plain Markdown inside the vault, no tricks. */
@@ -118,7 +134,7 @@ export function safeRelPath(p: unknown): string | null {
 }
 
 export function sealFile(rel: string, text: string, key: Buffer): string {
-  const name = blobName(rel);
+  const name = blobName(rel, key);
   return encrypt(JSON.stringify({ p: rel, t: text }), key, `git-sync|${name}`) + "\n";
 }
 
@@ -126,7 +142,7 @@ export function openFile(name: string, blob: string, key: Buffer): { rel: string
   const json = JSON.parse(decrypt(blob.trim(), key, `git-sync|${name}`)) as { p?: unknown; t?: unknown };
   const rel = safeRelPath(json.p);
   if (!rel || typeof json.t !== "string") throw new Error("a sealed file holds an unsafe path");
-  if (blobName(rel) !== name) throw new Error("a sealed file is stored under the wrong name");
+  if (blobName(rel, key) !== name) throw new Error("a sealed file is stored under the wrong name");
   return { rel, text: json.t };
 }
 
@@ -198,6 +214,15 @@ export async function runGitSync(io: GitSyncIO, o: GitSyncOptions): Promise<numb
     const remotes = mustGit(repo, ["remote"], o.env, "listing remotes").split("\n").filter(Boolean);
     const remote = o.remote ?? remotes[0];
     if (o.remote && !remotes.includes(o.remote)) throw new SyncStop(`The repository has no remote called "${o.remote}".`);
+    if (remote) {
+      const u = git(repo, ["remote", "get-url", remote], o.env);
+      if (u.ok && addressHasSecret(u.out)) {
+        throw new SyncStop(
+          `The address of remote "${remote}" has a password or token inside its address. That is saved in plain text in the repository's .git/config. ` +
+            `Change it to an address without one (git remote set-url ${remote} <address>) and let your git credential helper or an SSH key do the signing in. Nothing was changed.`
+        );
+      }
+    }
     const keyFile = o.encrypt ? syncKeyPath(o) : null;
     if (keyFile && isInside(top, keyFile)) throw new SyncStop(`The key file ${keyFile} is inside the repository. A key must never be committed; move it elsewhere (--key-file).`);
 
@@ -216,22 +241,23 @@ export async function runGitSync(io: GitSyncIO, o: GitSyncOptions): Promise<numb
       }
     }
 
-    const { Store } = await import("./store.js");
+    const { Store, SCHEMA_VERSION } = await import("./store.js");
     const { importMarkdown, exportMarkdown } = await import("./sync.js");
 
     if (o.dryRun) {
-      // Look only: merge the vault as it is now into nothing, writing nothing.
+      // Look only. Nothing is created: no data folder, no database, no upgrade of an old database.
+      const have = Store.peekSchemaVersion(o.dbPath);
       let dryDir = vault;
       let cleanup: (() => void) | null = null;
       if (o.encrypt) {
         const key = keyFile ? readKey(keyFile) : null;
-        mkdirSync(o.dataDir, { recursive: true, mode: 0o700 });
-        dryDir = mkdtempSync(join(o.dataDir, ".sync-dry-"));
+        dryDir = mkdtempSync(join(tmpdir(), "onememory-sync-dry-"));
         cleanup = () => rmSync(dryDir, { recursive: true, force: true });
         if (key) decryptInto(vault, dryDir, key);
       }
       try {
-        if (existsSync(dryDir)) {
+        if (!existsSync(dryDir) || listMd(dryDir).length === 0) io.out("  [dry run] the repository has no notes yet; the first sync would export yours.");
+        else if (have === SCHEMA_VERSION) {
           const store = new Store(o.dbPath);
           try {
             const r = await importMarkdown(store, dryDir, { dryRun: true });
@@ -240,11 +266,13 @@ export async function runGitSync(io: GitSyncIO, o: GitSyncOptions): Promise<numb
           } finally {
             store.close();
           }
-        } else io.out("  [dry run] the repository has no notes yet; the first sync would export yours.");
+        } else {
+          io.out(`  [dry run] the repository holds ${listMd(dryDir).length} note file(s). ${have === null ? "Your database does not exist yet" : `Your database is at an older schema (v${have})`}, so I did not open it; the real sync would ${have === null ? "create" : "upgrade (one way, after a safety copy)"} it first.`);
+        }
       } finally {
         cleanup?.();
       }
-      io.out("Dry run: nothing was fetched, merged, written, committed or pushed.");
+      io.out("Dry run: nothing was fetched, merged, written, committed or pushed, and no database or folder was created.");
       return 0;
     }
 
@@ -270,7 +298,7 @@ export async function runGitSync(io: GitSyncIO, o: GitSyncOptions): Promise<numb
             const conflicted = git(repo, ["diff", "--name-only", "--diff-filter=U"], o.env).out.split("\n").filter(Boolean);
             git(repo, ["merge", "--abort"], o.env);
             throw new SyncStop(
-              `git could not merge ${remote}/${branch} on its own (${conflicted.length ? conflicted.slice(0, 5).join(", ") : m.err.split("\n")[0]}). ` +
+              `git could not merge ${remote}/${branch} on its own (${conflicted.length ? conflicted.slice(0, 5).join(", ") : scrubUrls(m.err).split("\n")[0]}). ` +
                 `Nothing was changed in your memory. Resolve it in the repository with git, then run sync again.`
             );
           }
@@ -331,17 +359,17 @@ export async function runGitSync(io: GitSyncIO, o: GitSyncOptions): Promise<numb
           io.out("  another computer pushed in the meantime; merging again.");
           continue;
         }
-        throw new SyncStop(`pushing to ${remote} failed: ${p.err.split("\n").slice(-2).join(" ")}. Your memory is safe and committed locally; fix the connection and run sync again.`);
+        throw new SyncStop(`pushing to ${remote} failed: ${scrubUrls(p.err).split("\n").slice(-2).join(" ")}. Your memory is safe and committed locally; fix the connection and run sync again.`);
       }
       return 0;
     }
     return 0;
   } catch (e) {
     if (e instanceof SyncStop) {
-      io.err("Stopped: " + e.message);
+      io.err("Stopped: " + scrubUrls(e.message));
       return 1;
     }
-    io.err("Stopped: " + (e as Error).message);
+    io.err("Stopped: " + scrubUrls((e as Error).message));
     return 1;
   }
 }
@@ -375,10 +403,10 @@ function writeSealed(vault: string, work: string, key: Buffer, before: Map<strin
   for (const rel of listMd(work)) {
     now.add(rel);
     const text = readFileSync(join(work, ...rel.split("/")), "utf8");
-    if (before.get(rel) === text && existsSync(join(vault, blobName(rel)))) continue;
-    writeFileSync(join(vault, blobName(rel)), sealFile(rel, text, key));
+    if (before.get(rel) === text && existsSync(join(vault, blobName(rel, key)))) continue;
+    writeFileSync(join(vault, blobName(rel, key)), sealFile(rel, text, key));
   }
-  for (const rel of before.keys()) if (!now.has(rel)) rmSync(join(vault, blobName(rel)), { force: true });
+  for (const rel of before.keys()) if (!now.has(rel)) rmSync(join(vault, blobName(rel, key)), { force: true });
 }
 
 function copyTree(from: string, to: string): void {

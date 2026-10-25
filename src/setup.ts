@@ -16,7 +16,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { randomBytes, createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { applyOps, getMember, getPath, JsonEditError, opsAreApplied, parseDoc, type Op } from "./jsonc-edit.js";
+import { applyOps, getMember, getPath, JsonEditError, opsAreApplied, parseDoc, parseJsonc, type Op } from "./jsonc-edit.js";
 
 // ---- environment (injectable, so tests never touch a real configuration) ---------------------------------------------
 
@@ -81,9 +81,14 @@ export interface SetupOptions {
   noDoctor: boolean;
   /** "auto" (default), "node" (absolute node + cli.js) or "npx". */
   command: "auto" | "node" | "npx";
+  /** Replace a config file that exists but is completely empty (0 bytes), which may be a half-written one. */
+  forceEmpty: boolean;
 }
 
-export const DEFAULT_OPTIONS: SetupOptions = { dryRun: false, yes: false, undo: false, hook: "ask", project: false, noTestNote: false, noDoctor: false, command: "auto" };
+export const DEFAULT_OPTIONS: SetupOptions = { dryRun: false, yes: false, undo: false, hook: "ask", project: false, noTestNote: false, noDoctor: false, command: "auto", forceEmpty: false };
+
+const EMPTY_FILE_MSG = (file: string): string =>
+  `${file} exists but is completely empty (0 bytes). A program may have been cut off while saving it, and replacing it could lose settings. Look for a backup next to it, or if you are sure it is empty run setup again with --force-empty.`;
 
 export const CLIENT_IDS = ["claude-code", "claude-desktop", "cursor", "project"] as const;
 export type ClientId = (typeof CLIENT_IDS)[number];
@@ -142,7 +147,8 @@ export function buildServerEntry(e: SetupEnv, opts: Pick<SetupOptions, "command"
   if (useNpx) {
     // Pinned to this version on purpose: a database upgrade is one-way, so it must be a choice, not a side effect of npx.
     const pkg = `onememory-mcp@${e.version}`;
-    // Windows cannot start npx directly from a config file; it needs cmd /c (documented by Claude Code for npx servers).
+    // On native Windows, npx is a .cmd script, so a config usually needs it wrapped as `cmd /c npx`. This is commonly needed;
+    // the Claude Code MCP docs do not state it (checked), so it is not confirmed there. Verify with `/mcp` after setup.
     entry = e.platform === "win32" ? { command: "cmd", args: ["/c", "npx", "-y", pkg, "mcp"] } : { command: "npx", args: ["-y", pkg, "mcp"] };
   } else {
     // Absolute node + absolute cli.js: nothing depends on PATH, and it is the same on every OS.
@@ -193,9 +199,12 @@ export function migrateEntry(e: SetupEnv, opts: Pick<SetupOptions, "command">, o
   const notes: string[] = [];
   const env: Record<string, string> = {};
   const oldEnv = old.env && typeof old.env === "object" ? (old.env as Record<string, unknown>) : {};
+  // A name already in the new style wins over its old-style twin, exactly as at run time (legacy-env.ts).
+  for (const [k, v] of Object.entries(oldEnv)) if (typeof v === "string" && !k.startsWith("CLAUDE_BRIDGE_")) env[k] = v;
   for (const [k, v] of Object.entries(oldEnv)) {
-    if (typeof v !== "string") continue;
-    env[k.startsWith("CLAUDE_BRIDGE_") ? "ONEMEMORY_" + k.slice("CLAUDE_BRIDGE_".length) : k] = v;
+    if (typeof v !== "string" || !k.startsWith("CLAUDE_BRIDGE_")) continue;
+    const nk = "ONEMEMORY_" + k.slice("CLAUDE_BRIDGE_".length);
+    if (!(nk in env)) env[nk] = v;
   }
   let db = env.ONEMEMORY_DB_PATH ?? null;
   if (!db) {
@@ -227,6 +236,8 @@ export interface FileChange {
   lines: string[];
   /** Ops that put things back (recorded for --undo). */
   inverse: Op[];
+  /** Allow replacing an existing 0-byte file (--force-empty). */
+  allowEmpty?: boolean;
 }
 
 export interface SetupPlan {
@@ -261,12 +272,18 @@ export function readTextFile(file: string): string | null {
 }
 
 function safeParseEntry(text: string, node: { start: number; end: number }): Record<string, unknown> | null {
+  const slice = text.slice(node.start, node.end);
+  let v: unknown;
   try {
-    const v = JSON.parse(text.slice(node.start, node.end)) as unknown;
-    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+    v = JSON.parse(slice);
   } catch {
-    return null;
+    try {
+      v = parseJsonc(slice); // comments or trailing commas inside the entry
+    } catch {
+      return null;
+    }
   }
+  return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
 }
 
 interface FoundServer {
@@ -294,6 +311,7 @@ function findServers(text: string, includeProjects: boolean): FoundServer[] {
 
 export function planFile(e: SetupEnv, opts: SetupOptions, target: ClientTarget, shared: { dbs: Set<string> }): { change: FileChange | null; already: string[]; conflicts: string[]; warnings: string[] } {
   const text = readTextFile(target.file);
+  if (text === "" && !opts.forceEmpty) return { change: null, already: [], conflicts: [EMPTY_FILE_MSG(target.file)], warnings: [] };
   const base = text ?? "";
   const already: string[] = [];
   const conflicts: string[] = [];
@@ -309,7 +327,11 @@ export function planFile(e: SetupEnv, opts: SetupOptions, target: ClientTarget, 
   for (const s of servers) {
     const entry = safeParseEntry(base, s);
     if (!entry) {
-      warnings.push(`${target.label}: the entry "${s.name}" is in a form I do not understand; I left it alone`);
+      warnings.push(
+        /bridge/i.test(s.name)
+          ? `${target.label}: the entry "${s.name}" looks like the old claude-bridge, but I could not read it, so I did NOT migrate it and left it alone. By hand: in the file, rename "${s.name}" to "onememory", set its "command" and "args" as shown in docs/live-claude-code.md, and rename its CLAUDE_BRIDGE_* settings to ONEMEMORY_* (same ending). Your data is not touched.`
+          : `${target.label}: the entry "${s.name}" is in a form I do not understand; I left it alone`
+      );
       continue;
     }
     const kind = classifyEntry(s.name, entry);
@@ -345,16 +367,17 @@ export function planFile(e: SetupEnv, opts: SetupOptions, target: ClientTarget, 
     if (opts.db) shared.dbs.add(opts.db);
   }
   if (ops.length === 0) return { change: null, already, conflicts, warnings };
-  return { change: { client: target.id, label: target.label, file: target.file, before: text, ops, lines, inverse }, already, conflicts, warnings };
+  return { change: { client: target.id, label: target.label, file: target.file, before: text, ops, lines, inverse, allowEmpty: opts.forceEmpty }, already, conflicts, warnings };
 }
 
 export const HOOK_MARKER = "recall --budget-ms";
 /** Our own hook: the exact recall command we write, or any command line naming onememory with recall. */
 const HOOK_DETECT = /recall --budget-ms|onememory[^\n]{0,120}\brecall\b/;
 
-export function planHook(e: SetupEnv, opts: SetupOptions, dbForHook?: string): { change: FileChange | null; already: boolean } {
+export function planHook(e: SetupEnv, opts: SetupOptions, dbForHook?: string): { change: FileChange | null; already: boolean; conflict?: string } {
   const file = join(claudeDir(e), "settings.json");
   const text = readTextFile(file);
+  if (text === "" && !opts.forceEmpty) return { change: null, already: false, conflict: EMPTY_FILE_MSG(file) };
   if (text && text.trim()) {
     const doc = parseDoc(text);
     const arr = getPath(doc, ["hooks", "SessionStart"]);
@@ -370,6 +393,7 @@ export function planHook(e: SetupEnv, opts: SetupOptions, dbForHook?: string): {
       ops: [{ op: "append", path: ["hooks"], key: "SessionStart", value: item }],
       lines: ["add a start-of-session hook that shows your recent notes to Claude (your existing hooks stay as they are)"],
       inverse: [{ op: "unappend", path: ["hooks"], key: "SessionStart", marker: HOOK_MARKER }],
+      allowEmpty: opts.forceEmpty,
     },
     already: false,
   };
@@ -380,7 +404,7 @@ export function planHook(e: SetupEnv, opts: SetupOptions, dbForHook?: string): {
 const SECRET_LINE = /("[^"\n]*(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[^"\n]*"\s*:\s*)"[^"\n]*"/gi;
 const PLAIN_ENV_KEY = /_(PATH|HOME|DIR|FILE|PORT|HOST|BIND|TIMEZONE)$/;
 const ENV_STYLE_LINE = /("([A-Z][A-Z0-9_]{2,})"\s*:\s*)"[^"\n]*"/g;
-const URL_CREDS = /(\w+:\/\/[^\s:@/"]+:)[^\s@/"]+@/g;
+const URL_CREDS = /(\b\w{1,20}:\/\/[^\s:@/"]{1,100}:)[^\s@/"]{1,200}@/g;
 
 /** Hide values that could be secrets in a diff shown on screen: secret-looking keys, any ALL_CAPS env value that is not a plain path/port/etc., and user:pass@ in URLs. */
 export function redact(s: string): string {
@@ -439,8 +463,10 @@ function renameWithRetry(from: string, to: string): void {
       return;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (i < 8 && (code === "EPERM" || code === "EBUSY" || code === "EACCES")) {
-        sleepSync(60 * (i + 1));
+      // About 2 seconds elsewhere; about 7 on Windows, where antivirus and indexers hold files longer.
+      const tries = process.platform === "win32" ? 12 : 8;
+      if (i < tries && (code === "EPERM" || code === "EBUSY" || code === "EACCES")) {
+        sleepSync(process.platform === "win32" ? Math.min(100 * (i + 1), 800) : 60 * (i + 1));
         continue;
       }
       throw err;
@@ -501,6 +527,7 @@ export function writeChange(e: SetupEnv, change: FileChange): WrittenChange | nu
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
+    if (buf && buf.length === 0 && !change.allowEmpty) throw new JsonEditError(EMPTY_FILE_MSG(file));
     const current = buf ? buf.toString("utf8") : null;
     if (buf && current !== null && Buffer.from(current, "utf8").compare(buf) !== 0) throw new JsonEditError(`${file} is not valid UTF-8 text; nothing was written`);
     if (current !== null && opsAreApplied(current, change.ops)) return null; // already in place (someone else added it in the meantime)
@@ -553,6 +580,10 @@ export interface HistorySession {
   version: string;
   undone?: boolean;
   changes: WrittenChange[];
+  /** Databases setup opened, with the schema version each had BEFORE (null: none yet), so --undo can say what rolling back needs. */
+  dbs?: Array<{ path: string; before: number | null }>;
+  /** An old claude-bridge entry was replaced in this session. */
+  migratedLegacy?: boolean;
 }
 
 export function historyFile(e: SetupEnv): string {
@@ -571,11 +602,39 @@ export function readHistory(e: SetupEnv): HistorySession[] {
 
 function saveHistory(e: SetupEnv, all: HistorySession[]): void {
   const f = historyFile(e);
-  mkdirSync(dirname(f), { recursive: true });
+  mkdirSync(dirname(f), { recursive: true, mode: 0o700 });
   writeAtomic(f, JSON.stringify(all, null, 2) + "\n", 0o600);
 }
 
-export function undoLast(e: SetupEnv, io: SetupIO): number {
+/**
+ * `--undo` puts the configuration back; it never touches a database. If the old claude-bridge entry came back after the
+ * database was upgraded, that old program cannot open the upgraded file, so say exactly how to go back.
+ */
+async function reportDatabaseAfterUndo(s: HistorySession, io: SetupIO): Promise<void> {
+  const { Store } = await import("./store.js");
+  const upgraded: Array<{ path: string; before: number; now: number }> = [];
+  for (const d of s.dbs ?? []) {
+    const now = Store.peekSchemaVersion(d.path);
+    if (d.before !== null && now !== null && now > d.before) upgraded.push({ path: d.path, before: d.before, now });
+  }
+  if (!s.migratedLegacy || upgraded.length === 0) {
+    io.out("Your notes (the database) were not touched" + (s.migratedLegacy ? " and were not upgraded by setup." : "."));
+    return;
+  }
+  io.out("\nIMPORTANT: your notes were NOT rolled back, only the configuration was.");
+  for (const u of upgraded) {
+    const bak = `${u.path}.pre-v${u.now}-backup`;
+    io.out(`  ${u.path} was upgraded from schema v${u.before} to v${u.now}. The old claude-bridge program cannot open an upgraded database,`);
+    io.out("  so the restored entry will fail until you do ONE of these:");
+    io.out("   A. Keep the new database and use OneMemory:  onememory setup   (it will reconnect you).");
+    io.out(`   B. Go fully back (notes written since the upgrade are lost, so run \`onememory backup --out <folder>\` first if you want them):`);
+    io.out("        1. Close Claude Code and every program that uses the database.");
+    io.out(`        2. Move the safety copy over it:  ${bak}  ->  ${u.path}`);
+    io.out(`        3. Delete  ${u.path}-wal  and  ${u.path}-shm  if they exist (they belong to the upgraded file).`);
+    if (!existsSync(bak)) io.out(`      (I do not see ${bak}; if it was removed, option B is not possible.)`);
+  }
+}
+export async function undoLast(e: SetupEnv, io: SetupIO): Promise<number> {
   const all = readHistory(e);
   const idx = [...all.keys()].reverse().find((i) => !all[i].undone);
   if (idx === undefined) {
@@ -624,7 +683,8 @@ export function undoLast(e: SetupEnv, io: SetupIO): number {
   if (failed === 0) {
     s.undone = true;
     saveHistory(e, all);
-    io.out("Done. Restart Claude Code. Your notes (the database) were not touched.");
+    io.out("Done. Restart Claude Code.");
+    await reportDatabaseAfterUndo(s, io);
     return 0;
   }
   return 1;
@@ -713,7 +773,8 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
   const hookEligible = !!ccFound?.present && (!opts.only || opts.only.includes("claude-code"));
   if (hookEligible && opts.hook !== "no") {
     const ph = planHook(e, opts, primaryDbIfCustom(primaryDb, DB_PATH, opts));
-    if (ph.already) plan.already.push("Claude Code: the start-of-session hook is already installed");
+    if (ph.conflict) plan.conflicts.push(ph.conflict);
+    else if (ph.already) plan.already.push("Claude Code: the start-of-session hook is already installed");
     else if (ph.change) {
       if (opts.hook === "yes") wantHook = true;
       plan.hook = ph.change;
@@ -781,6 +842,8 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
     wantHook = false; // --yes alone never adds a hook; it needs --hook
   }
 
+  const dbsBefore = dbs.map((d) => ({ path: d, before: Store.peekSchemaVersion(d) }));
+  const migratedLegacy = plan.changes.some((c) => c.inverse.some((o) => o.op === "rename"));
   // 1. The database first: if it cannot be opened, no config is touched.
   const storeErr: string[] = [];
   {
@@ -831,7 +894,7 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
     io.err(`Stopped: ${(err as Error).message}`);
     if (written.length) {
       const all = readHistory(e);
-      all.push({ id: stamp(e.now()), at: e.now().toISOString(), version: e.version, changes: written });
+      all.push({ id: stamp(e.now()), at: e.now().toISOString(), version: e.version, changes: written, dbs: dbsBefore, migratedLegacy });
       saveHistory(e, all);
       io.err("What was already written can be undone with: onememory setup --undo");
     }
@@ -839,7 +902,7 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
   }
   if (written.length) {
     const all = readHistory(e);
-    all.push({ id: stamp(e.now()), at: e.now().toISOString(), version: e.version, changes: written });
+    all.push({ id: stamp(e.now()), at: e.now().toISOString(), version: e.version, changes: written, dbs: dbsBefore, migratedLegacy });
     saveHistory(e, all);
   }
 

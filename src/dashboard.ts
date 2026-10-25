@@ -226,7 +226,16 @@ function loadReview(){
   var ns = document.getElementById("ns").value.trim();
   var sel = document.getElementById("rv_writer");
   var writer = sel ? sel.value : "";
-  api("/notes?limit=500" + (ns ? ("&namespace=" + encodeURIComponent(ns)) : "")).then(function(j){
+  // Page through every note (500 at a time, at most 40 pages), so nothing past the first page is missed.
+  var collected = [];
+  function page(offset){
+    return api("/notes?limit=500&offset=" + offset + (ns ? ("&namespace=" + encodeURIComponent(ns)) : "")).then(function(r){
+      var got = r.notes || [];
+      collected = collected.concat(got);
+      return (got.length === 500 && offset < 20000) ? page(offset + 500) : { notes: collected, truncated: got.length === 500 };
+    });
+  }
+  page(0).then(function(j){
     var all = reviewQueue(j.notes || []);
     var writers = {};
     all.forEach(function(n){ writers[n.written_by] = (writers[n.written_by] || 0) + 1; });
@@ -243,6 +252,7 @@ function loadReview(){
     }).join("");
     document.getElementById("list").innerHTML = "<div class='row'><select id='rv_writer' onchange='loadReview()'>"+opts+"</select>"+
       "<span class='muted'>Accept keeps a note and marks it reviewed. Delete removes it.</span></div>" +
+      (j.truncated ? "<p class='muted'>Showing the newest 20,000 notes only.</p>" : "") +
       (rows || "<p class='muted'>Nothing waiting for review.</p>");
   }).catch(function(e){ document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
 }
