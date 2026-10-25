@@ -809,6 +809,9 @@ describe("doctor and the primary token", () => {
     assert.match(noPin.stderr, /--any-server/);
     const add = cli(home, ["trust", "attester-add", k.publicKey, "--server-id", "55555555-5555-4555-8555-555555555555"]);
     assert.equal(add.status, 0, add.stderr);
+    // a key id may begin with "-" (base64url); it is a value, never "Unknown option"
+    const dash = cli(home, ["trust", "attester-revoke", "-Abc123notarealkeyid", "--reason", "x"]);
+    assert.doesNotMatch(dash.stderr, /Unknown option/);
     const rev = cli(home, ["trust", "attester-revoke", k.keyId, "--reason", "leaked"]);
     assert.equal(rev.status, 0, rev.stderr);
     assert.match(rev.stdout, /Revoked key/);

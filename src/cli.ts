@@ -830,10 +830,10 @@ function parseFlags(
       }
     } else if (name && spec.bools.includes(name)) {
       flags[name] = true;
-    } else if (a.startsWith("-")) {
+    } else if (a.startsWith("--") || (a.startsWith("-") && a.length === 2)) {
       console.error(`Unknown option: ${a}`);
       process.exit(1);
-    } else rest.push(a);
+    } else rest.push(a); // a base64url key id may start with a single "-"; that is a value, not an option
   }
   return { flags, rest };
 }
