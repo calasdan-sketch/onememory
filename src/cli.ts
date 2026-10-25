@@ -107,6 +107,10 @@ function usage(): void {
       "            disable  Decrypt every body and remove the key file.",
       "            When: running OneMemory as a shared / multi-agent store.",
       "            See: docs/encryption-retention.md for the real tradeoffs.",
+      "  bench [--json] [--suite name] [--only id] [--seed n] [--dir folder] [--strict-gaps] [--verbose]",
+      "            Run the provenance benchmark on a throwaway store: stale memory, contradiction recovery,",
+      "            permission isolation, provenance retention. Offline, deterministic, exits 1 on a failure.",
+      "            Your own data is never touched. See docs/BENCHMARK.md.",
       "  help      Show this help",
       "",
     ].join("\n")
@@ -1721,7 +1725,8 @@ async function main(): Promise<void> {
     return;
   }
   // Move 1.0.x state out of the package before anything opens the DB.
-  if (!["help", "--help", "-h", "init"].includes(cmd)) (await import("./config.js")).prepareDataDir();
+  // (`bench` runs on a throwaway store and must never touch the real data directory.)
+  if (!["help", "--help", "-h", "init", "bench"].includes(cmd)) (await import("./config.js")).prepareDataDir();
   // Fixed writer marker for notes this process writes with no token behind
   // them (written_by): the long-running server's own jobs, the stdio MCP
   // server, or an `onememory ...` command run by the machine owner.
@@ -1785,6 +1790,11 @@ async function main(): Promise<void> {
     case "encrypt":
       await encryptCmd();
       break;
+    case "bench": {
+      const { benchMain } = await import("./bench/index.js");
+      process.exitCode = await benchMain(process.argv.slice(3));
+      break;
+    }
     case "help":
     case "--help":
     case "-h":

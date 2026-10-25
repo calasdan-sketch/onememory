@@ -1,0 +1,65 @@
+{
+  "id": "C14",
+  "suite": "isolation",
+  "title": "Import can be told to reject unsigned notes",
+  "what": "With require_attestation, a file with no valid signatures is refused or yields nothing: no note enters the tenant.",
+  "actors": {
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    },
+    "ext": {
+      "scope": "write",
+      "server": "other"
+    },
+    "extadmin": {
+      "scope": "admin",
+      "server": "other"
+    }
+  },
+  "needs": [
+    "export_import"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "ext",
+      "ref": "n",
+      "title": "{{proj}} unsigned",
+      "body": "Unsigned {{canX}}."
+    },
+    {
+      "op": "export",
+      "as": "extadmin",
+      "id": "dump"
+    },
+    {
+      "op": "import",
+      "as": "bAdmin",
+      "from": "dump",
+      "id": "imp",
+      "require_attestation": true
+    },
+    {
+      "op": "search",
+      "as": "b1",
+      "q": "{{canX}}",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "hit_count",
+      "step": "s",
+      "desc": "nothing was imported",
+      "is": 0,
+      "metric": "leak"
+    }
+  ]
+}

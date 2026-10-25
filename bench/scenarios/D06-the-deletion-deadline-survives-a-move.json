@@ -1,0 +1,69 @@
+{
+  "id": "D06",
+  "suite": "provenance",
+  "title": "The deletion deadline survives a move",
+  "what": "A note set to be forgotten after 30 days is exported and imported. The deadline must be the same.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    },
+    "importer": {
+      "scope": "admin",
+      "server": "fresh"
+    }
+  },
+  "needs": [
+    "export_import",
+    "list"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} expiring note",
+      "body": "Body {{tok}}.",
+      "forget_after": 30
+    },
+    {
+      "op": "export",
+      "as": "boss",
+      "id": "dump"
+    },
+    {
+      "op": "import",
+      "as": "importer",
+      "from": "dump",
+      "id": "imp"
+    },
+    {
+      "op": "list",
+      "as": "importer",
+      "id": "l"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "write:n",
+      "path": "expires_at",
+      "desc": "the original has a deadline",
+      "present": true
+    },
+    {
+      "check": "field",
+      "step": "l",
+      "path": "expires_at",
+      "desc": "the imported copy has the same deadline",
+      "title": "{{proj}} expiring note",
+      "same_as": {
+        "step": "write:n",
+        "path": "expires_at"
+      },
+      "metric": "field"
+    }
+  ]
+}

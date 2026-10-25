@@ -1,0 +1,83 @@
+{
+  "id": "C10",
+  "suite": "isolation",
+  "title": "Asking for hidden notes is admin-only",
+  "what": "include_distrusted switches the trust list off. A write token must be refused; a pinned admin gets only its own tenant's hidden notes.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "aAdmin": {
+      "scope": "admin",
+      "namespace": "tenantA",
+      "writer": "adminA"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    },
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    }
+  },
+  "needs": [
+    "trust"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "b1",
+      "ref": "bn",
+      "title": "{{proj}} b hidden",
+      "body": "Hidden {{canB}}."
+    },
+    {
+      "op": "distrust",
+      "as": "bAdmin",
+      "writer": "agentB"
+    },
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "an",
+      "title": "{{proj}} a hidden",
+      "body": "Hidden {{canA}}."
+    },
+    {
+      "op": "search",
+      "as": "a1",
+      "q": "{{proj}} hidden",
+      "id": "wr",
+      "include_distrusted": true
+    },
+    {
+      "op": "search",
+      "as": "aAdmin",
+      "q": "{{proj}} hidden",
+      "id": "adm",
+      "include_distrusted": true,
+      "namespace": "tenantB"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "wr",
+      "is": "denied",
+      "desc": "a write token is refused",
+      "metric": "leak"
+    },
+    {
+      "check": "no_text",
+      "step": "adm",
+      "text": "{{canB}}",
+      "desc": "tenant A's admin never sees tenant B's hidden note",
+      "metric": "leak"
+    }
+  ]
+}

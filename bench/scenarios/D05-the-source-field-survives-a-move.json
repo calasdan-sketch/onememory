@@ -1,0 +1,59 @@
+{
+  "id": "D05",
+  "suite": "provenance",
+  "title": "The source field survives a move",
+  "what": "The client-supplied source (where the note came from) is kept on export and import.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    },
+    "importer": {
+      "scope": "admin",
+      "server": "fresh"
+    }
+  },
+  "needs": [
+    "export_import",
+    "list"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} sourced note",
+      "body": "Body {{tok}}.",
+      "source": "claude-desktop {{tok}}"
+    },
+    {
+      "op": "export",
+      "as": "boss",
+      "id": "dump"
+    },
+    {
+      "op": "import",
+      "as": "importer",
+      "from": "dump",
+      "id": "imp"
+    },
+    {
+      "op": "list",
+      "as": "importer",
+      "id": "l"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "l",
+      "path": "source",
+      "desc": "source kept",
+      "title": "{{proj}} sourced note",
+      "equals": "claude-desktop {{tok}}",
+      "metric": "field"
+    }
+  ]
+}

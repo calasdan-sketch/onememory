@@ -6,6 +6,24 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-25
+
+A benchmark for the question "can one agent silently turn a weak guess into shared truth?". Additive only: no
+schema change, no change to any existing result shape or default.
+
+### Added
+- **`onememory bench`** (and `npm run bench`): 75 deterministic, offline, no-model scenarios in four suites, run on a
+  throwaway store through the real REST API (plus the `memory_consolidate` MCP tool for merges). **A** stale memory
+  (stale-hit-rate@1/@5, current-recall@1), **B** contradiction recovery, **C** permission isolation (leakage count,
+  unexpected denials), **D** provenance retention (fields lost). `--json` gives every scenario with expected vs actual;
+  exit 1 on a failure. Never reads or writes your own data (it hides `ONEMEMORY_*`, uses a temporary folder and its own
+  audit log). Scenarios are JSON files in `bench/scenarios/` (shipped in the package), and a small adapter interface
+  (write, update, delete, search, plus actor) lets the same scenarios run against another memory system.
+  See [docs/BENCHMARK.md](./docs/BENCHMARK.md).
+- **Known gaps are recorded, not hidden.** Scenarios that fail because OneMemory lacks the behaviour carry a `known_gap`
+  marker and are listed in the README: `GAP-SUPERSEDE`, `GAP-RECENCY`, `GAP-HISTORY`, `GAP-REST-CAS`, `GAP-CONFIDENCE`.
+  They do not fail the run; a marked scenario that starts to pass does.
+
 ## [1.4.2] - 2026-10-24
 
 A third expert review of 1.4.1 (coding, security, architecture, developer experience, infrastructure) found

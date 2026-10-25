@@ -1,0 +1,50 @@
+{
+  "id": "B06",
+  "suite": "contradiction",
+  "title": "A write token cannot switch the distrust list off for itself",
+  "what": "A hostile note could talk an agent into asking for hidden notes. Only an admin may ask.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "trust"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "mallory",
+      "ref": "n",
+      "title": "{{proj}} secret plan",
+      "body": "Plan {{tok}}."
+    },
+    {
+      "op": "distrust",
+      "as": "boss",
+      "writer": "mallory"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} secret plan",
+      "id": "s",
+      "include_distrusted": true
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "s",
+      "is": "denied",
+      "desc": "a write token asking for include_distrusted is refused",
+      "metric": "silent_overwrite"
+    }
+  ]
+}

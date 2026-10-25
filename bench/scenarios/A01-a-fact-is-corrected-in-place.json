@@ -1,0 +1,63 @@
+{
+  "id": "A01",
+  "suite": "stale",
+  "title": "A fact is corrected in place",
+  "what": "A note is written, then its body is edited to the new value. Searching must show the new value and must no longer find the old one.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    }
+  },
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "Deploy region for {{proj}}",
+      "body": "The {{proj}} service deploys to region {{old}}."
+    },
+    {
+      "op": "update",
+      "as": "alice",
+      "ref": "n",
+      "body": "The {{proj}} service deploys to region {{new}}."
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} deploys region",
+      "id": "now"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{old}}",
+      "id": "old"
+    }
+  ],
+  "expect": [
+    {
+      "check": "fresh_answer",
+      "step": "now",
+      "desc": "Searching the topic returns the note first, and nothing carries the old value",
+      "current": "n",
+      "stale_text": [
+        "{{old}}"
+      ]
+    },
+    {
+      "check": "field",
+      "step": "now",
+      "path": "body",
+      "desc": "the note now says the new value",
+      "of": "n",
+      "includes": "{{new}}"
+    },
+    {
+      "check": "hit_count",
+      "step": "old",
+      "desc": "the old value can no longer be found by searching for it",
+      "is": 0
+    }
+  ]
+}

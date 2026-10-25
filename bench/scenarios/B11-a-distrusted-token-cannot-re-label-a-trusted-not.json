@@ -1,0 +1,73 @@
+{
+  "id": "B11",
+  "suite": "contradiction",
+  "title": "A distrusted token cannot re-label a trusted note",
+  "what": "Mallory is distrusted but her token still works. She must not be able to edit the tags of a note she did not write (that would let her re-label trusted notes).",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "trust",
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} runbook",
+      "body": "Runbook text {{tok}}."
+    },
+    {
+      "op": "distrust",
+      "as": "boss",
+      "writer": "mallory"
+    },
+    {
+      "op": "update",
+      "as": "mallory",
+      "ref": "n",
+      "tags": [
+        "approved"
+      ],
+      "id": "try"
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "n",
+      "id": "after"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "try",
+      "is": [
+        "denied",
+        "not_found",
+        "invalid"
+      ],
+      "desc": "the tag edit is refused",
+      "metric": "silent_overwrite"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "tags",
+      "desc": "the tags are not changed",
+      "not_equals": [
+        "approved"
+      ],
+      "metric": "silent_overwrite"
+    }
+  ]
+}

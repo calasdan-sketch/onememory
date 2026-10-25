@@ -1,0 +1,63 @@
+{
+  "id": "C04",
+  "suite": "isolation",
+  "title": "Deleting another tenant's note by id",
+  "what": "Tenant B's admin tries to delete tenant A's note. Refused, and the note survives.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    },
+    "aAdmin": {
+      "scope": "admin",
+      "namespace": "tenantA",
+      "writer": "adminA"
+    }
+  },
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "n",
+      "title": "{{proj}} contract",
+      "body": "Contract {{canA}}."
+    },
+    {
+      "op": "delete",
+      "as": "bAdmin",
+      "ref": "n",
+      "id": "try"
+    },
+    {
+      "op": "search",
+      "as": "a1",
+      "q": "{{proj}} contract",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "try",
+      "is": [
+        "denied",
+        "not_found"
+      ],
+      "desc": "the cross-tenant delete is refused",
+      "metric": "leak"
+    },
+    {
+      "check": "has",
+      "step": "s",
+      "ref": "n",
+      "desc": "the note is still there",
+      "metric": "leak"
+    }
+  ]
+}

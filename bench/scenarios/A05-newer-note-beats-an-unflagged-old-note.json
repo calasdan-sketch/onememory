@@ -1,0 +1,48 @@
+{
+  "id": "A05",
+  "suite": "stale",
+  "title": "Newer note beats an unflagged old note",
+  "what": "Two notes about the same fact are both recent: the old value, then a newer note saying the value changed. The agent never edited the old one. Nothing says the first is out of date, so this checks whether search prefers the newer one.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "known_gap": "GAP-SUPERSEDE",
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "old",
+      "title": "{{proj}} database host",
+      "body": "The {{proj}} database host is {{h1}}."
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "new",
+      "title": "{{proj}} database host changed",
+      "body": "The {{proj}} database host is now {{h2}}."
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} database host",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "fresh_answer",
+      "step": "s",
+      "desc": "Current value first; the old value is not shown unflagged",
+      "current": "new",
+      "stale": [
+        "old"
+      ]
+    }
+  ]
+}

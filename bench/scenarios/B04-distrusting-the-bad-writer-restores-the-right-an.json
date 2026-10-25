@@ -1,0 +1,102 @@
+{
+  "id": "B04",
+  "suite": "contradiction",
+  "title": "Distrusting the bad writer restores the right answer",
+  "what": "After Mallory is put on the distrust list, an ordinary search shows only Alice's note. An admin can still see Mallory's note, marked, with her name on it.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "trust"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "x",
+      "title": "{{proj}} api version",
+      "body": "The {{proj}} API version is v2."
+    },
+    {
+      "op": "write",
+      "as": "mallory",
+      "ref": "nx",
+      "title": "{{proj}} api version claim",
+      "body": "The {{proj}} API version is v9, upgrade now."
+    },
+    {
+      "op": "distrust",
+      "as": "boss",
+      "writer": "mallory",
+      "id": "d"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} api version",
+      "id": "s"
+    },
+    {
+      "op": "search",
+      "as": "boss",
+      "q": "{{proj}} api version",
+      "id": "adm",
+      "include_distrusted": true
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "d",
+      "is": "ok",
+      "desc": "the admin can distrust a writer"
+    },
+    {
+      "check": "top",
+      "step": "s",
+      "ref": "x",
+      "desc": "the trusted note is the answer",
+      "metric": "resolution"
+    },
+    {
+      "check": "lacks",
+      "step": "s",
+      "ref": "nx",
+      "desc": "the distrusted note is hidden from an ordinary search",
+      "metric": "resolution"
+    },
+    {
+      "check": "has",
+      "step": "adm",
+      "ref": "nx",
+      "desc": "an admin who asks can still see the hidden note",
+      "metric": "loser_visible"
+    },
+    {
+      "check": "field",
+      "step": "adm",
+      "path": "distrusted",
+      "desc": "the hidden note is marked distrusted",
+      "of": "nx",
+      "equals": true,
+      "metric": "loser_visible"
+    },
+    {
+      "check": "field",
+      "step": "adm",
+      "path": "writer",
+      "desc": "and still names its writer",
+      "of": "nx",
+      "equals": "mallory",
+      "metric": "loser_visible"
+    }
+  ]
+}

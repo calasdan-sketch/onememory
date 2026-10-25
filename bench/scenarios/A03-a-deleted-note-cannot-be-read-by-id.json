@@ -1,0 +1,45 @@
+{
+  "id": "A03",
+  "suite": "stale",
+  "title": "A deleted note cannot be read by id",
+  "what": "After a delete, asking for the note directly must say it does not exist (not return a leftover copy).",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "Parking spot {{x}}",
+      "body": "Spot {{x}} belongs to {{who}}."
+    },
+    {
+      "op": "delete",
+      "as": "boss",
+      "ref": "n"
+    },
+    {
+      "op": "read",
+      "as": "alice",
+      "ref": "n",
+      "id": "byid"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "byid",
+      "is": "not_found",
+      "desc": "reading the deleted id says not found"
+    }
+  ]
+}

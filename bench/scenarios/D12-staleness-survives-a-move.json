@@ -1,0 +1,72 @@
+{
+  "id": "D12",
+  "suite": "provenance",
+  "title": "Staleness survives a move",
+  "what": "A note that is 200 days old is exported and imported. It must still read as old (timestamps kept), not as brand new.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    },
+    "importer": {
+      "scope": "admin",
+      "server": "fresh"
+    }
+  },
+  "needs": [
+    "restore",
+    "export_import"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "n",
+      "title": "{{proj}} aged note",
+      "body": "Old body {{tok}}.",
+      "age_days": 200
+    },
+    {
+      "op": "export",
+      "as": "boss",
+      "id": "dump"
+    },
+    {
+      "op": "import",
+      "as": "importer",
+      "from": "dump",
+      "id": "imp"
+    },
+    {
+      "op": "search",
+      "as": "importer",
+      "q": "{{proj}} aged note",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "s",
+      "path": "stale",
+      "desc": "still flagged stale after the move",
+      "title": "{{proj}} aged note",
+      "equals": true,
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "s",
+      "path": "created_at",
+      "desc": "created_at kept",
+      "title": "{{proj}} aged note",
+      "same_as": {
+        "step": "write:n",
+        "path": "created_at"
+      },
+      "metric": "field"
+    }
+  ]
+}

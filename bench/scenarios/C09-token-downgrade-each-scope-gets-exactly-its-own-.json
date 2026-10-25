@@ -1,0 +1,148 @@
+{
+  "id": "C09",
+  "suite": "isolation",
+  "title": "Token downgrade: each scope gets exactly its own actions",
+  "what": "The same agent holds a read token, a write token and an admin token. Read can search but not write; write can write but not delete, export or import; admin can do all of it.",
+  "actors": {
+    "reader": {
+      "scope": "read",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "writer": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "admin": {
+      "scope": "admin",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    }
+  },
+  "needs": [
+    "export_import"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "writer",
+      "ref": "n",
+      "title": "{{proj}} shared doc",
+      "body": "Doc {{canA}}."
+    },
+    {
+      "op": "search",
+      "as": "reader",
+      "q": "{{proj}} shared doc",
+      "id": "rs"
+    },
+    {
+      "op": "write",
+      "as": "reader",
+      "ref": "bad",
+      "title": "{{proj}} by reader",
+      "body": "x",
+      "id": "rw"
+    },
+    {
+      "op": "update",
+      "as": "writer",
+      "ref": "n",
+      "body": "Doc {{canA}} edited.",
+      "id": "wu"
+    },
+    {
+      "op": "delete",
+      "as": "writer",
+      "ref": "n",
+      "id": "wd"
+    },
+    {
+      "op": "export",
+      "as": "writer",
+      "id": "wx"
+    },
+    {
+      "op": "search",
+      "as": "writer",
+      "q": "{{proj}} shared doc",
+      "id": "ws"
+    },
+    {
+      "op": "export",
+      "as": "admin",
+      "id": "ax"
+    },
+    {
+      "op": "import",
+      "as": "admin",
+      "from": "ax",
+      "id": "ai"
+    },
+    {
+      "op": "delete",
+      "as": "admin",
+      "ref": "n",
+      "id": "ad"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "rs",
+      "is": "ok",
+      "desc": "read token can search",
+      "metric": "unexpected_denial"
+    },
+    {
+      "check": "outcome",
+      "step": "rw",
+      "is": "denied",
+      "desc": "read token cannot write",
+      "metric": "leak"
+    },
+    {
+      "check": "outcome",
+      "step": "wu",
+      "is": "ok",
+      "desc": "write token can edit",
+      "metric": "unexpected_denial"
+    },
+    {
+      "check": "outcome",
+      "step": "wd",
+      "is": "denied",
+      "desc": "write token cannot delete",
+      "metric": "leak"
+    },
+    {
+      "check": "outcome",
+      "step": "wx",
+      "is": "denied",
+      "desc": "write token cannot export",
+      "metric": "leak"
+    },
+    {
+      "check": "outcome",
+      "step": "ax",
+      "is": "ok",
+      "desc": "admin token can export",
+      "metric": "unexpected_denial"
+    },
+    {
+      "check": "outcome",
+      "step": "ai",
+      "is": "ok",
+      "desc": "admin token can import",
+      "metric": "unexpected_denial"
+    },
+    {
+      "check": "outcome",
+      "step": "ad",
+      "is": "ok",
+      "desc": "admin token can delete",
+      "metric": "unexpected_denial"
+    }
+  ]
+}

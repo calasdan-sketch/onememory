@@ -1,0 +1,59 @@
+{
+  "id": "B03",
+  "suite": "contradiction",
+  "title": "A trusted correction written as a new note",
+  "what": "Alice says X, Mallory says not-X, the admin adds a third note with the right value. The admin's note should come first and the two older ones should not look equally current.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "known_gap": "GAP-SUPERSEDE",
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "x",
+      "title": "{{proj}} primary region",
+      "body": "Primary region for {{proj}} is east."
+    },
+    {
+      "op": "write",
+      "as": "mallory",
+      "ref": "nx",
+      "title": "{{proj}} primary region claim",
+      "body": "Primary region for {{proj}} is west."
+    },
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "fix",
+      "title": "{{proj}} primary region correction",
+      "body": "Primary region for {{proj}} is east (verified by the admin)."
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} primary region",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "fresh_answer",
+      "step": "s",
+      "desc": "The admin's correction first; Mallory's claim not shown unflagged",
+      "current": "fix",
+      "stale": [
+        "nx"
+      ],
+      "metric": "resolution"
+    }
+  ]
+}

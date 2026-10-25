@@ -1,0 +1,52 @@
+{
+  "id": "A11",
+  "suite": "stale",
+  "title": "Near-duplicate wording, old copy is 200 days old",
+  "what": "Old fact in one wording (200 days old), new fact in different wording. Search must rank the new one first or flag the old one.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "restore"
+  ],
+  "known_gap": "GAP-RECENCY",
+  "steps": [
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "old",
+      "title": "Primary contact for {{proj}}",
+      "body": "The primary contact for {{proj}} is {{p1}}.",
+      "age_days": 200
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "new",
+      "title": "{{proj}} main contact moved",
+      "body": "{{proj}} primary contact changed: it is now {{p2}}."
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} primary contact",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "fresh_answer",
+      "step": "s",
+      "desc": "New contact first; the old one is flagged stale",
+      "current": "new",
+      "stale": [
+        "old"
+      ]
+    }
+  ]
+}

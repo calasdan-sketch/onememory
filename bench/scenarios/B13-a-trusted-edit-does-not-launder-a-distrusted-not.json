@@ -1,0 +1,55 @@
+{
+  "id": "B13",
+  "suite": "contradiction",
+  "title": "A trusted edit does not launder a distrusted note",
+  "what": "Mallory's note is rewritten by the admin. Because the text may still contain her words, the note stays hidden until the rule is removed (documented behaviour).",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "trust"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "mallory",
+      "ref": "n",
+      "title": "{{proj}} vendor list",
+      "body": "Vendors: {{v}}."
+    },
+    {
+      "op": "distrust",
+      "as": "boss",
+      "writer": "mallory"
+    },
+    {
+      "op": "update",
+      "as": "boss",
+      "ref": "n",
+      "body": "Vendors: {{v}} (reviewed)."
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} vendor list",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "lacks",
+      "step": "s",
+      "ref": "n",
+      "desc": "the edited note is still hidden from ordinary searches",
+      "metric": "resolution"
+    }
+  ]
+}

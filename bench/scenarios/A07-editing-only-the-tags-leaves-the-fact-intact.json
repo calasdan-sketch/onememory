@@ -1,0 +1,76 @@
+{
+  "id": "A07",
+  "suite": "stale",
+  "title": "Editing only the tags leaves the fact intact",
+  "what": "A partial update that touches only tags must not wipe or change the body, and must not change who last wrote the content.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} cron schedule",
+      "body": "The {{proj}} backup runs at {{t}} every night."
+    },
+    {
+      "op": "update",
+      "as": "boss",
+      "ref": "n",
+      "tags": [
+        "ops",
+        "{{tag}}"
+      ]
+    },
+    {
+      "op": "read",
+      "as": "alice",
+      "ref": "n",
+      "id": "after"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} backup runs",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "after",
+      "path": "body",
+      "desc": "the body is unchanged",
+      "equals": "The {{proj}} backup runs at {{t}} every night."
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "writer",
+      "desc": "a tag edit does not make the editor the author of the content",
+      "equals": "alice"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "tags",
+      "desc": "the new tags are there",
+      "includes": "ops"
+    },
+    {
+      "check": "fresh_answer",
+      "step": "s",
+      "desc": "The note is still the first hit",
+      "current": "n"
+    }
+  ]
+}

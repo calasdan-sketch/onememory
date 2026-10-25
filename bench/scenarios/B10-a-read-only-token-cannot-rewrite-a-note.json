@@ -1,0 +1,56 @@
+{
+  "id": "B10",
+  "suite": "contradiction",
+  "title": "A read-only token cannot rewrite a note",
+  "what": "The weakest token is refused, and the note is untouched.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "viewer": {
+      "scope": "read"
+    }
+  },
+  "needs": [
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} budget",
+      "body": "Budget is {{v}}."
+    },
+    {
+      "op": "update",
+      "as": "viewer",
+      "ref": "n",
+      "body": "Budget is 0.",
+      "id": "try"
+    },
+    {
+      "op": "read",
+      "as": "alice",
+      "ref": "n",
+      "id": "after"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "try",
+      "is": "denied",
+      "desc": "the update is refused",
+      "metric": "silent_overwrite"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "body",
+      "desc": "the note is unchanged",
+      "equals": "Budget is {{v}}.",
+      "metric": "silent_overwrite"
+    }
+  ]
+}

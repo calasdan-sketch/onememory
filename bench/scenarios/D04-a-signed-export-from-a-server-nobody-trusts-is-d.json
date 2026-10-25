@@ -1,0 +1,83 @@
+{
+  "id": "D04",
+  "suite": "provenance",
+  "title": "A signed export from a server nobody trusts is demoted to a claim",
+  "what": "The signature is there but the receiving admin does not trust the key. The writer survives only as an unverified claim.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    },
+    "importer": {
+      "scope": "admin",
+      "server": "fresh"
+    }
+  },
+  "needs": [
+    "export_import",
+    "attestation",
+    "list"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} untrusted note",
+      "body": "Body {{tok}}."
+    },
+    {
+      "op": "export",
+      "as": "boss",
+      "attest": true,
+      "id": "dump"
+    },
+    {
+      "op": "import",
+      "as": "importer",
+      "from": "dump",
+      "id": "imp"
+    },
+    {
+      "op": "list",
+      "as": "importer",
+      "id": "l"
+    }
+  ],
+  "expect": [
+    {
+      "check": "recoverable",
+      "step": "l",
+      "value": "alice",
+      "desc": "the original writer is still findable, but only as a claim",
+      "title": "{{proj}} untrusted note",
+      "verified_in": [
+        "writer",
+        "attested_writer"
+      ],
+      "claim_in": [
+        "claimed_writer"
+      ],
+      "metric": "field",
+      "is": "claim"
+    },
+    {
+      "check": "field",
+      "step": "l",
+      "path": "attested_writer",
+      "desc": "no verified author",
+      "title": "{{proj}} untrusted note",
+      "present": false
+    },
+    {
+      "check": "field",
+      "step": "l",
+      "path": "imported_unverified",
+      "desc": "flagged unverified",
+      "title": "{{proj}} untrusted note",
+      "equals": true
+    }
+  ]
+}

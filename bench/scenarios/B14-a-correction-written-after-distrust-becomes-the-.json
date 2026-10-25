@@ -1,0 +1,69 @@
+{
+  "id": "B14",
+  "suite": "contradiction",
+  "title": "A correction written after distrust becomes the answer",
+  "what": "Mallory's note is hidden by a distrust rule. The admin writes the right value as a new note: it is what searches return.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "trust"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "mallory",
+      "ref": "bad",
+      "title": "{{proj}} dns server",
+      "body": "DNS server is {{bad}}."
+    },
+    {
+      "op": "distrust",
+      "as": "boss",
+      "writer": "mallory"
+    },
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "fix",
+      "title": "{{proj}} dns server confirmed",
+      "body": "DNS server is {{good}}."
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} dns server",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "top",
+      "step": "s",
+      "ref": "fix",
+      "desc": "the correction is first",
+      "metric": "resolution"
+    },
+    {
+      "check": "fresh_answer",
+      "step": "s",
+      "desc": "no trace of the bad value",
+      "current": "fix",
+      "stale": [
+        "bad"
+      ],
+      "stale_text": [
+        "{{bad}}"
+      ],
+      "metric": "resolution"
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "id": "C15",
+  "suite": "isolation",
+  "title": "The 'what is relevant to this message' lookup stays in the tenant",
+  "what": "Tenant B sends a message full of tenant A's words. Nothing of A's may come back.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    }
+  },
+  "needs": [
+    "recall"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "n",
+      "title": "{{proj}} merger plan",
+      "body": "We plan to acquire {{canA}} next quarter."
+    },
+    {
+      "op": "recall",
+      "as": "b1",
+      "q": "what about the {{proj}} merger plan and {{canA}}?",
+      "id": "r"
+    }
+  ],
+  "expect": [
+    {
+      "check": "no_text",
+      "step": "r",
+      "text": "{{canA}}",
+      "desc": "tenant A's text is not recalled for B",
+      "metric": "leak"
+    }
+  ]
+}

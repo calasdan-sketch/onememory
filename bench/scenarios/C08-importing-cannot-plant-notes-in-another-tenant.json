@@ -1,0 +1,101 @@
+{
+  "id": "C08",
+  "suite": "isolation",
+  "title": "Importing cannot plant notes in another tenant",
+  "what": "Tenant B's admin imports a file whose notes claim namespace tenantA. They must land in tenant B; tenant A sees nothing new.",
+  "actors": {
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    },
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "ext": {
+      "scope": "write",
+      "server": "other"
+    },
+    "extadmin": {
+      "scope": "admin",
+      "server": "other"
+    }
+  },
+  "needs": [
+    "export_import",
+    "list"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "ext",
+      "ref": "n",
+      "title": "{{proj}} outside note",
+      "body": "Outside {{canX}}."
+    },
+    {
+      "op": "export",
+      "as": "extadmin",
+      "id": "dump"
+    },
+    {
+      "op": "import",
+      "as": "bAdmin",
+      "from": "dump",
+      "id": "imp",
+      "tamper": {
+        "field": "namespace",
+        "value": "tenantA"
+      }
+    },
+    {
+      "op": "search",
+      "as": "a1",
+      "q": "{{canX}}",
+      "id": "asA"
+    },
+    {
+      "op": "list",
+      "as": "a1",
+      "id": "listA"
+    },
+    {
+      "op": "search",
+      "as": "bAdmin",
+      "q": "{{canX}}",
+      "id": "asB"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "imp",
+      "is": "ok",
+      "desc": "the import itself works",
+      "metric": "unexpected_denial"
+    },
+    {
+      "check": "hit_count",
+      "step": "asA",
+      "desc": "tenant A finds nothing",
+      "is": 0,
+      "metric": "leak"
+    },
+    {
+      "check": "no_text",
+      "step": "listA",
+      "text": "{{canX}}",
+      "desc": "tenant A's list has no planted note",
+      "metric": "leak"
+    },
+    {
+      "check": "hit_count",
+      "step": "asB",
+      "desc": "tenant B has the imported note",
+      "min": 1,
+      "metric": "unexpected_denial"
+    }
+  ]
+}

@@ -1,0 +1,79 @@
+{
+  "id": "B15",
+  "suite": "contradiction",
+  "title": "A merge cannot absorb a distrusted note into a trusted one",
+  "what": "Merging would hide the trusted text (the merged note carries every source's writers) and delete the trusted original. It must be refused.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "trust",
+    "merge",
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "good",
+      "title": "{{proj}} meeting notes",
+      "body": "Notes by Alice {{tok}}."
+    },
+    {
+      "op": "write",
+      "as": "mallory",
+      "ref": "bad",
+      "title": "{{proj}} meeting notes copy",
+      "body": "Notes by Mallory {{tok}}."
+    },
+    {
+      "op": "distrust",
+      "as": "boss",
+      "writer": "mallory"
+    },
+    {
+      "op": "merge",
+      "as": "boss",
+      "refs": [
+        "good",
+        "bad"
+      ],
+      "ref": "m",
+      "id": "try"
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "good",
+      "id": "after"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "try",
+      "is": [
+        "invalid",
+        "denied"
+      ],
+      "desc": "the merge is refused",
+      "metric": "silent_overwrite"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "body",
+      "desc": "Alice's note survives",
+      "equals": "Notes by Alice {{tok}}.",
+      "metric": "silent_overwrite"
+    }
+  ]
+}

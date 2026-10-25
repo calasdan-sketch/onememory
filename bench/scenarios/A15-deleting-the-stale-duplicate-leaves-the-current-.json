@@ -1,0 +1,61 @@
+{
+  "id": "A15",
+  "suite": "stale",
+  "title": "Deleting the stale duplicate leaves the current note",
+  "what": "Old and new note both exist; the admin deletes the old one. Search returns only the new one.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "old",
+      "title": "{{proj}} office door code",
+      "body": "Door code of {{proj}} office is {{c1}}."
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "new",
+      "title": "{{proj}} office door code changed",
+      "body": "Door code of {{proj}} office is now {{c2}}."
+    },
+    {
+      "op": "delete",
+      "as": "boss",
+      "ref": "old"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} office door code",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "fresh_answer",
+      "step": "s",
+      "desc": "Only the new code remains",
+      "current": "new",
+      "stale": [
+        "old"
+      ],
+      "stale_text": [
+        "{{c1}}"
+      ]
+    },
+    {
+      "check": "hit_count",
+      "step": "s",
+      "desc": "exactly one result",
+      "is": 1
+    }
+  ]
+}

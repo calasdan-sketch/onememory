@@ -1,0 +1,27 @@
+{
+  "GAP-SUPERSEDE": {
+    "title": "A new note does not retire the old one",
+    "summary": "OneMemory has no 'supersedes' link between notes, and search does not prefer the newer of two notes about the same fact. Correcting a note in place works (the old value is gone). Writing a second note and leaving the first alone returns both, in relevance order.",
+    "status": "roadmap"
+  },
+  "GAP-RECENCY": {
+    "title": "A flagged-stale note can still rank above a fresher one",
+    "summary": "Staleness is a flag plus a mild ranking penalty (x0.95 per 90 days). A 200-day-old note whose words match the query better still ranks first; the flag is on it, but the current value is not first.",
+    "status": "roadmap"
+  },
+  "GAP-HISTORY": {
+    "title": "No version history of note bodies",
+    "summary": "An edit replaces the body. The change feed keeps titles, writers and times but not earlier text, so after a bad overwrite (or an overwrite followed by distrusting the overwriter) the trusted original cannot be recovered from OneMemory itself. Backups are the only way back.",
+    "status": "roadmap"
+  },
+  "GAP-REST-CAS": {
+    "title": "REST updates have no compare-and-swap",
+    "summary": "The MCP tool state_write accepts if_rev and refuses an edit made on an out-of-date copy. The REST PUT /notes/:id ignored it, so a stale REST edit silently replaced a newer one.",
+    "status": "roadmap"
+  },
+  "GAP-CONFIDENCE": {
+    "title": "No confidence field",
+    "summary": "A note has no confidence value. A client may send one, but the server drops it silently and nothing can rank, filter or flag notes by how sure the writer was.",
+    "status": "roadmap"
+  }
+}

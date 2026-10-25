@@ -1,0 +1,61 @@
+{
+  "id": "B20",
+  "suite": "contradiction",
+  "title": "Both disputing writers distrusted: no answer rather than a wrong one",
+  "what": "If every source of an answer is distrusted, searches return nothing; they must not fall back to showing either side.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "trust"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "x",
+      "title": "{{proj}} cache ttl",
+      "body": "Cache TTL is 60 seconds {{tok}}."
+    },
+    {
+      "op": "write",
+      "as": "mallory",
+      "ref": "nx",
+      "title": "{{proj}} cache ttl claim",
+      "body": "Cache TTL is 9999 seconds {{tok}}."
+    },
+    {
+      "op": "distrust",
+      "as": "boss",
+      "writer": "alice"
+    },
+    {
+      "op": "distrust",
+      "as": "boss",
+      "writer": "mallory"
+    },
+    {
+      "op": "search",
+      "as": "boss",
+      "q": "{{proj}} cache ttl",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "hit_count",
+      "step": "s",
+      "desc": "nothing is returned",
+      "is": 0,
+      "metric": "resolution"
+    }
+  ]
+}

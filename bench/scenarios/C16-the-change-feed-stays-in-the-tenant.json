@@ -1,0 +1,63 @@
+{
+  "id": "C16",
+  "suite": "isolation",
+  "title": "The change feed stays in the tenant",
+  "what": "Tenant B's admin reads the feed of recent changes. Tenant A's titles must not be in it.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    }
+  },
+  "needs": [
+    "changes"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "n",
+      "title": "{{canA}} confidential title",
+      "body": "body"
+    },
+    {
+      "op": "write",
+      "as": "b1",
+      "ref": "m",
+      "title": "{{proj}} b title",
+      "body": "body"
+    },
+    {
+      "op": "changes",
+      "as": "bAdmin",
+      "id": "feed"
+    }
+  ],
+  "expect": [
+    {
+      "check": "no_text",
+      "step": "feed",
+      "text": "{{canA}}",
+      "desc": "tenant A's titles are not in B's feed",
+      "metric": "leak"
+    },
+    {
+      "check": "contains_text",
+      "step": "feed",
+      "text": "{{proj}} b title",
+      "desc": "B's own change is in the feed",
+      "metric": "unexpected_denial"
+    }
+  ]
+}

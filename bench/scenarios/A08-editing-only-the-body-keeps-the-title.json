@@ -1,0 +1,78 @@
+{
+  "id": "A08",
+  "suite": "stale",
+  "title": "Editing only the body keeps the title",
+  "what": "A partial update with just a new body must keep the title, and the old body text must disappear from search.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    }
+  },
+  "needs": [
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} on-call",
+      "body": "On call this week: {{old}}."
+    },
+    {
+      "op": "update",
+      "as": "alice",
+      "ref": "n",
+      "body": "On call this week: {{new}}."
+    },
+    {
+      "op": "read",
+      "as": "alice",
+      "ref": "n",
+      "id": "after"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{old}}",
+      "id": "olds"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} on call",
+      "id": "now"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "after",
+      "path": "title",
+      "desc": "the title is unchanged",
+      "equals": "{{proj}} on-call"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "body",
+      "desc": "the body is the new one",
+      "equals": "On call this week: {{new}}."
+    },
+    {
+      "check": "hit_count",
+      "step": "olds",
+      "desc": "the old body text is not searchable any more",
+      "is": 0
+    },
+    {
+      "check": "fresh_answer",
+      "step": "now",
+      "desc": "The title still finds the note",
+      "current": "n",
+      "stale_text": [
+        "{{old}}"
+      ]
+    }
+  ]
+}

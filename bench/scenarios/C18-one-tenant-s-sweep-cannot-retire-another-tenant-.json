@@ -1,0 +1,75 @@
+{
+  "id": "C18",
+  "suite": "isolation",
+  "title": "One tenant's sweep cannot retire another tenant's notes",
+  "what": "Tenant A's note is past its deletion deadline. Tenant B's admin runs the sweep. A's note is untouched until A's own admin sweeps.",
+  "actors": {
+    "aAdmin": {
+      "scope": "admin",
+      "namespace": "tenantA",
+      "writer": "adminA"
+    },
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    },
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    }
+  },
+  "needs": [
+    "restore",
+    "retire"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "aAdmin",
+      "ref": "n",
+      "title": "{{proj}} expiring doc",
+      "body": "Doc {{canA}}.",
+      "expires_in_days": -1
+    },
+    {
+      "op": "sweep",
+      "as": "bAdmin",
+      "id": "bs"
+    },
+    {
+      "op": "search",
+      "as": "a1",
+      "q": "{{proj}} expiring doc",
+      "id": "afterB"
+    },
+    {
+      "op": "sweep",
+      "as": "aAdmin",
+      "id": "as"
+    },
+    {
+      "op": "search",
+      "as": "a1",
+      "q": "{{proj}} expiring doc",
+      "id": "afterA"
+    }
+  ],
+  "expect": [
+    {
+      "check": "has",
+      "step": "afterB",
+      "ref": "n",
+      "desc": "still there after the other tenant's sweep",
+      "metric": "leak"
+    },
+    {
+      "check": "lacks",
+      "step": "afterA",
+      "ref": "n",
+      "desc": "gone after its own sweep",
+      "metric": "unexpected_denial"
+    }
+  ]
+}

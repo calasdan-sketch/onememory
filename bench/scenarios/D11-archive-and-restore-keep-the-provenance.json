@@ -1,0 +1,80 @@
+{
+  "id": "D11",
+  "suite": "provenance",
+  "title": "Archive and restore keep the provenance",
+  "what": "A note is archived and restored by an admin. Writer, creator and creation time are exactly as before.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "retire",
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} cycled note",
+      "body": "Body {{tok}}."
+    },
+    {
+      "op": "archive",
+      "as": "boss",
+      "ref": "n"
+    },
+    {
+      "op": "unarchive",
+      "as": "boss",
+      "ref": "n"
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "n",
+      "id": "after"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "after",
+      "path": "writer",
+      "desc": "writer unchanged",
+      "equals": "alice",
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "creator",
+      "desc": "creator unchanged",
+      "equals": "alice",
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "created_at",
+      "desc": "created_at unchanged",
+      "same_as": {
+        "step": "write:n",
+        "path": "created_at"
+      },
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "body",
+      "desc": "body unchanged",
+      "equals": "Body {{tok}}.",
+      "metric": "field"
+    }
+  ]
+}

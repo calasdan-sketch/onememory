@@ -1,0 +1,71 @@
+{
+  "id": "B01",
+  "suite": "contradiction",
+  "title": "Two writers disagree: both notes stay, each with its own writer",
+  "what": "Alice says X, Mallory says not-X, in separate notes. Neither is silently dropped, and each note says who wrote it.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "x",
+      "title": "{{proj}} deploy window",
+      "body": "The {{proj}} deploy window is Tuesday ({{tok}})."
+    },
+    {
+      "op": "write",
+      "as": "mallory",
+      "ref": "nx",
+      "title": "{{proj}} deploy window disputed",
+      "body": "The {{proj}} deploy window is NOT Tuesday, it is Friday ({{tok}})."
+    },
+    {
+      "op": "search",
+      "as": "boss",
+      "q": "{{proj}} deploy window",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "has",
+      "step": "s",
+      "ref": "x",
+      "desc": "Alice's note is returned"
+    },
+    {
+      "check": "has",
+      "step": "s",
+      "ref": "nx",
+      "desc": "Mallory's note is returned"
+    },
+    {
+      "check": "field",
+      "step": "s",
+      "path": "writer",
+      "desc": "Alice's note names Alice",
+      "of": "x",
+      "equals": "alice",
+      "metric": "loser_visible"
+    },
+    {
+      "check": "field",
+      "step": "s",
+      "path": "writer",
+      "desc": "Mallory's note names Mallory",
+      "of": "nx",
+      "equals": "mallory",
+      "metric": "loser_visible"
+    }
+  ]
+}

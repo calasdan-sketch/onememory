@@ -1,0 +1,79 @@
+{
+  "id": "B19",
+  "suite": "contradiction",
+  "title": "Distrusting a claimed writer hides their imported note",
+  "what": "An unverified import claims it came from Mallory. Putting Mallory on the distrust list hides it, because claimed names count as taint.",
+  "actors": {
+    "boss": {
+      "scope": "admin"
+    },
+    "alice": {
+      "scope": "write"
+    },
+    "ext": {
+      "scope": "write",
+      "writer": "mallory",
+      "server": "other"
+    },
+    "extadmin": {
+      "scope": "admin",
+      "server": "other"
+    }
+  },
+  "needs": [
+    "export_import",
+    "trust"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "ext",
+      "ref": "n",
+      "title": "{{proj}} imported claim",
+      "body": "Claim {{tok}}."
+    },
+    {
+      "op": "export",
+      "as": "extadmin",
+      "id": "dump"
+    },
+    {
+      "op": "import",
+      "as": "boss",
+      "from": "dump",
+      "id": "imp"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} imported claim",
+      "id": "before"
+    },
+    {
+      "op": "distrust",
+      "as": "boss",
+      "writer": "mallory"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} imported claim",
+      "id": "after"
+    }
+  ],
+  "expect": [
+    {
+      "check": "hit_count",
+      "step": "before",
+      "desc": "visible before the rule",
+      "min": 1
+    },
+    {
+      "check": "hit_count",
+      "step": "after",
+      "desc": "hidden after the rule",
+      "is": 0,
+      "metric": "resolution"
+    }
+  ]
+}

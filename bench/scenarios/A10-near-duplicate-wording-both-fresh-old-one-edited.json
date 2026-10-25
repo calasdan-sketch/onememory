@@ -1,0 +1,54 @@
+{
+  "id": "A10",
+  "suite": "stale",
+  "title": "Near-duplicate wording, both fresh, old one edited",
+  "what": "The same fact was saved twice in different words. The agent corrects one of them in place and forgets the other. Search should not present the forgotten duplicate as the answer.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "known_gap": "GAP-SUPERSEDE",
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "a",
+      "title": "{{proj}} api base url",
+      "body": "The {{proj}} API base URL is {{u1}}."
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "b",
+      "title": "{{proj}} api endpoint address",
+      "body": "Address of the {{proj}} API endpoint: {{u1}}."
+    },
+    {
+      "op": "update",
+      "as": "alice",
+      "ref": "a",
+      "body": "The {{proj}} API base URL is now {{u2}}."
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} api",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "fresh_answer",
+      "step": "s",
+      "desc": "Corrected note first; the forgotten duplicate with the old URL is flagged or not shown",
+      "current": "a",
+      "stale": [
+        "b"
+      ]
+    }
+  ]
+}

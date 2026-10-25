@@ -1,0 +1,90 @@
+{
+  "id": "D08",
+  "suite": "provenance",
+  "title": "A merge keeps every source's writer and the oldest creation time",
+  "what": "Two notes by different writers are merged by the admin. The merged note lists both writers, keeps the older creation time, and names the admin as the one who merged.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "bob": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "merge",
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "a",
+      "title": "{{proj}} dup one",
+      "body": "Same fact {{tok}}."
+    },
+    {
+      "op": "write",
+      "as": "bob",
+      "ref": "b",
+      "title": "{{proj}} dup one copy",
+      "body": "Same fact {{tok}} also."
+    },
+    {
+      "op": "merge",
+      "as": "boss",
+      "refs": [
+        "a",
+        "b"
+      ],
+      "ref": "m",
+      "id": "mg"
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "m",
+      "id": "after"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "after",
+      "path": "taint",
+      "desc": "Alice is on record",
+      "includes": "alice",
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "taint",
+      "desc": "Bob is on record",
+      "includes": "bob",
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "created_at",
+      "desc": "oldest creation time kept",
+      "same_as": {
+        "step": "write:a",
+        "path": "created_at"
+      },
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "writer",
+      "desc": "the admin who merged is the stamped writer",
+      "equals": "boss",
+      "metric": "field"
+    }
+  ]
+}

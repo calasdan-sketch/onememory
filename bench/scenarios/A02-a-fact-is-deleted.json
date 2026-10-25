@@ -1,0 +1,59 @@
+{
+  "id": "A02",
+  "suite": "stale",
+  "title": "A fact is deleted",
+  "what": "A note is written and then deleted. A search for it must find nothing.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "Wifi password for {{place}}",
+      "body": "The wifi password at {{place}} is {{pw}}."
+    },
+    {
+      "op": "delete",
+      "as": "boss",
+      "ref": "n"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{place}} wifi password",
+      "id": "after"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "delete:n",
+      "is": "ok",
+      "desc": "the admin can delete the note"
+    },
+    {
+      "check": "fresh_answer",
+      "step": "after",
+      "desc": "The deleted value is not returned",
+      "stale": [
+        "n"
+      ],
+      "stale_text": [
+        "{{pw}}"
+      ]
+    },
+    {
+      "check": "hit_count",
+      "step": "after",
+      "desc": "no result at all",
+      "is": 0
+    }
+  ]
+}

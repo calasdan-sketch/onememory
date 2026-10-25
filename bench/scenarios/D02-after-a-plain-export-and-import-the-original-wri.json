@@ -1,0 +1,81 @@
+{
+  "id": "D02",
+  "suite": "provenance",
+  "title": "After a plain export and import the original writer is still named",
+  "what": "A plain export is not signed, so the importing server cannot confirm who wrote a note. By design it stamps the importer as the writer and keeps the file's claim, labelled as a claim. The original name must at least survive as that claim.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    },
+    "importer": {
+      "scope": "admin",
+      "server": "fresh"
+    }
+  },
+  "needs": [
+    "export_import",
+    "list"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} writer note",
+      "body": "Body {{tok}}."
+    },
+    {
+      "op": "export",
+      "as": "boss",
+      "id": "dump"
+    },
+    {
+      "op": "import",
+      "as": "importer",
+      "from": "dump",
+      "id": "imp"
+    },
+    {
+      "op": "list",
+      "as": "importer",
+      "id": "l"
+    }
+  ],
+  "expect": [
+    {
+      "check": "recoverable",
+      "step": "l",
+      "value": "alice",
+      "desc": "the original writer is findable on the imported note",
+      "title": "{{proj}} writer note",
+      "verified_in": [
+        "writer",
+        "attested_writer"
+      ],
+      "claim_in": [
+        "claimed_writer"
+      ],
+      "metric": "field",
+      "is": "claim"
+    },
+    {
+      "check": "field",
+      "step": "l",
+      "path": "writer",
+      "desc": "the importer is the stamped writer (not the claimed one)",
+      "title": "{{proj}} writer note",
+      "equals": "importer"
+    },
+    {
+      "check": "field",
+      "step": "l",
+      "path": "imported_unverified",
+      "desc": "and the note is flagged as arriving unverified",
+      "title": "{{proj}} writer note",
+      "equals": true
+    }
+  ]
+}

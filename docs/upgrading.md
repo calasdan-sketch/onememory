@@ -1,6 +1,6 @@
 # Upgrading from 1.3.x
 
-This page is for an existing 1.3.x install moving to 1.4.x (1.4.2 is the current one). Nothing here is
+This page is for an existing 1.3.x install moving to 1.4.x (1.4.2 is the last 1.4.x; 1.5.0 only adds the benchmark and needs no migration). Nothing here is
 needed for a fresh install.
 
 **EXPERIMENTAL in 1.4.x:** signed attestations, cross-server writer ids, `trust rotate`,

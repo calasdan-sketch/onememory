@@ -1,0 +1,65 @@
+{
+  "id": "B05",
+  "suite": "contradiction",
+  "title": "Removing the distrust rule brings the note back",
+  "what": "Distrust is reversible: undistrusting the writer shows the note again.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "trust"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "mallory",
+      "ref": "n",
+      "title": "{{proj}} release note",
+      "body": "Release note by Mallory {{tok}}."
+    },
+    {
+      "op": "distrust",
+      "as": "boss",
+      "writer": "mallory"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} release note",
+      "id": "hidden"
+    },
+    {
+      "op": "undistrust",
+      "as": "boss",
+      "writer": "mallory"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} release note",
+      "id": "back"
+    }
+  ],
+  "expect": [
+    {
+      "check": "lacks",
+      "step": "hidden",
+      "ref": "n",
+      "desc": "hidden while distrusted"
+    },
+    {
+      "check": "has",
+      "step": "back",
+      "ref": "n",
+      "desc": "visible again after the rule is removed"
+    }
+  ]
+}

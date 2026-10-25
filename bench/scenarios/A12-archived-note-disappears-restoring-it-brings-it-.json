@@ -1,0 +1,62 @@
+{
+  "id": "A12",
+  "suite": "stale",
+  "title": "Archived note disappears; restoring it brings it back",
+  "what": "Archiving is the soft way to retire a fact: it must leave search, and come back only on request.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "retire"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} legacy endpoint",
+      "body": "The old endpoint of {{proj}} is {{u}}."
+    },
+    {
+      "op": "archive",
+      "as": "boss",
+      "ref": "n"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} legacy endpoint",
+      "id": "gone"
+    },
+    {
+      "op": "unarchive",
+      "as": "boss",
+      "ref": "n"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} legacy endpoint",
+      "id": "back"
+    }
+  ],
+  "expect": [
+    {
+      "check": "lacks",
+      "step": "gone",
+      "ref": "n",
+      "desc": "archived: not in search"
+    },
+    {
+      "check": "has",
+      "step": "back",
+      "ref": "n",
+      "desc": "restored: in search again"
+    }
+  ]
+}

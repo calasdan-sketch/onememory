@@ -1,0 +1,67 @@
+{
+  "id": "B07",
+  "suite": "contradiction",
+  "title": "A weak writer overwrites a trusted note: the change is visible",
+  "what": "Any write token can edit a note in its namespace (there is no per-note owner lock). What must hold: the edit is not silent. The note names the new writer and keeps the old one in its record.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "n",
+      "title": "{{proj}} signing key owner",
+      "body": "Signing key owner: Dana ({{tok}})."
+    },
+    {
+      "op": "update",
+      "as": "mallory",
+      "ref": "n",
+      "body": "Signing key owner: Mallory ({{tok}})."
+    },
+    {
+      "op": "read",
+      "as": "alice",
+      "ref": "n",
+      "id": "after"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "after",
+      "path": "writer",
+      "desc": "the note now names the weak writer as the last writer",
+      "equals": "mallory",
+      "metric": "silent_overwrite"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "creator",
+      "desc": "the original author is still named",
+      "equals": "boss",
+      "metric": "silent_overwrite"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "taint",
+      "desc": "the trusted writer stays in the record of hands",
+      "includes": "boss",
+      "metric": "silent_overwrite"
+    }
+  ]
+}

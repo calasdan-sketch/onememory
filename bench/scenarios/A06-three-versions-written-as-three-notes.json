@@ -1,0 +1,56 @@
+{
+  "id": "A06",
+  "suite": "stale",
+  "title": "Three versions written as three notes",
+  "what": "A value changes twice and each version is saved as a new note. Search should return the latest first and never show the two older ones unflagged.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "known_gap": "GAP-SUPERSEDE",
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "v1",
+      "title": "{{proj}} release owner",
+      "body": "The {{proj}} release owner is {{p1}}."
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "v2",
+      "title": "{{proj}} release owner update",
+      "body": "The {{proj}} release owner is now {{p2}}."
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "v3",
+      "title": "{{proj}} release owner update again",
+      "body": "The {{proj}} release owner is now {{p3}}."
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} release owner",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "fresh_answer",
+      "step": "s",
+      "desc": "Latest version first; older versions not shown unflagged",
+      "current": "v3",
+      "stale": [
+        "v1",
+        "v2"
+      ]
+    }
+  ]
+}

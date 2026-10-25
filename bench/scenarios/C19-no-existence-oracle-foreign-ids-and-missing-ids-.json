@@ -1,0 +1,70 @@
+{
+  "id": "C19",
+  "suite": "isolation",
+  "title": "No existence oracle: foreign ids and missing ids look the same",
+  "what": "Reading a note in another tenant, and reading a note that was deleted, must be refused in exactly the same words, so nobody can probe which ids exist.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    },
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    }
+  },
+  "needs": [
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "n",
+      "title": "{{proj}} exists",
+      "body": "A {{canA}}."
+    },
+    {
+      "op": "write",
+      "as": "b1",
+      "ref": "gone",
+      "title": "{{proj}} deleted",
+      "body": "B {{canB}}."
+    },
+    {
+      "op": "delete",
+      "as": "bAdmin",
+      "ref": "gone"
+    },
+    {
+      "op": "read",
+      "as": "b1",
+      "ref": "n",
+      "id": "foreign"
+    },
+    {
+      "op": "read",
+      "as": "b1",
+      "ref": "gone",
+      "id": "missing"
+    }
+  ],
+  "expect": [
+    {
+      "check": "same_response",
+      "steps": [
+        "foreign",
+        "missing"
+      ],
+      "desc": "a foreign id and a missing id are refused identically",
+      "metric": "leak"
+    }
+  ]
+}

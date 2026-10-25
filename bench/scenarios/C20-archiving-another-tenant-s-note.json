@@ -1,0 +1,61 @@
+{
+  "id": "C20",
+  "suite": "isolation",
+  "title": "Archiving another tenant's note",
+  "what": "Tenant B's admin tries to archive tenant A's note. Refused, and A still finds it.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    }
+  },
+  "needs": [
+    "retire"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "n",
+      "title": "{{proj}} archive target",
+      "body": "Doc {{canA}}."
+    },
+    {
+      "op": "archive",
+      "as": "bAdmin",
+      "ref": "n",
+      "id": "try"
+    },
+    {
+      "op": "search",
+      "as": "a1",
+      "q": "{{proj}} archive target",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "try",
+      "is": [
+        "denied",
+        "not_found"
+      ],
+      "desc": "the cross-tenant archive is refused",
+      "metric": "leak"
+    },
+    {
+      "check": "has",
+      "step": "s",
+      "ref": "n",
+      "desc": "A's note is still searchable",
+      "metric": "leak"
+    }
+  ]
+}

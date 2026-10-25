@@ -1,0 +1,59 @@
+{
+  "id": "B08",
+  "suite": "contradiction",
+  "title": "After a weak overwrite the trusted original text can be recovered",
+  "what": "A note is overwritten in place. Can an admin get the trusted original text back from anywhere (a history, the change feed, a backup)? OneMemory keeps no history of earlier bodies.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "changes",
+    "export_import"
+  ],
+  "known_gap": "GAP-HISTORY",
+  "steps": [
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "n",
+      "title": "{{proj}} backup schedule",
+      "body": "Backups run nightly at {{t}}."
+    },
+    {
+      "op": "update",
+      "as": "mallory",
+      "ref": "n",
+      "body": "Backups are disabled."
+    },
+    {
+      "op": "changes",
+      "as": "boss",
+      "id": "feed"
+    },
+    {
+      "op": "export",
+      "as": "boss",
+      "id": "dump"
+    }
+  ],
+  "expect": [
+    {
+      "check": "contains_text",
+      "steps": [
+        "feed",
+        "dump"
+      ],
+      "text": "{{t}}",
+      "desc": "the trusted original text is still available to an admin",
+      "metric": "silent_overwrite"
+    }
+  ]
+}

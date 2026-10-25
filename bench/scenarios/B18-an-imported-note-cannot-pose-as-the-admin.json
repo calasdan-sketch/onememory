@@ -1,0 +1,83 @@
+{
+  "id": "B18",
+  "suite": "contradiction",
+  "title": "An imported note cannot pose as the admin",
+  "what": "A note exported from another server claims it was written by 'boss'. After import it is stamped with the importer, flagged as unverified, and the claim is only a claim.",
+  "actors": {
+    "boss": {
+      "scope": "admin"
+    },
+    "ext": {
+      "scope": "write",
+      "writer": "boss",
+      "server": "other"
+    },
+    "extadmin": {
+      "scope": "admin",
+      "server": "other"
+    }
+  },
+  "needs": [
+    "export_import",
+    "list"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "ext",
+      "ref": "n",
+      "title": "{{proj}} imported fact",
+      "body": "Claimed fact {{tok}}."
+    },
+    {
+      "op": "export",
+      "as": "extadmin",
+      "id": "dump"
+    },
+    {
+      "op": "import",
+      "as": "boss",
+      "from": "dump",
+      "id": "imp"
+    },
+    {
+      "op": "list",
+      "as": "boss",
+      "id": "l"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "imp",
+      "is": "ok",
+      "desc": "the import works"
+    },
+    {
+      "check": "field",
+      "step": "l",
+      "path": "writer",
+      "desc": "the importer, not the claimed writer, is stamped as the writer",
+      "title": "{{proj}} imported fact",
+      "equals": "boss",
+      "metric": "silent_overwrite"
+    },
+    {
+      "check": "field",
+      "step": "l",
+      "path": "imported_unverified",
+      "desc": "the note is flagged as unverified",
+      "title": "{{proj}} imported fact",
+      "equals": true,
+      "metric": "silent_overwrite"
+    },
+    {
+      "check": "field",
+      "step": "l",
+      "path": "claimed_writer",
+      "desc": "the claimed name is kept, labelled as a claim",
+      "title": "{{proj}} imported fact",
+      "equals": "boss"
+    }
+  ]
+}
