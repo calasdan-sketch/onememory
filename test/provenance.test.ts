@@ -692,7 +692,7 @@ describe("upgrade safety", () => {
     try {
       const path = makeV12(dir);
       new Store(path).close();
-      const bak = path + ".pre-v14-backup";
+      const bak = path + ".pre-v15-backup";
       assert.ok(existsSync(bak), "backup exists");
       assert.equal(Store.peekSchemaVersion(bak), 12);
       assert.equal(Store.peekSchemaVersion(path), SCHEMA_VERSION);
@@ -726,7 +726,7 @@ describe("upgrade safety", () => {
     try {
       const p = join(dir, "fresh.db");
       new Store(p).close();
-      assert.ok(!existsSync(p + ".pre-v14-backup"));
+      assert.ok(!existsSync(p + ".pre-v15-backup"));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

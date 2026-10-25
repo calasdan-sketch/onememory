@@ -1,0 +1,71 @@
+{
+  "id": "B29",
+  "suite": "contradiction",
+  "title": "A code made for one person is useless to another",
+  "what": "Alice's confirmation code must not work for Mallory, even though both can write.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "old",
+      "title": "{{proj}} slot",
+      "body": "Slot is {{v1}}."
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "new",
+      "title": "{{proj}} slot now",
+      "body": "Slot is now {{v2}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "mallory",
+      "id": "steal",
+      "from": "pv"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} slot",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "steal",
+      "is": "invalid",
+      "desc": "another person cannot use the code"
+    },
+    {
+      "check": "has",
+      "step": "s",
+      "ref": "old",
+      "desc": "nothing was replaced"
+    }
+  ]
+}

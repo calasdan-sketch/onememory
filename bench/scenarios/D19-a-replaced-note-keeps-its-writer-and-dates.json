@@ -1,0 +1,90 @@
+{
+  "id": "D19",
+  "suite": "provenance",
+  "title": "A replaced note keeps its writer and dates",
+  "what": "Replacing hides a note; it must not change who wrote it or when.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede",
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "old",
+      "title": "{{proj}} origin",
+      "body": "Origin {{v1}}."
+    },
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "new",
+      "title": "{{proj}} origin now",
+      "body": "Origin now {{v2}}."
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "old",
+      "id": "before"
+    },
+    {
+      "op": "supersede_preview",
+      "as": "boss",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "boss",
+      "id": "cf",
+      "from": "pv"
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "old",
+      "id": "after"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "after",
+      "path": "creator",
+      "equals": "alice",
+      "desc": "the creator is still alice",
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "created_at",
+      "same_as": {
+        "step": "before",
+        "path": "created_at"
+      },
+      "desc": "the first-saved time is unchanged",
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "body",
+      "equals": "Origin {{v1}}.",
+      "desc": "the text is unchanged",
+      "metric": "field"
+    }
+  ]
+}

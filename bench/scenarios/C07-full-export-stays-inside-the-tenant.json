@@ -1,0 +1,87 @@
+{
+  "id": "C07",
+  "suite": "isolation",
+  "title": "Full export stays inside the tenant",
+  "what": "Each tenant's admin exports everything they may see. Each export has its own tenant's text and none of the other's.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    },
+    "aAdmin": {
+      "scope": "admin",
+      "namespace": "tenantA",
+      "writer": "adminA"
+    },
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    }
+  },
+  "needs": [
+    "export_import"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "n",
+      "title": "{{proj}} a note",
+      "body": "A secret {{canA}}."
+    },
+    {
+      "op": "write",
+      "as": "b1",
+      "ref": "m",
+      "title": "{{proj}} b note",
+      "body": "B secret {{canB}}."
+    },
+    {
+      "op": "export",
+      "as": "bAdmin",
+      "id": "exB"
+    },
+    {
+      "op": "export",
+      "as": "aAdmin",
+      "id": "exA"
+    }
+  ],
+  "expect": [
+    {
+      "check": "no_text",
+      "step": "exB",
+      "text": "{{canA}}",
+      "desc": "tenant B's export has no tenant A text",
+      "metric": "leak"
+    },
+    {
+      "check": "no_text",
+      "step": "exA",
+      "text": "{{canB}}",
+      "desc": "tenant A's export has no tenant B text",
+      "metric": "leak"
+    },
+    {
+      "check": "contains_text",
+      "step": "exA",
+      "text": "{{canA}}",
+      "desc": "tenant A's export has its own text",
+      "metric": "unexpected_denial"
+    },
+    {
+      "check": "contains_text",
+      "step": "exB",
+      "text": "{{canB}}",
+      "desc": "tenant B's export has its own text",
+      "metric": "unexpected_denial"
+    }
+  ]
+}

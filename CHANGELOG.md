@@ -6,6 +6,75 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-25
+
+Closes every gap the 1.5.0 benchmark recorded, without ever changing a memory silently. **Schema v15** (a verified
+`<db>.pre-v15-backup` is made first; no downgrade path). Everything else is additive.
+
+### Added
+- **Replacing a memory is always two steps** (CLI `onememory supersede`, REST `POST /supersede/{preview,confirm,undo}`, MCP
+  `memory_supersede_preview` / `_confirm` / `_undo`). The preview changes nothing and shows "ARE YOU SURE YOU WANT TO REPLACE THIS?" in plain
+  words: each old note's text, writer, dates, tags, how many notes are similar to it and how many tasks depend on it, what you lose, what you do
+  **not** lose, and a **RED FLAG** when it applies. The confirm needs the preview's one-time code: it works once, expires (10 minutes;
+  `ONEMEMORY_SUPERSEDE_TTL_SECONDS`), is bound to the caller, to the exact notes and revisions previewed and to the exact replacement text, and
+  fails if anything changed in between. On the command line you type the number of notes you are replacing (or `yes`); a script must pass
+  `--confirm-token`. There is no `--yes`.
+- **Nothing is deleted.** The old note becomes `superseded` with a `superseded_by` link, leaves search, lists, `relevant` and
+  similar-note suggestions, and shows (always labelled) with `include_superseded`. `supersede undo` brings it back; both are recorded, and a write token can undo only a replacement it made itself (an administrator can undo any). Hard delete
+  is unchanged, except that hard-deleting a note that *replaced* others brings those back rather than leaving them hidden for good. Details: [docs/replacing-memories.md](./docs/replacing-memories.md).
+- **Trust guard.** A distrusted writer is refused outright; a replacement that claims lower confidence than the note it hides needs an
+  administrator and an explicit `acknowledge_risk` (on the CLI, typing `i accept the risk`). Confidence never overrides trust.
+- **Version history.** Every edit keeps the text it replaces (bounded: `ONEMEMORY_HISTORY_VERSIONS` default 20, `ONEMEMORY_HISTORY_MAX_BYTES`;
+  the original is never dropped and one writer cannot flood out another's version). Admin-only `GET /notes/:id/history`, `memory_history`,
+  `onememory history`; `restore` makes a **new** version; `purge` forgets history. Encrypted at rest with note bodies; carried by export/import
+  (as claims; `?history=0` / `--no-history` leaves it out).
+- **Optional `confidence`** (0 to 1) on write and update (REST, MCP `state_write`): validated, labelled with who claimed it, kept through edits,
+  export and import, shown in search and in the replace warning. A claim only.
+- Six MCP tools (`memory_supersede_preview`, `memory_supersede_confirm`, `memory_supersede_undo`, `memory_history`, `memory_restore_version`,
+  `memory_history_purge`; 28 tools in all), `include_superseded` on `state_search` / `state_list` and the REST `GET /search` / `GET /notes`.
+
+### Changed
+- **Ranking.** When two notes are about the same thing and the older one is flagged stale, it now stays behind the newer one in search even if it
+  matches the words better (it is still returned and flagged). The retrieval evaluation set is unchanged: best-of-both recall@1 1.000, recall@5 1.000,
+  MRR 1.000; keyword-only recall@1 0.700, before and after.
+- **Benchmark: 109 deterministic scenarios** (was 75): A 32, B 31, C 27, D 19. All four known gaps are now `fixed`, and the scenarios that carried them pass
+  (A05, A06, A10, A20, B03 include the confirmed replace steps; A11 passes by the ranking fix alone; B08, B09 by history; D10 by confidence). New
+  scenarios cover: a preview writes nothing; a confirm needs a valid code; expired, reused, damaged and changed-revision codes fail; a code is useless to
+  another writer or tenant; undo; history restore; the trust-guard cases; confidence round trip; and cross-tenant isolation of history, previews and undo.
+  stale-hit-rate@1 36% to 0%, current-recall@1 62% to 100%, fields lost 1 to 0.
+- The pre-upgrade copy is now named after the schema it upgrades to: `<db>.pre-v15-backup`.
+
+### Known limits
+- Over MCP and REST the "Are you sure?" text is relayed by the agent. The code makes it impossible to confirm without a preview, but only the command
+  line asks the person directly. See [SECURITY.md](./SECURITY.md).
+- OneMemory does not guess that a new note replaces an old one. Writing a second note and leaving the first still returns both (as before); replace
+  explicitly if you want the old one out of sight.
+
+## [1.5.0] - 2026-10-25
+
+A benchmark for the question "can one agent silently turn a weak guess into shared truth?". Additive only: no
+schema change, no change to any existing result shape or default.
+
+### Added
+- **`onememory bench`** (and `npm run bench`): 75 deterministic, offline, no-model scenarios in four suites, run on a
+  throwaway store through the real REST API (plus the `memory_consolidate` MCP tool for merges). **A** stale memory
+  (stale-hit-rate@1/@5, current-recall@1), **B** contradiction recovery, **C** permission isolation (leakage count,
+  unexpected denials), **D** provenance retention (fields lost). `--json` gives every scenario with expected vs actual;
+  exit 1 on a failure. Never reads or writes your own data (it hides `ONEMEMORY_*`, uses a temporary folder and its own
+  audit log). Scenarios are JSON files in `bench/scenarios/` (shipped in the package), and a small adapter interface
+  (write, update, delete, search, plus actor) lets the same scenarios run against another memory system.
+  See [docs/BENCHMARK.md](./docs/BENCHMARK.md).
+
+### Fixed
+- **REST `PUT /notes/:id` now honours `if_rev`** (compare-and-swap), as the MCP tool `state_write` already did. An edit made on
+  an out-of-date copy is refused with `409` ("stale write: ... re-read and retry") instead of silently replacing a newer write.
+  Without `if_rev` nothing changes (last write wins). Found by benchmark scenario B16.
+
+### Known gaps
+- **Known gaps are recorded, not hidden.** Scenarios that fail because OneMemory lacks the behaviour carry a `known_gap`
+  marker and are listed in the README: `GAP-SUPERSEDE`, `GAP-RECENCY`, `GAP-HISTORY`, `GAP-CONFIDENCE` (a fifth, `GAP-REST-CAS`, was found and fixed in this release).
+  They do not fail the run; a marked scenario that starts to pass does.
+
 ## [1.4.2] - 2026-10-24
 
 A third expert review of 1.4.1 (coding, security, architecture, developer experience, infrastructure) found

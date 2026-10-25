@@ -1,0 +1,101 @@
+{
+  "id": "A21",
+  "suite": "stale",
+  "title": "A preview changes nothing",
+  "what": "Asking 'are you sure?' must not touch anything. After a preview, both notes are still there, unchanged and unlabelled.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede",
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "old",
+      "title": "{{proj}} cache size",
+      "body": "The {{proj}} cache size is {{v1}}."
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "new",
+      "title": "{{proj}} cache size now",
+      "body": "The {{proj}} cache size is now {{v2}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} cache size",
+      "id": "s"
+    },
+    {
+      "op": "read",
+      "as": "alice",
+      "ref": "old",
+      "id": "r"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "pv",
+      "is": "ok",
+      "desc": "the preview works"
+    },
+    {
+      "check": "has",
+      "step": "s",
+      "ref": "old",
+      "desc": "the old note is still found after a preview"
+    },
+    {
+      "check": "has",
+      "step": "s",
+      "ref": "new",
+      "desc": "the new note is still found"
+    },
+    {
+      "check": "field",
+      "step": "r",
+      "path": "status",
+      "present": false,
+      "desc": "the old note is not marked as replaced"
+    },
+    {
+      "check": "field",
+      "step": "r",
+      "path": "rev",
+      "equals": 1,
+      "desc": "the old note's revision did not move"
+    },
+    {
+      "check": "contains_text",
+      "step": "pv",
+      "text": "ARE YOU SURE YOU WANT TO REPLACE THIS?",
+      "desc": "the preview asks the question in plain words"
+    },
+    {
+      "check": "contains_text",
+      "step": "pv",
+      "text": "{{v1}}",
+      "desc": "the preview shows exactly what the old note says"
+    }
+  ]
+}

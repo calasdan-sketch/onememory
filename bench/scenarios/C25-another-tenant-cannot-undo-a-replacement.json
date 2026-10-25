@@ -1,0 +1,87 @@
+{
+  "id": "C25",
+  "suite": "isolation",
+  "title": "Another tenant cannot undo a replacement",
+  "what": "Undo changes what tenant A sees. Tenant B must not be able to trigger it, or learn whether it exists.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "aAdmin": {
+      "scope": "admin",
+      "namespace": "tenantA",
+      "writer": "adminA"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    },
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    }
+  },
+  "needs": [
+    "supersede"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "old",
+      "title": "{{proj}} cfg",
+      "body": "Cfg {{canA}}."
+    },
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "new",
+      "title": "{{proj}} cfg now",
+      "body": "Cfg now {{canB}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "a1",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "a1",
+      "id": "cf",
+      "from": "pv"
+    },
+    {
+      "op": "supersede_undo",
+      "as": "b1",
+      "ref": "old"
+    },
+    {
+      "op": "search",
+      "as": "a1",
+      "q": "{{proj}} cfg",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "supersede_undo:old",
+      "is": "not_found",
+      "desc": "not found"
+    },
+    {
+      "check": "lacks",
+      "step": "s",
+      "ref": "old",
+      "desc": "the replacement still stands"
+    }
+  ]
+}

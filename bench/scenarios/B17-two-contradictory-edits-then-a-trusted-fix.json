@@ -1,0 +1,89 @@
+{
+  "id": "B17",
+  "suite": "contradiction",
+  "title": "Two contradictory edits, then a trusted fix",
+  "what": "Alice writes X, Mallory flips it to not-X, the admin restores X. The final state is X and the record lists everyone who touched the content.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} tls minimum",
+      "body": "Minimum TLS version is 1.2 ({{tok}})."
+    },
+    {
+      "op": "update",
+      "as": "mallory",
+      "ref": "n",
+      "body": "Minimum TLS version is 1.0 ({{tok}})."
+    },
+    {
+      "op": "update",
+      "as": "boss",
+      "ref": "n",
+      "body": "Minimum TLS version is 1.2 ({{tok}}), restored by the admin."
+    },
+    {
+      "op": "read",
+      "as": "alice",
+      "ref": "n",
+      "id": "after"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} tls minimum",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "fresh_answer",
+      "step": "s",
+      "desc": "The restored value is the only one",
+      "current": "n",
+      "stale_text": [
+        "version is 1.0"
+      ],
+      "metric": "resolution"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "writer",
+      "desc": "the admin is the last writer",
+      "equals": "boss",
+      "metric": "loser_visible"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "taint",
+      "desc": "Mallory is on record",
+      "includes": "mallory",
+      "metric": "loser_visible"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "taint",
+      "desc": "Alice is on record",
+      "includes": "alice",
+      "metric": "loser_visible"
+    }
+  ]
+}

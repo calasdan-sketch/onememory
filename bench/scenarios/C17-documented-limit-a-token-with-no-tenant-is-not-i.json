@@ -1,0 +1,41 @@
+{
+  "id": "C17",
+  "suite": "isolation",
+  "title": "Documented limit: a token with no tenant is not isolated",
+  "what": "A token that is not pinned to a tenant keeps the old, open behaviour and sees every tenant. That is by design (the primary token is the operator's); this scenario pins the documented fact so a change would be noticed. Pin every token you hand out.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "unpinned": {
+      "scope": "write",
+      "writer": "unpinned"
+    }
+  },
+  "limit": "Documented in docs/token-namespaces.md: tokens with no pin are not tenant-scoped.",
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "n",
+      "title": "{{proj}} tenant a doc",
+      "body": "Doc {{canA}}."
+    },
+    {
+      "op": "search",
+      "as": "unpinned",
+      "q": "{{canA}}",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "has",
+      "step": "s",
+      "ref": "n",
+      "desc": "an unpinned token finds the tenant's note (documented, not a bug)"
+    }
+  ]
+}

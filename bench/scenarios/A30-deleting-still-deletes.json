@@ -1,0 +1,74 @@
+{
+  "id": "A30",
+  "suite": "stale",
+  "title": "Deleting still deletes",
+  "what": "Hard delete is unchanged: an admin can delete a replaced note for good.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede",
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "old",
+      "title": "{{proj}} badge",
+      "body": "Badge is {{v1}}."
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "new",
+      "title": "{{proj}} badge now",
+      "body": "Badge is now {{v2}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "alice",
+      "id": "cf",
+      "from": "pv"
+    },
+    {
+      "op": "delete",
+      "as": "boss",
+      "ref": "old"
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "old",
+      "id": "r"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "delete:old",
+      "is": "ok",
+      "desc": "the admin can delete a replaced note"
+    },
+    {
+      "check": "outcome",
+      "step": "r",
+      "is": "not_found",
+      "desc": "the deleted note is gone"
+    }
+  ]
+}

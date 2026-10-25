@@ -23,6 +23,8 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+      - name: provenance benchmark (exit 1 on a failed scenario)
+        run: node dist/src/cli.js bench
 
   audit:
     name: npm audit

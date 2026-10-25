@@ -1,0 +1,68 @@
+{
+  "id": "C01",
+  "suite": "isolation",
+  "title": "Reading another tenant's note by id",
+  "what": "Tenant B asks for tenant A's note by its id. It must look like the note does not exist. Tenant A can still read it.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    }
+  },
+  "needs": [
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "n",
+      "title": "{{proj}} customer list",
+      "body": "Customers: {{canA}}."
+    },
+    {
+      "op": "read",
+      "as": "b1",
+      "ref": "n",
+      "id": "cross"
+    },
+    {
+      "op": "read",
+      "as": "a1",
+      "ref": "n",
+      "id": "own"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "cross",
+      "is": [
+        "denied",
+        "not_found"
+      ],
+      "desc": "the other tenant gets nothing",
+      "metric": "leak"
+    },
+    {
+      "check": "no_text",
+      "step": "cross",
+      "text": "{{canA}}",
+      "desc": "no content from tenant A in the answer",
+      "metric": "leak"
+    },
+    {
+      "check": "outcome",
+      "step": "own",
+      "is": "ok",
+      "desc": "the owner can still read it",
+      "metric": "unexpected_denial"
+    }
+  ]
+}

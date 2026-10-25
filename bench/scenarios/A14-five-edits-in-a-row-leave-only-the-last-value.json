@@ -1,0 +1,96 @@
+{
+  "id": "A14",
+  "suite": "stale",
+  "title": "Five edits in a row leave only the last value",
+  "what": "The same note is rewritten five times. Only the final value may be findable.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    }
+  },
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} build number",
+      "body": "Build number is {{b1}}."
+    },
+    {
+      "op": "update",
+      "as": "alice",
+      "ref": "n",
+      "body": "Build number is {{b2}}."
+    },
+    {
+      "op": "update",
+      "as": "alice",
+      "ref": "n",
+      "body": "Build number is {{b3}}."
+    },
+    {
+      "op": "update",
+      "as": "alice",
+      "ref": "n",
+      "body": "Build number is {{b4}}."
+    },
+    {
+      "op": "update",
+      "as": "alice",
+      "ref": "n",
+      "body": "Build number is {{b5}}."
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} build number",
+      "id": "s"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{b2}}",
+      "id": "o2"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{b4}}",
+      "id": "o4"
+    }
+  ],
+  "expect": [
+    {
+      "check": "fresh_answer",
+      "step": "s",
+      "desc": "Only the final value is in the note",
+      "current": "n",
+      "stale_text": [
+        "{{b1}}",
+        "{{b2}}",
+        "{{b3}}",
+        "{{b4}}"
+      ]
+    },
+    {
+      "check": "field",
+      "step": "s",
+      "path": "body",
+      "desc": "the body holds the fifth value",
+      "of": "n",
+      "includes": "{{b5}}"
+    },
+    {
+      "check": "hit_count",
+      "step": "o2",
+      "desc": "an intermediate value is gone",
+      "is": 0
+    },
+    {
+      "check": "hit_count",
+      "step": "o4",
+      "desc": "an intermediate value is gone",
+      "is": 0
+    }
+  ]
+}

@@ -1,0 +1,86 @@
+{
+  "id": "D07",
+  "suite": "provenance",
+  "title": "An edit keeps creator and creation time, and records the previous writer",
+  "what": "Alice writes, the admin edits. Creator and creation time stay Alice's; the last writer is the admin; Alice stays in the record; the update time moves forward.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} edited note",
+      "body": "Body v1 {{tok}}."
+    },
+    {
+      "op": "update",
+      "as": "boss",
+      "ref": "n",
+      "body": "Body v2 {{tok}}."
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "n",
+      "id": "after"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "after",
+      "path": "creator",
+      "desc": "creator unchanged",
+      "equals": "alice",
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "created_at",
+      "desc": "created_at unchanged",
+      "same_as": {
+        "step": "write:n",
+        "path": "created_at"
+      },
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "writer",
+      "desc": "writer is the editor",
+      "equals": "boss",
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "taint",
+      "desc": "previous writer is on record",
+      "includes": "alice",
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "updated_at",
+      "desc": "updated_at moved forward",
+      "differs_from": {
+        "step": "write:n",
+        "path": "updated_at"
+      },
+      "metric": "field"
+    }
+  ]
+}

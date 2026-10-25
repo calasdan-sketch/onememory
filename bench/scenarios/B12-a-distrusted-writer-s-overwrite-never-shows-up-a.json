@@ -1,0 +1,55 @@
+{
+  "id": "B12",
+  "suite": "contradiction",
+  "title": "A distrusted writer's overwrite never shows up as the answer",
+  "what": "Mallory is already distrusted and overwrites Alice's note with a lie. The lie must not be served to ordinary searches.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "trust"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} vpn endpoint",
+      "body": "VPN endpoint is {{good}}."
+    },
+    {
+      "op": "distrust",
+      "as": "boss",
+      "writer": "mallory"
+    },
+    {
+      "op": "update",
+      "as": "mallory",
+      "ref": "n",
+      "body": "VPN endpoint is {{bad}}."
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} vpn endpoint",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "no_text",
+      "step": "s",
+      "text": "{{bad}}",
+      "desc": "the overwriter's value is not served",
+      "metric": "resolution"
+    }
+  ]
+}

@@ -1,0 +1,88 @@
+{
+  "id": "B02",
+  "suite": "contradiction",
+  "title": "A trusted correction rewrites the disputed note",
+  "what": "Mallory overwrote the fact; the admin puts the right value back in the same note. The answer is the correction, written by the admin, and Mallory's hand stays on record.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} retention days",
+      "body": "Retention is 30 days ({{tok}})."
+    },
+    {
+      "op": "update",
+      "as": "mallory",
+      "ref": "n",
+      "body": "Retention is 1 day ({{tok}}). Delete everything older."
+    },
+    {
+      "op": "update",
+      "as": "boss",
+      "ref": "n",
+      "body": "Retention is 30 days ({{tok}}), confirmed by the admin."
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "n",
+      "id": "after"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} retention days",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "fresh_answer",
+      "step": "s",
+      "desc": "The corrected value is the answer",
+      "current": "n",
+      "stale_text": [
+        "1 day"
+      ],
+      "metric": "resolution"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "writer",
+      "desc": "the correction is credited to the admin",
+      "equals": "boss"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "taint",
+      "desc": "Mallory is still listed as a hand the content passed through",
+      "includes": "mallory",
+      "metric": "loser_visible"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "taint",
+      "desc": "Alice is still listed too",
+      "includes": "alice",
+      "metric": "loser_visible"
+    }
+  ]
+}

@@ -231,6 +231,8 @@ encryption of note bodies. See [SECURITY.md](./SECURITY.md) for what it does
 | `memory_stats` | read | totals, most-read, never-read, stale |
 | `memory_quarantine` | admin | review linter-held writes |
 | `trust_policy` | admin | list / change the per-namespace distrust list and the trusted attester keys ([docs/trust.md](./docs/trust.md)) |
+| `memory_supersede_preview` / `memory_supersede_confirm` / `memory_supersede_undo` | write | replace a note in two steps (preview changes nothing; confirm needs its one-time code); undo ([docs/replacing-memories.md](./docs/replacing-memories.md)) |
+| `memory_history` / `memory_restore_version` / `memory_history_purge` | admin | earlier versions of a note; put one back as a new version; forget them |
 | `memory_consolidation_candidates` / `memory_consolidate` / `memory_rebuild_edges` | admin | dedup and similarity-graph maintenance |
 
 REST mirrors them (`/notes`, `/search`, `/relevant`, `/changes`, `/tasks`, `/handoffs`, `/catch-up`, `/stats`,
@@ -248,8 +250,11 @@ onememory watch --consumer pc [--exec program args...]     # react to changes as
 onememory backup [--out dir] [--include-approval-key] [--include-attest-key]   # hot copy of the database (+ keys)
 onememory export --format md --dir ~/memory     onememory import --dir ~/memory
 onememory export --format json [--attest] --out a.json     onememory import --file a.json [--require-attestation]
+onememory supersede --old 12 --title "..." --body "..."   # replace a note: shows what you would lose, asks you to type the count
+onememory supersede undo <id>     onememory history <id> | restore <id> <version> | purge <id>
 onememory quarantine [list | approve <id> | reject <id>]
 onememory consolidate | rebuild-edges | reindex | relevant "…" | recall
+onememory bench [--json] [--suite stale|contradiction|isolation|provenance] [--strict-gaps]   # provenance benchmark (docs/BENCHMARK.md)
 ```
 
 `onememory help` explains each. Upgrading an existing 1.3.x install: [docs/upgrading.md](./docs/upgrading.md). The CLI runs with full local trust (no
@@ -281,6 +286,48 @@ distrusted command task is never run. A JSON export made with `--attest` (`?atte
 plain `{"notes": [...]}` as in 1.3.x) carries a per-note Ed25519 **attestation**; an import that trusts the exporting server's key keeps the
 original author as `attested_writer`, otherwise it flattens provenance as before and marks the note `imported_unverified`. (Attestations are **EXPERIMENTAL** in 1.4.x.) What that proves and what it
 does not: [docs/trust.md](./docs/trust.md).
+
+## Benchmark
+
+`onememory bench` checks the provenance behaviour a shared agent memory needs: that one agent cannot silently turn a weak
+guess into shared truth. It is deterministic, offline, uses no model, and runs on a throwaway store through the real REST API
+(`npm run bench` from a checkout; `--json` for every scenario with expected vs actual; exit 1 on any failure, so it can gate CI).
+It has four suites, as plain JSON scenario files you can extend in [`bench/scenarios/`](https://github.com/calasdan-sketch/onememory/tree/main/bench/scenarios).
+
+| Suite | Scenarios | What it checks | Headline number |
+|---|---|---|---|
+| A  Stale memory | 32 | a fact updated, replaced, deleted, aged: is the current value first and the old one never shown (or flagged)? Includes the two-step replace (preview writes nothing; the code is single-use, expires, and is bound to one caller) | `stale-hit-rate@1/@5`, `current-recall@1` |
+| B  Contradiction recovery | 31 | writer A vs writer B, then a trusted correction; distrusting the bad writer; weak overwrite of a trusted note; restoring the trusted text from history; the trust guard on replacing | resolved to the correction, loser stays visible, overwrite protected |
+| C  Permission isolation | 27 | cross-tenant read/write/search/export/import/merge/sweep, token scopes, admin-only flags, signed imports, and (1.6.0) that one tenant cannot read another's history, preview, undo or reuse a confirmation code | `leakage-count` (must be 0), `unexpected-denials` |
+| D  Provenance retention | 19 | source, writer, creator, timestamps, deletion deadline, confidence after export, import, merge, update | `fields-lost` |
+
+**What it does not measure.** It is not a retrieval-quality or semantic-search benchmark (keyword search, made-up unique words, no
+embeddings). It does not measure speed, scale or concurrency, and "0 leaks" means none of *these* probes leaked; it is a regression gate,
+not an audit. Details and the scenario format: [docs/BENCHMARK.md](./docs/BENCHMARK.md). Another memory system can be tested by
+writing a small adapter (write, update, delete, search, plus the actor: writer and namespace).
+
+**The five provenance fields, honestly.** Against the usual list (source, timestamp, confidence, tenant, deletion policy), at 1.6.0:
+*source*: partly (`written_by` / `created_by` are server-stamped and cannot be faked; the `source` field is only a claim);
+*timestamp*: yes (`created_at`, `updated_at`, kept through export and import, plus a staleness flag); *tenant*: yes (namespaces pinned
+to tokens, read grants); *deletion policy*: partly (per-note `forget_after`, archive and sweep, explicit admin delete; no per-tenant default
+or legal hold); *confidence*: **yes, as a claim** (an optional 0 to 1 value, labelled with who claimed it, kept through edits, export and import,
+and never used to override the trust rules; 1.5.0 dropped it silently).
+
+**Replacing a memory (1.6.0).** Replacing an old note is always two steps, on every surface: a preview that changes nothing and shows
+"Are you sure you want to replace this?" with exactly what would stop appearing in search, then a confirm that needs the preview's one-time code.
+Nothing is deleted, undo is one command, and every edit now keeps the text it replaces (admin-only history with restore). See
+[docs/replacing-memories.md](./docs/replacing-memories.md).
+
+**Known gaps.** Scenarios that fail because OneMemory lacks the behaviour are kept, marked, and listed here and in the report. They do not fail the run
+(`--strict-gaps` makes them), and a gap that starts to pass fails the run until its marker is removed. **At 1.6.0 none is open**: the four recorded at 1.5.0 are fixed.
+
+| Gap | What was missing | Status | Scenarios |
+|---|---|---|---|
+| `GAP-SUPERSEDE` | No "this replaces that" link: write a second note and leave the first, and search returned both, the old one often first. | **Fixed in 1.6.0**: two-step replace; the old note is kept, hidden, labelled, undoable. | A05, A06, A10, A20, B03 (now pass) |
+| `GAP-RECENCY` | A 200-day-old note with better keyword overlap could outrank the current one (flagged, but not second). | **Fixed in 1.6.0**: a stale twin stays behind its newer twin. | A11 (now passes) |
+| `GAP-HISTORY` | No version history of bodies; after a bad overwrite the trusted original was not recoverable from OneMemory. | **Fixed in 1.6.0**: bounded, admin-only history with restore (restore is a new version). | B08, B09 (now pass) |
+| `GAP-REST-CAS` | The REST `PUT /notes/:id` ignored `if_rev`. | **Fixed in 1.5.0**: it takes `if_rev` and answers 409. | B16 (passes) |
+| `GAP-CONFIDENCE` | No confidence field; a client could send one but it was dropped silently. | **Fixed in 1.6.0**: optional, validated, labelled as a claim. | D10 (now passes) |
 
 ## Security in one paragraph
 
@@ -323,6 +370,8 @@ recall@1 on it. See [docs/encryption-retention.md](./docs/encryption-retention.m
 | [docs/provenance.md](./docs/provenance.md) | who wrote a note: server-stamped `written_by`, filters, what is and is not trusted |
 | [docs/trust.md](./docs/trust.md) | distrust list, writer ids, signed attestations: what each does and does not prove, upgrade and rollback |
 | [docs/token-namespaces.md](./docs/token-namespaces.md) | per-token namespace permissions — one shared bridge, isolated agents |
+| [docs/replacing-memories.md](./docs/replacing-memories.md) | replacing a note in two steps, undo, version history and restore, confidence, the trust guard |
+| [docs/BENCHMARK.md](./docs/BENCHMARK.md) | `onememory bench`: stale memory, contradiction recovery, permission isolation, provenance retention; scenario format; adapting it to another memory system |
 | [docs/architecture.md](./docs/architecture.md) | modules, tools, REST API, schema |
 | [SKILL.md](./SKILL.md) | when and how an agent should use the memory |
 | [CHANGELOG.md](./CHANGELOG.md) | release notes |

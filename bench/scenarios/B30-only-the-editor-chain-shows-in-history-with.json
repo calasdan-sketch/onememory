@@ -1,0 +1,55 @@
+{
+  "id": "B30",
+  "suite": "contradiction",
+  "title": "Only the editor chain shows in history, with writers",
+  "what": "The history names who wrote each earlier version.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "history"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} pager",
+      "body": "Pager is {{v1}}."
+    },
+    {
+      "op": "update",
+      "as": "mallory",
+      "ref": "n",
+      "body": "Pager is {{v2}}."
+    },
+    {
+      "op": "history",
+      "as": "boss",
+      "ref": "n",
+      "id": "h"
+    }
+  ],
+  "expect": [
+    {
+      "check": "contains_text",
+      "step": "h",
+      "text": "alice",
+      "desc": "the earlier version names its writer"
+    },
+    {
+      "check": "contains_text",
+      "step": "h",
+      "text": "{{v1}}",
+      "desc": "the earlier text is there"
+    }
+  ]
+}

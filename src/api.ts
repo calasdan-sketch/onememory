@@ -17,6 +17,7 @@ import {
   ValidationError,
   QuarantinedError,
   RebuildBusyError,
+  StaleWriteError,
   NoteUnreadableError,
   type ImportReport,
   attestationsToShow,
@@ -94,6 +95,7 @@ import {
   ClaimConflictError,
 } from "./tasks.js";
 import { ackChanges } from "./changes.js";
+import { SupersedeError, supersedePreview, supersedeConfirm, supersedeUndo, noteHistory, restoreVersion, purgeNoteHistory, type Caller } from "./supersede.js";
 import { assertPlainWriteTags } from "./reserved-tags.js";
 import { waitForChanges, parseWait, WaitBusyError } from "./change-wait.js";
 import type { LintFinding } from "./lint.js";
@@ -122,6 +124,8 @@ function requiredScope(method: string | undefined, path: string): Scope {
   // Restoring is equally admin: it re-exposes a note an operator retired.
   if (method === "POST" && /^\/notes\/\d+\/(archive|restore)$/.test(path)) return "admin";
   if (method === "POST" && path === "/sweep-expired") return "admin";
+  // A note's earlier versions can hold text that was taken out on purpose: administrators only, reads included.
+  if (/^\/notes\/\d+\/history(\/restore)?$/.test(path)) return "admin";
   if (method === "POST" || method === "PUT") return "write";
   return "read";
 }
@@ -135,7 +139,11 @@ function sendError(res: ServerResponse, e: unknown): void {
     sendJson(res, 202, { quarantined: { id: e.quarantineId, reasons: e.findings } });
     return;
   }
-  if (e instanceof ValidationError) {
+  if (e instanceof SupersedeError) {
+    sendJson(res, e.status, { error: e.message, ...(e.warning ? { warning: e.warning } : {}) });
+  } else if (e instanceof StaleWriteError) {
+    sendJson(res, 409, { error: e.message });
+  } else if (e instanceof ValidationError) {
     sendJson(res, 400, { error: e.message });
   } else if (e instanceof NoteUnreadableError) {
     console.error("[onememory] " + e.message);
@@ -194,6 +202,18 @@ function writerFilter(url: URL): WriterFilter {
     ...(is !== null && is !== "" ? { writtenBy: is } : {}),
     ...(not !== null && not !== "" ? { notWrittenBy: not } : {}),
     ...(flagParam(url, "include_distrusted") ? { includeDistrusted: true } : {}),
+  };
+}
+
+/**
+ * `?include_superseded=1` also lists notes a confirmed replacement retired (always labelled `status: "superseded"`);
+ * `?superseded=1` lists only those. Both are read-scoped, like `includeArchived`: seeing that a note was replaced is not privileged.
+ */
+type SupersededFilter = { includeSuperseded?: boolean; supersededOnly?: boolean };
+function supersededFilter(url: URL): SupersededFilter {
+  return {
+    ...(flagParam(url, "include_superseded") ? { includeSuperseded: true } : {}),
+    ...(flagParam(url, "superseded") ? { supersededOnly: true } : {}),
   };
 }
 
@@ -309,7 +329,7 @@ export function createApiServer(
     offset?: number,
     includeArchived?: boolean,
     archivedOnly?: boolean,
-    wf: WriterFilter = {}
+    wf: WriterFilter & SupersededFilter = {}
   ): { notes: NoteRecord[]; total: number } =>
     store.list({ namespaces: readable(ctx), limit, offset, includeArchived, archivedOnly, ...wf });
 
@@ -484,6 +504,7 @@ export function createApiServer(
           return;
         }
         if (parsed.forget_after !== undefined) parsed.forget_after = coerceNumeric(parsed.forget_after) as number;
+        if (parsed.confidence !== undefined) parsed.confidence = coerceNumeric(parsed.confidence) as number;
         try {
           // When namespace resolution is active the client-supplied namespace
           // is untrusted: writes always land in the server-resolved namespace.
@@ -559,6 +580,21 @@ export function createApiServer(
           return;
         }
         if (parsed && parsed.forget_after !== undefined) parsed.forget_after = coerceNumeric(parsed.forget_after) as number;
+        if (parsed && parsed.confidence !== undefined && parsed.confidence !== null) parsed.confidence = coerceNumeric(parsed.confidence) as number;
+        // Compare-and-swap, as in the MCP tool state_write: `if_rev` is the revision the caller last read; the edit is
+        // refused (409) when the note has moved on, instead of silently replacing a newer write.
+        let ifRev: number | undefined;
+        if (parsed && typeof parsed === "object" && "if_rev" in parsed) {
+          const raw = coerceNumeric((parsed as { if_rev?: unknown }).if_rev);
+          delete (parsed as { if_rev?: unknown }).if_rev;
+          if (raw !== undefined && raw !== null) {
+            if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) {
+              sendJson(res, 400, { error: "if_rev must be a whole number (the rev you last read)" });
+              return;
+            }
+            ifRev = raw;
+          }
+        }
         try {
           if (nsCtx.active) {
             // The client-supplied namespace is dropped (the note keeps its
@@ -576,7 +612,7 @@ export function createApiServer(
           }
           if (parsed && parsed.tags !== undefined) assertPlainWriteTags(parsed.tags, store.read(id)?.tags); // gate-ok: tag-guard lookup only (no content returned)
           const warnings: LintFinding[] = [];
-          const note = store.update(id, parsed, { lintWarnings: warnings });
+          const note = store.update(id, parsed, { lintWarnings: warnings, ...(ifRev !== undefined ? { ifRev } : {}) });
           if (!note) {
             sendJson(res, 404, { error: "not found" });
             return;
@@ -654,6 +690,85 @@ export function createApiServer(
         return;
       }
 
+      // --- Replacing a memory (1.6.0): two steps, never silent, never destructive ---
+      // POST /supersede/preview   { old_ids: [..], new_note: {title, body?, tags?, confidence?} | new_id }  -> writes NOTHING
+      // POST /supersede/confirm   { token, new_note?, acknowledge_risk? }   the only call that changes anything
+      // POST /supersede/undo      { id }                                   bring a replaced note back (recorded)
+      // GET  /notes/:id/history   earlier versions (admin)        POST /notes/:id/history/restore { version, if_rev? } (admin)
+      // DELETE /notes/:id/history forget the earlier versions (admin)
+      if (path.startsWith("/supersede/") && req.method === "POST") {
+        const step = path.slice("/supersede/".length);
+        if (step !== "preview" && step !== "confirm" && step !== "undo") {
+          sendJson(res, 404, { error: "no such route" });
+          return;
+        }
+        const raw = await readBody(req);
+        let b: Record<string, unknown>;
+        try {
+          const v = JSON.parse(raw || "{}") as unknown;
+          if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error("not an object");
+          b = v as Record<string, unknown>;
+        } catch {
+          sendJson(res, 400, { error: "invalid JSON body (expected an object)" });
+          return;
+        }
+        const caller: Caller = { scope, ...(nsCtx.active ? { ownNamespace: nsCtx.ownNamespace } : {}) };
+        try {
+          if (step === "preview") {
+            const out = supersedePreview(
+              store,
+              caller,
+              { old_ids: b.old_ids, new_note: b.new_note as never, new_id: b.new_id },
+              "To go ahead, send POST /supersede/confirm with this code: {token}"
+            );
+            sendJson(res, 200, out);
+          } else if (step === "confirm") {
+            const out = supersedeConfirm(store, caller, { token: b.token, new_note: b.new_note as never, acknowledge_risk: b.acknowledge_risk });
+            await maybeEmbed(store, out.replacement);
+            sendJson(res, 200, out);
+          } else {
+            sendJson(res, 200, supersedeUndo(store, caller, coerceNumeric(b.id)));
+          }
+        } catch (e) {
+          sendError(res, e);
+        }
+        return;
+      }
+      const histMatch = /^\/notes\/(\d+)\/history(\/restore)?$/.exec(path);
+      if (histMatch) {
+        const hid = Number(histMatch[1]);
+        const caller: Caller = { scope, ...(nsCtx.active ? { ownNamespace: nsCtx.ownNamespace } : {}) };
+        try {
+          if (req.method === "GET" && !histMatch[2]) {
+            sendJson(res, 200, noteHistory(store, caller, hid, { includeDistrusted: flagParam(url, "include_distrusted") }));
+          } else if (req.method === "POST" && histMatch[2]) {
+            const raw = await readBody(req);
+            let b: { version?: unknown; if_rev?: unknown };
+            try {
+              b = JSON.parse(raw || "{}");
+            } catch {
+              sendJson(res, 400, { error: "invalid JSON body" });
+              return;
+            }
+            const ifRev = b.if_rev === undefined || b.if_rev === null ? undefined : coerceNumeric(b.if_rev);
+            if (ifRev !== undefined && (typeof ifRev !== "number" || !Number.isInteger(ifRev) || ifRev < 1)) {
+              sendJson(res, 400, { error: "if_rev must be a whole number (the rev you last read)" });
+              return;
+            }
+            const out = restoreVersion(store, caller, hid, coerceNumeric(b.version), ifRev !== undefined ? { ifRev: ifRev as number } : {});
+            await maybeEmbed(store, out.note);
+            sendJson(res, 200, out);
+          } else if (req.method === "DELETE" && !histMatch[2]) {
+            sendJson(res, 200, purgeNoteHistory(store, caller, hid));
+          } else {
+            sendJson(res, 404, { error: "no such route" });
+          }
+        } catch (e) {
+          sendError(res, e);
+        }
+        return;
+      }
+
       // Retention: POST /sweep-expired -> archive every note past its TTL.
       // Returns how many were archived. Safe to call on a timer/cron.
       if (req.method === "POST" && path === "/sweep-expired") {
@@ -681,7 +796,7 @@ export function createApiServer(
         // not privileged, and the namespace filter still applies.
         const includeArchived = url.searchParams.get("includeArchived") === "1";
         const archivedOnly = url.searchParams.get("archived") === "1";
-        const wf = writerFilter(url);
+        const wf = { ...writerFilter(url), ...supersededFilter(url) };
         if (nsCtx.active) {
           // Untrusted hint intersected with the readable set, like the MCP
           // state_list tool.
@@ -781,6 +896,7 @@ export function createApiServer(
             mode: parseMode(url.searchParams.get("mode")),
             timeRange: timePhrase ? { start: timePhrase.start, end: timePhrase.end } : undefined,
             ...writerFilter(url),
+            ...(flagParam(url, "include_superseded") ? { includeSuperseded: true } : {}),
           };
           if (hint) {
             if (explain) {
@@ -835,6 +951,7 @@ export function createApiServer(
           mode: parseMode(url.searchParams.get("mode")),
           timeRange: timePhrase ? { start: timePhrase.start, end: timePhrase.end } : undefined,
           ...writerFilter(url),
+          ...(flagParam(url, "include_superseded") ? { includeSuperseded: true } : {}),
         };
         if (explain) {
           const hits = await runSearchExplained(store, q, singleOpts);
@@ -1377,7 +1494,7 @@ export function createApiServer(
         let first = true;
         try {
           for (;;) {
-            const page = store.exportBatch(afterId, EXPORT_PAGE_SIZE, { namespaces: exportNs, skipUnreadable, attest }); // gate-ok: GET /export is admin-only (a full backup)
+            const page = store.exportBatch(afterId, EXPORT_PAGE_SIZE, { namespaces: exportNs, skipUnreadable, attest, history: url.searchParams.get("history") !== "0" }); // gate-ok: GET /export is admin-only (a full backup)
             if (page.length === 0) break;
             afterId = page[page.length - 1].id;
             for (const note of page) {

@@ -1,0 +1,98 @@
+{
+  "id": "B31",
+  "suite": "contradiction",
+  "title": "A plain writer cannot undo an admin's replacement",
+  "what": "An admin hides a bad note by replacing it. The bad note's own writer must not be able to bring it back; only an admin can.",
+  "actors": {
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "mallory",
+      "ref": "bad",
+      "title": "{{proj}} advice",
+      "body": "Advice is {{v1}}."
+    },
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "good",
+      "title": "{{proj}} advice now",
+      "body": "Advice is now {{v2}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "boss",
+      "id": "pv",
+      "old": [
+        "bad"
+      ],
+      "new_ref": "good"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "boss",
+      "id": "cf",
+      "from": "pv"
+    },
+    {
+      "op": "supersede_undo",
+      "as": "mallory",
+      "ref": "bad",
+      "id": "sneak"
+    },
+    {
+      "op": "search",
+      "as": "mallory",
+      "q": "{{proj}} advice",
+      "id": "s"
+    },
+    {
+      "op": "supersede_undo",
+      "as": "boss",
+      "ref": "bad",
+      "id": "fix"
+    },
+    {
+      "op": "search",
+      "as": "boss",
+      "q": "{{proj}} advice",
+      "id": "s2"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "sneak",
+      "is": "denied",
+      "desc": "the note's own writer cannot undo the admin's replacement"
+    },
+    {
+      "check": "lacks",
+      "step": "s",
+      "ref": "bad",
+      "desc": "the bad note is still hidden"
+    },
+    {
+      "check": "outcome",
+      "step": "fix",
+      "is": "ok",
+      "desc": "the admin can bring it back"
+    },
+    {
+      "check": "has",
+      "step": "s2",
+      "ref": "bad",
+      "desc": "after the admin's undo it is found again"
+    }
+  ]
+}

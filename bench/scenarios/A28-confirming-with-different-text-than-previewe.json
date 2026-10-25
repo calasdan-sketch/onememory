@@ -1,0 +1,74 @@
+{
+  "id": "A28",
+  "suite": "stale",
+  "title": "Confirming with different text than previewed is refused",
+  "what": "The person approved one replacement text. A confirm that swaps in other text must be refused and write nothing.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "old",
+      "title": "{{proj}} contact",
+      "body": "Contact is {{v1}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_note": {
+        "title": "{{proj}} contact now",
+        "body": "Contact is now {{v2}}."
+      }
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "alice",
+      "id": "cf",
+      "from": "pv",
+      "new_note": {
+        "title": "{{proj}} contact now",
+        "body": "Contact is now {{v3}}."
+      }
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} contact",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "cf",
+      "is": "invalid",
+      "desc": "different text than the preview is refused"
+    },
+    {
+      "check": "has",
+      "step": "s",
+      "ref": "old",
+      "desc": "the old note is untouched"
+    },
+    {
+      "check": "no_text",
+      "step": "s",
+      "text": "{{v3}}",
+      "desc": "the swapped-in text was never written"
+    }
+  ]
+}

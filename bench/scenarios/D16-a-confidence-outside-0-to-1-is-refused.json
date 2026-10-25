@@ -1,0 +1,32 @@
+{
+  "id": "D16",
+  "suite": "provenance",
+  "title": "A confidence outside 0 to 1 is refused",
+  "what": "A confidence must be a number from 0 to 1; anything else is refused instead of stored.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "bad",
+      "title": "{{proj}} wild",
+      "body": "x {{tok}}.",
+      "confidence": 1.5
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "write:bad",
+      "is": "invalid",
+      "desc": "1.5 is refused"
+    }
+  ]
+}

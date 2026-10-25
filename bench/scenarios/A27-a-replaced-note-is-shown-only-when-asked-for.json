@@ -1,0 +1,98 @@
+{
+  "id": "A27",
+  "suite": "stale",
+  "title": "A replaced note is shown only when asked for, and labelled",
+  "what": "Search and lists skip replaced notes by default. Asking for them shows them with a clear label and a link to the note that replaced them.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede",
+    "list"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "old",
+      "title": "{{proj}} port",
+      "body": "Port is {{v1}}."
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "new",
+      "title": "{{proj}} port now",
+      "body": "Port is now {{v2}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "alice",
+      "id": "cf",
+      "from": "pv"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} port",
+      "id": "plain"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} port",
+      "id": "withold",
+      "include_superseded": true
+    },
+    {
+      "op": "list",
+      "as": "alice",
+      "id": "l",
+      "include_superseded": true
+    }
+  ],
+  "expect": [
+    {
+      "check": "lacks",
+      "step": "plain",
+      "ref": "old",
+      "desc": "a normal search does not show the replaced note"
+    },
+    {
+      "check": "has",
+      "step": "withold",
+      "ref": "old",
+      "desc": "asking for replaced notes shows it"
+    },
+    {
+      "check": "field",
+      "step": "withold",
+      "of": "old",
+      "path": "status",
+      "equals": "superseded",
+      "desc": "the replaced note is labelled as replaced"
+    },
+    {
+      "check": "field",
+      "step": "l",
+      "of": "old",
+      "path": "superseded_by",
+      "present": true,
+      "desc": "the list says which note replaced it"
+    }
+  ]
+}

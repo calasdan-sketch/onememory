@@ -1,0 +1,49 @@
+{
+  "id": "A16",
+  "suite": "stale",
+  "title": "A lone old note is returned but flagged",
+  "what": "Nothing replaced it, so it is still the best answer, but it is 200 days old. The system must say so.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "restore"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "n",
+      "title": "{{proj}} vendor contract end",
+      "body": "The {{proj}} vendor contract ends on {{d}}.",
+      "age_days": 200
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} vendor contract",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "top",
+      "step": "s",
+      "ref": "n",
+      "desc": "still found"
+    },
+    {
+      "check": "field",
+      "step": "s",
+      "path": "stale",
+      "desc": "flagged stale",
+      "of": "n",
+      "equals": true
+    }
+  ]
+}

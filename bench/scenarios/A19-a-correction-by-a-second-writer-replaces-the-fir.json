@@ -1,0 +1,69 @@
+{
+  "id": "A19",
+  "suite": "stale",
+  "title": "A correction by a second writer replaces the first writer's value",
+  "what": "Alice writes a value, the admin edits it. The current value wins and the note shows the admin as the last writer.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} meeting room",
+      "body": "Weekly meeting room: {{r1}}."
+    },
+    {
+      "op": "update",
+      "as": "boss",
+      "ref": "n",
+      "body": "Weekly meeting room: {{r2}}."
+    },
+    {
+      "op": "read",
+      "as": "alice",
+      "ref": "n",
+      "id": "after"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} meeting room",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "fresh_answer",
+      "step": "s",
+      "desc": "Current value first",
+      "current": "n",
+      "stale_text": [
+        "{{r1}}"
+      ]
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "writer",
+      "desc": "the last writer is the one who made the correction",
+      "equals": "boss"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "creator",
+      "desc": "the first writer is still recorded",
+      "equals": "alice"
+    }
+  ]
+}

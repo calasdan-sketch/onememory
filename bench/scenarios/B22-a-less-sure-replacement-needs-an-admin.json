@@ -1,0 +1,63 @@
+{
+  "id": "B22",
+  "suite": "contradiction",
+  "title": "A less sure replacement needs an admin",
+  "what": "A new note that claims lower confidence than the one it would hide must not be able to hide it without an admin.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} dns",
+      "body": "DNS is {{v1}}.",
+      "confidence": 0.9
+    },
+    {
+      "op": "supersede_preview",
+      "as": "mallory",
+      "id": "pv",
+      "old": [
+        "n"
+      ],
+      "new_note": {
+        "title": "{{proj}} dns now",
+        "body": "DNS is {{v2}}.",
+        "confidence": 0.2
+      }
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} dns",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "pv",
+      "is": "denied",
+      "desc": "a write-level writer is refused"
+    },
+    {
+      "check": "has",
+      "step": "s",
+      "ref": "n",
+      "desc": "the more sure note is still there"
+    }
+  ]
+}

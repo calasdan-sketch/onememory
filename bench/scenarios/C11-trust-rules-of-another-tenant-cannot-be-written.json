@@ -1,0 +1,78 @@
+{
+  "id": "C11",
+  "suite": "isolation",
+  "title": "Trust rules of another tenant cannot be written",
+  "what": "Tenant B's admin tries to distrust a writer inside tenant A (and globally with '*'). Refused. Tenant A's note stays visible.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "aAdmin": {
+      "scope": "admin",
+      "namespace": "tenantA",
+      "writer": "adminA"
+    },
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    }
+  },
+  "needs": [
+    "trust"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "n",
+      "title": "{{proj}} a policy",
+      "body": "Policy {{canA}}."
+    },
+    {
+      "op": "distrust",
+      "as": "bAdmin",
+      "writer": "agentA",
+      "namespace": "tenantA",
+      "id": "inA"
+    },
+    {
+      "op": "distrust",
+      "as": "bAdmin",
+      "writer": "agentA",
+      "namespace": "*",
+      "id": "inAll"
+    },
+    {
+      "op": "search",
+      "as": "aAdmin",
+      "q": "{{proj}} a policy",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "inA",
+      "is": "denied",
+      "desc": "distrusting inside tenant A is refused",
+      "metric": "leak"
+    },
+    {
+      "check": "outcome",
+      "step": "inAll",
+      "is": "denied",
+      "desc": "a global rule is refused",
+      "metric": "leak"
+    },
+    {
+      "check": "has",
+      "step": "s",
+      "ref": "n",
+      "desc": "tenant A's note is still visible",
+      "metric": "leak"
+    }
+  ]
+}

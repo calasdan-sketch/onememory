@@ -1,0 +1,71 @@
+{
+  "id": "A13",
+  "suite": "stale",
+  "title": "A note past its deletion deadline is swept out",
+  "what": "A note carries a deletion deadline that has passed. After the sweep it must not be returned by search, but an admin can still list it as archived.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "restore",
+    "retire",
+    "list"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "n",
+      "title": "{{proj}} temporary promo code",
+      "body": "Use promo code {{code}} for {{proj}}.",
+      "expires_in_days": -1
+    },
+    {
+      "op": "sweep",
+      "as": "boss",
+      "id": "sw"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} promo code",
+      "id": "s"
+    },
+    {
+      "op": "list",
+      "as": "boss",
+      "id": "arch",
+      "include_archived": true
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "sw",
+      "is": "ok",
+      "desc": "the sweep runs"
+    },
+    {
+      "check": "fresh_answer",
+      "step": "s",
+      "desc": "The expired value is not returned",
+      "stale": [
+        "n"
+      ],
+      "stale_text": [
+        "{{code}}"
+      ]
+    },
+    {
+      "check": "has",
+      "step": "arch",
+      "ref": "n",
+      "desc": "the expired note is kept (archived), not destroyed"
+    }
+  ]
+}

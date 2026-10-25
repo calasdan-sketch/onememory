@@ -1,0 +1,68 @@
+{
+  "id": "A09",
+  "suite": "stale",
+  "title": "Editing only the title drops the old title from search",
+  "what": "A partial update with just a new title: searching for a word that only the old title had must find nothing, while the body is untouched.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    }
+  },
+  "needs": [
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{oldt}} plan",
+      "body": "Kickoff happens on {{day}}."
+    },
+    {
+      "op": "update",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{newt}} plan"
+    },
+    {
+      "op": "read",
+      "as": "alice",
+      "ref": "n",
+      "id": "after"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{oldt}}",
+      "id": "olds"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{newt}}",
+      "id": "news"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "after",
+      "path": "body",
+      "desc": "the body is unchanged",
+      "equals": "Kickoff happens on {{day}}."
+    },
+    {
+      "check": "hit_count",
+      "step": "olds",
+      "desc": "the old title word finds nothing",
+      "is": 0
+    },
+    {
+      "check": "top",
+      "step": "news",
+      "ref": "n",
+      "desc": "the new title finds the note"
+    }
+  ]
+}

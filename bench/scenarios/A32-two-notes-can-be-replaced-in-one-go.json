@@ -1,0 +1,89 @@
+{
+  "id": "A32",
+  "suite": "stale",
+  "title": "Two notes can be replaced in one go",
+  "what": "One correction can retire several older notes at once, and the warning counts them.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "o1",
+      "title": "{{proj}} limit",
+      "body": "Limit is {{v1}}."
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "o2",
+      "title": "{{proj}} limit again",
+      "body": "Limit is {{v2}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "o1",
+        "o2"
+      ],
+      "new_note": {
+        "title": "{{proj}} limit final",
+        "body": "Limit is {{v3}}."
+      }
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "alice",
+      "id": "cf",
+      "from": "pv",
+      "new_note": {
+        "title": "{{proj}} limit final",
+        "body": "Limit is {{v3}}."
+      },
+      "ref": "new"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} limit",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "contains_text",
+      "step": "pv",
+      "text": "replace 2 notes",
+      "desc": "the warning says how many notes will be replaced"
+    },
+    {
+      "check": "lacks",
+      "step": "s",
+      "ref": "o1",
+      "desc": "first old note hidden"
+    },
+    {
+      "check": "lacks",
+      "step": "s",
+      "ref": "o2",
+      "desc": "second old note hidden"
+    },
+    {
+      "check": "top",
+      "step": "s",
+      "ref": "new",
+      "desc": "the new note is first"
+    }
+  ]
+}

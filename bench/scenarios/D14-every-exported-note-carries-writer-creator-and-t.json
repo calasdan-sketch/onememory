@@ -1,0 +1,79 @@
+{
+  "id": "D14",
+  "suite": "provenance",
+  "title": "Every exported note carries writer, creator and timestamps",
+  "what": "A full export is the backup. For every note in it the provenance fields must be present, not just the content.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "export_import"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} exported note",
+      "body": "Body {{tok}}.",
+      "source": "x"
+    },
+    {
+      "op": "export",
+      "as": "boss",
+      "id": "dump"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "dump",
+      "path": "writer",
+      "desc": "writer in the export",
+      "title": "{{proj}} exported note",
+      "equals": "alice",
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "dump",
+      "path": "creator",
+      "desc": "creator in the export",
+      "title": "{{proj}} exported note",
+      "equals": "alice",
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "dump",
+      "path": "created_at",
+      "desc": "created_at in the export",
+      "title": "{{proj}} exported note",
+      "present": true,
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "dump",
+      "path": "updated_at",
+      "desc": "updated_at in the export",
+      "title": "{{proj}} exported note",
+      "present": true,
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "dump",
+      "path": "source",
+      "desc": "source in the export",
+      "title": "{{proj}} exported note",
+      "equals": "x",
+      "metric": "field"
+    }
+  ]
+}

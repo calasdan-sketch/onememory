@@ -1,0 +1,64 @@
+{
+  "id": "B08",
+  "suite": "contradiction",
+  "title": "After a weak overwrite the trusted original text can be recovered",
+  "what": "A note is overwritten in place. An admin must be able to get the trusted original text back from the note's history.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "changes",
+    "export_import",
+    "history"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "n",
+      "title": "{{proj}} backup schedule",
+      "body": "Backups run nightly at {{t}}."
+    },
+    {
+      "op": "update",
+      "as": "mallory",
+      "ref": "n",
+      "body": "Backups are disabled."
+    },
+    {
+      "op": "changes",
+      "as": "boss",
+      "id": "feed"
+    },
+    {
+      "op": "export",
+      "as": "boss",
+      "id": "dump"
+    },
+    {
+      "op": "history",
+      "as": "boss",
+      "ref": "n",
+      "id": "hist"
+    }
+  ],
+  "expect": [
+    {
+      "check": "contains_text",
+      "steps": [
+        "hist"
+      ],
+      "text": "{{t}}",
+      "desc": "the trusted original text is still available to an admin (in the note's history)",
+      "metric": "silent_overwrite"
+    }
+  ]
+}

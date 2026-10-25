@@ -1,0 +1,122 @@
+{
+  "id": "C12",
+  "suite": "isolation",
+  "title": "A read grant lets B read A, never write",
+  "what": "The operator grants tenant B read access to tenant A. B may search A's notes; B may not edit or delete them; A still cannot read B.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    },
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    }
+  },
+  "grants": {
+    "tenantB": [
+      "tenantA"
+    ]
+  },
+  "needs": [
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "n",
+      "title": "{{proj}} grant doc",
+      "body": "From A {{canA}}."
+    },
+    {
+      "op": "write",
+      "as": "b1",
+      "ref": "m",
+      "title": "{{proj}} grant doc B",
+      "body": "From B {{canB}}."
+    },
+    {
+      "op": "search",
+      "as": "b1",
+      "q": "{{canA}}",
+      "id": "bReadsA"
+    },
+    {
+      "op": "update",
+      "as": "b1",
+      "ref": "n",
+      "body": "hacked",
+      "id": "bw"
+    },
+    {
+      "op": "delete",
+      "as": "bAdmin",
+      "ref": "n",
+      "id": "bd"
+    },
+    {
+      "op": "search",
+      "as": "a1",
+      "q": "{{canB}}",
+      "id": "aReadsB"
+    },
+    {
+      "op": "read",
+      "as": "a1",
+      "ref": "n",
+      "id": "after"
+    }
+  ],
+  "expect": [
+    {
+      "check": "has",
+      "step": "bReadsA",
+      "ref": "n",
+      "desc": "B can read A through the grant",
+      "metric": "unexpected_denial"
+    },
+    {
+      "check": "outcome",
+      "step": "bw",
+      "is": [
+        "denied",
+        "not_found"
+      ],
+      "desc": "B cannot edit A's note",
+      "metric": "leak"
+    },
+    {
+      "check": "outcome",
+      "step": "bd",
+      "is": [
+        "denied",
+        "not_found"
+      ],
+      "desc": "B's admin cannot delete A's note",
+      "metric": "leak"
+    },
+    {
+      "check": "hit_count",
+      "step": "aReadsB",
+      "desc": "A cannot read B (grants are one-way)",
+      "is": 0,
+      "metric": "leak"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "body",
+      "desc": "A's note is unchanged",
+      "equals": "From A {{canA}}.",
+      "metric": "leak"
+    }
+  ]
+}

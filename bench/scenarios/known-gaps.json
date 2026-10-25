@@ -1,0 +1,32 @@
+{
+  "GAP-SUPERSEDE": {
+    "title": "A new note does not retire the old one",
+    "summary": "Fixed in 1.6.0: replacing a note is a two-step action (preview, then confirm with a one-time code). The old note is kept, marked as replaced, hidden from search and lists, and can be brought back with undo.",
+    "status": "fixed",
+    "fixed_in": "1.6.0"
+  },
+  "GAP-RECENCY": {
+    "title": "A flagged-stale note can still rank above a fresher one",
+    "summary": "Fixed in 1.6.0: when two notes about the same thing are close in meaning, the newer one now ranks first and the flagged-stale older twin is kept behind it.",
+    "status": "fixed",
+    "fixed_in": "1.6.0"
+  },
+  "GAP-HISTORY": {
+    "title": "No version history of note bodies",
+    "summary": "Fixed in 1.6.0: every edit saves the earlier version (bounded, admin-only, encrypted at rest when encryption is on). An admin can list earlier versions and restore one; a restore is a new version.",
+    "status": "fixed",
+    "fixed_in": "1.6.0"
+  },
+  "GAP-REST-CAS": {
+    "title": "REST updates have no compare-and-swap",
+    "summary": "The MCP tool state_write accepts if_rev and refuses an edit made on an out-of-date copy. The REST PUT /notes/:id ignored it, so a stale REST edit silently replaced a newer one. Fixed in 1.5.0: PUT now takes if_rev and answers 409.",
+    "status": "fixed",
+    "fixed_in": "1.5.0"
+  },
+  "GAP-CONFIDENCE": {
+    "title": "No confidence field",
+    "summary": "Fixed in 1.6.0: a note can carry an optional confidence (0 to 1). It is the writer's claim, it is labelled as such, it survives edits, export and import, and it never overrides the trust rules.",
+    "status": "fixed",
+    "fixed_in": "1.6.0"
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "id": "A18",
+  "suite": "stale",
+  "title": "Twenty unrelated notes do not hide the current value",
+  "what": "Same as an in-place correction, but with 20 other notes in the store.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    }
+  },
+  "distractors": 20,
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} sprint goal",
+      "body": "Sprint goal: {{g1}}."
+    },
+    {
+      "op": "update",
+      "as": "alice",
+      "ref": "n",
+      "body": "Sprint goal: {{g2}}."
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} sprint goal",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "fresh_answer",
+      "step": "s",
+      "desc": "Current value first with 20 other notes present",
+      "current": "n",
+      "stale_text": [
+        "{{g1}}"
+      ]
+    }
+  ]
+}

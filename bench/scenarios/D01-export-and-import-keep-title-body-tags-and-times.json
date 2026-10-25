@@ -1,0 +1,107 @@
+{
+  "id": "D01",
+  "suite": "provenance",
+  "title": "Export and import keep title, body, tags and timestamps",
+  "what": "A note is exported from one server and imported into a fresh one. The content and both timestamps must survive unchanged.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    },
+    "importer": {
+      "scope": "admin",
+      "server": "fresh"
+    }
+  },
+  "needs": [
+    "export_import",
+    "list"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} moved note",
+      "body": "Body {{tok}}.",
+      "tags": [
+        "a",
+        "b"
+      ]
+    },
+    {
+      "op": "export",
+      "as": "boss",
+      "id": "dump"
+    },
+    {
+      "op": "import",
+      "as": "importer",
+      "from": "dump",
+      "id": "imp"
+    },
+    {
+      "op": "list",
+      "as": "importer",
+      "id": "l"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "l",
+      "path": "title",
+      "desc": "title kept",
+      "title": "{{proj}} moved note",
+      "equals": "{{proj}} moved note",
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "l",
+      "path": "body",
+      "desc": "body kept",
+      "title": "{{proj}} moved note",
+      "equals": "Body {{tok}}.",
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "l",
+      "path": "tags",
+      "desc": "tags kept",
+      "title": "{{proj}} moved note",
+      "equals": [
+        "a",
+        "b"
+      ],
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "l",
+      "path": "created_at",
+      "desc": "created_at kept",
+      "title": "{{proj}} moved note",
+      "same_as": {
+        "step": "write:n",
+        "path": "created_at"
+      },
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "l",
+      "path": "updated_at",
+      "desc": "updated_at kept",
+      "title": "{{proj}} moved note",
+      "same_as": {
+        "step": "write:n",
+        "path": "updated_at"
+      },
+      "metric": "field"
+    }
+  ]
+}

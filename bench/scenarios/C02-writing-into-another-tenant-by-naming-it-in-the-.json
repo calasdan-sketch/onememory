@@ -1,0 +1,72 @@
+{
+  "id": "C02",
+  "suite": "isolation",
+  "title": "Writing into another tenant by naming it in the request",
+  "what": "Tenant B sends a note claiming namespace tenantA. The server must file it under tenant B and ignore the claim.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    }
+  },
+  "steps": [
+    {
+      "op": "write",
+      "as": "b1",
+      "ref": "n",
+      "title": "{{proj}} planted note",
+      "body": "Planted {{canB}}.",
+      "namespace": "tenantA"
+    },
+    {
+      "op": "search",
+      "as": "a1",
+      "q": "{{proj}} planted note",
+      "id": "asA"
+    },
+    {
+      "op": "search",
+      "as": "b1",
+      "q": "{{proj}} planted note",
+      "id": "asB"
+    }
+  ],
+  "expect": [
+    {
+      "check": "lacks",
+      "step": "asA",
+      "ref": "n",
+      "desc": "tenant A never sees the planted note",
+      "metric": "leak"
+    },
+    {
+      "check": "no_text",
+      "step": "asA",
+      "text": "{{canB}}",
+      "desc": "no planted text reaches tenant A",
+      "metric": "leak"
+    },
+    {
+      "check": "field",
+      "step": "asB",
+      "path": "namespace",
+      "desc": "the note lives in tenant B",
+      "of": "n",
+      "equals": "tenantB",
+      "metric": "leak"
+    },
+    {
+      "check": "has",
+      "step": "asB",
+      "ref": "n",
+      "desc": "tenant B can find its own note",
+      "metric": "unexpected_denial"
+    }
+  ]
+}

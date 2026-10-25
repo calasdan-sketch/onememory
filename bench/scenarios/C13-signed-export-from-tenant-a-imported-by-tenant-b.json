@@ -1,0 +1,112 @@
+{
+  "id": "C13",
+  "suite": "isolation",
+  "title": "Signed export from tenant A, imported by tenant B's admin",
+  "what": "Tenant A's admin exports with signatures. Tenant B's admin imports it into B. The notes land in B, are flagged unverified, and B's admin cannot make the server believe A's signing key (that list is server-wide).",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "aAdmin": {
+      "scope": "admin",
+      "namespace": "tenantA",
+      "writer": "adminA"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    },
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    },
+    "root": {
+      "scope": "admin",
+      "writer": "root"
+    }
+  },
+  "needs": [
+    "export_import",
+    "attestation",
+    "list"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "n",
+      "title": "{{proj}} signed note",
+      "body": "Signed {{canA}}."
+    },
+    {
+      "op": "export",
+      "as": "aAdmin",
+      "attest": true,
+      "id": "dump"
+    },
+    {
+      "op": "trust_server",
+      "as": "bAdmin",
+      "of": "main",
+      "id": "tr"
+    },
+    {
+      "op": "import",
+      "as": "bAdmin",
+      "from": "dump",
+      "id": "imp"
+    },
+    {
+      "op": "list",
+      "as": "bAdmin",
+      "id": "l"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "tr",
+      "is": "denied",
+      "desc": "a tenant admin cannot add a trusted signer",
+      "metric": "leak"
+    },
+    {
+      "check": "outcome",
+      "step": "imp",
+      "is": "ok",
+      "desc": "the import itself works",
+      "metric": "unexpected_denial"
+    },
+    {
+      "check": "field",
+      "step": "l",
+      "path": "namespace",
+      "desc": "the imported note lives in tenant B",
+      "title": "{{proj}} signed note",
+      "equals": "tenantB",
+      "metric": "leak"
+    },
+    {
+      "check": "field",
+      "step": "l",
+      "path": "imported_unverified",
+      "desc": "and is flagged unverified",
+      "title": "{{proj}} signed note",
+      "equals": true,
+      "metric": "leak"
+    },
+    {
+      "check": "field",
+      "step": "l",
+      "path": "attested_writer",
+      "desc": "no vouched-for author is claimed",
+      "title": "{{proj}} signed note",
+      "present": false,
+      "metric": "leak"
+    }
+  ]
+}

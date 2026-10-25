@@ -150,6 +150,15 @@ test("the packed tarball starts: every relative import resolves, runner-status a
     });
     assert.ok(tools.includes("runner_status"), "runner_status is served by the packed server");
     assert.ok(tools.includes("state_write"));
+
+    // 4. The benchmark runs from the tarball: its scenario files must be packed next to dist/ (one suite is enough here).
+    const bench = spawnSync(process.execPath, [join(src, "cli.js"), "bench", "--suite", "isolation", "--json"], { cwd: pkg, env, encoding: "utf8", timeout: 120000, maxBuffer: 20 * 1024 * 1024 });
+    assert.equal(bench.status, 0, `bench failed: ${bench.stdout.slice(0, 400)} ${bench.stderr}`);
+    const report = JSON.parse(bench.stdout) as { ok: boolean; summary: { scenarios: number }; suites: { isolation: { metrics: Record<string, unknown> } } };
+    assert.equal(report.ok, true);
+    assert.ok(report.summary.scenarios >= 15, "the packed benchmark found its scenarios");
+    assert.equal(report.suites.isolation.metrics["leakage-count"], 0);
+    assert.ok(existsSync(join(pkg, "bench", "scenarios", "known-gaps.json")), "known-gaps.json is packed");
   } finally {
     // Best effort: a Windows antivirus/indexer can briefly hold files. A failed
     // cleanup of a temp dir must never fail the smoke test itself.

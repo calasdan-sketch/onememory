@@ -1,0 +1,43 @@
+{
+  "id": "D10",
+  "suite": "provenance",
+  "title": "A confidence value is kept",
+  "what": "A writer says how sure it is (0.3). A system that has a confidence field returns it on read. OneMemory has none: it accepts the request and drops the value without telling the client.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} guess",
+      "body": "Probably {{tok}}.",
+      "confidence": 0.3
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "n",
+      "id": "after"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "after",
+      "path": "confidence",
+      "desc": "the confidence is returned unchanged",
+      "equals": 0.3,
+      "metric": "field"
+    }
+  ]
+}

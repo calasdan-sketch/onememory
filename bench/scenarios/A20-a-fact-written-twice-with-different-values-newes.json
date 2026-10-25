@@ -1,0 +1,62 @@
+{
+  "id": "A20",
+  "suite": "stale",
+  "title": "A fact written twice with different values, newest wins on tie",
+  "what": "Two notes with the very same title, the second written later with another value. A search on the title should put the later one first. The agent replaces the older note with the later one (preview, then confirm).",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "old",
+      "title": "{{proj}} status",
+      "body": "Status of {{proj}}: {{s1}}."
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "new",
+      "title": "{{proj}} status",
+      "body": "Status of {{proj}}: {{s2}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "alice",
+      "id": "cf",
+      "from": "pv"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} status",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "fresh_answer",
+      "step": "s",
+      "desc": "Later note first",
+      "current": "new",
+      "stale": [
+        "old"
+      ]
+    }
+  ]
+}

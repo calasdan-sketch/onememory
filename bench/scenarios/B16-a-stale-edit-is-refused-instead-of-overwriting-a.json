@@ -1,0 +1,73 @@
+{
+  "id": "B16",
+  "suite": "contradiction",
+  "title": "A stale edit is refused instead of overwriting a newer one",
+  "what": "Alice reads a note, Mallory changes it, then Alice saves her edit based on the old copy (compare-and-swap with the revision she saw). The server must refuse Alice's write instead of silently replacing Mallory's.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "cas",
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "n",
+      "title": "{{proj}} quota",
+      "body": "Quota is {{q1}}."
+    },
+    {
+      "op": "read",
+      "as": "alice",
+      "ref": "n",
+      "id": "seen"
+    },
+    {
+      "op": "update",
+      "as": "mallory",
+      "ref": "n",
+      "body": "Quota is {{q2}}."
+    },
+    {
+      "op": "update",
+      "as": "alice",
+      "ref": "n",
+      "body": "Quota is {{q3}}.",
+      "if_rev_of": "seen",
+      "id": "late"
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "n",
+      "id": "after"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "late",
+      "is": "conflict",
+      "desc": "the out-of-date edit is refused",
+      "metric": "silent_overwrite"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "body",
+      "desc": "the newer value is still there",
+      "equals": "Quota is {{q2}}.",
+      "metric": "silent_overwrite"
+    }
+  ]
+}

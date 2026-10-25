@@ -76,7 +76,18 @@ note's original author. Read [docs/trust.md](./docs/trust.md) for exactly what t
 - Heartbeats from runners older than 1.3.4 are no longer believed by default (`ONEMEMORY_RUNNER_ACCEPT_LEGACY=1`
   restores the old behaviour). A heartbeat counts only if the runner process wrote it and its own `alive_at` agrees
   with the server's clock within two minutes, so a tag-only touch of an old heartbeat does not make it fresh.
-- Pre-upgrade copies (`<db>.pre-v14-backup`) are plaintext snapshots: remove them
+- **Replacing a note (1.6.0)** is two steps: a preview that changes nothing, then a confirm that needs the preview's one-time
+  code. The code is signed with a key kept in the database, expires (default 10 minutes), works once, is bound to the caller
+  (writer, scope, tenant), to the exact notes and revisions previewed and to the exact replacement text, and a wrong code gets
+  one generic message. A distrusted writer, or a replacement that claims lower confidence, needs an administrator and an explicit
+  `acknowledge_risk`. Nothing is deleted and undo is recorded. **Limit:** over MCP and REST an agent stands between you and the
+  warning; the tool descriptions tell it to show the full warning and wait for you, and the code makes it impossible to confirm
+  without a preview, but a careless or manipulated agent could still confirm on its own. The command line asks you at your own
+  keyboard and is the strongest gate.
+- **Version history (1.6.0)** keeps the text an edit replaces, so it can hold text someone removed on purpose. It is administrators-only,
+  bounded per note, encrypted at rest when encryption is on (plaintext otherwise, like note bodies), included in `export` unless
+  `?history=0` / `--no-history`, and removable with `history purge`. Treat an export that carries history like the database.
+- Pre-upgrade copies (`<db>.pre-v15-backup`) are plaintext snapshots: remove them
   (`onememory backup --prune-premigration`) once the upgrade is checked, especially before enabling encryption.
 
 ## Encryption at rest (shipped in 1.2.0)

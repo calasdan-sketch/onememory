@@ -1,0 +1,62 @@
+{
+  "id": "A17",
+  "suite": "stale",
+  "title": "Editing an old note clears the stale flag",
+  "what": "A 200-day-old note is confirmed and rewritten today. It must stop being flagged stale.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "restore",
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "n",
+      "title": "{{proj}} licence renewal",
+      "body": "The {{proj}} licence renews on {{d1}}.",
+      "age_days": 200
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "n",
+      "id": "before"
+    },
+    {
+      "op": "update",
+      "as": "boss",
+      "ref": "n",
+      "body": "The {{proj}} licence renews on {{d2}}."
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "n",
+      "id": "after"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "before",
+      "path": "stale",
+      "desc": "before the edit it is flagged stale",
+      "equals": true
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "stale",
+      "desc": "after the edit it is not stale",
+      "equals": false
+    }
+  ]
+}

@@ -63,7 +63,7 @@ immediately visible through the others:
   `rev` for compare-and-swap, a provenance `source`, tags, and namespaces.
 - **`src/api.ts`** — a small HTTP/JSON API + a built-in web dashboard, on
   plain `node:http` (no framework).
-- **`src/mcp-server-core.ts`** — the transport-agnostic MCP server with twenty-two
+- **`src/mcp-server-core.ts`** — the transport-agnostic MCP server with twenty-eight
   tools, shared by both MCP transports.
 - **`src/mcp-stdio.ts`** — stdio entry point for local Claude Code / Desktop
   / editors.
@@ -111,6 +111,12 @@ immediately visible through the others:
 | `memory_consolidate` | admin | Merge 2+ notes (`dry_run`, `keep_sources`) |
 | `memory_rebuild_edges` | admin | Rebuild the similarity graph (confirmation gate above 2,000 notes) |
 | `memory_quarantine` | admin | List / approve / reject writes the memory linter held ([memory-linter.md](./memory-linter.md)) |
+| `memory_supersede_preview` | write | Step 1 of replacing notes: changes nothing; returns the plain-language "Are you sure?" warning and a one-time code ([replacing-memories.md](./replacing-memories.md)) |
+| `memory_supersede_confirm` | write | Step 2: replaces the previewed notes, only with the preview's code (once, in time, for the same caller). Nothing is deleted. A RED FLAG also needs an admin and `acknowledge_risk` |
+| `memory_supersede_undo` | write | Bring a replaced note back (recorded) |
+| `memory_history` | admin | Earlier versions of a note (bounded per note) |
+| `memory_restore_version` | admin | Put an earlier version back as a new version (`if_rev` supported) |
+| `memory_history_purge` | admin | Forget a note's earlier versions (cannot be undone) |
 | `trust_policy` | admin | The distrust list and the trusted export signers: `list`, `distrust`, `undistrust`, `add_attester`, `remove_attester`. A namespace-pinned admin sees and changes only its own namespace's rules ([trust.md](./trust.md)) |
 
 ## HTTP API
@@ -119,10 +125,15 @@ immediately visible through the others:
 `GET /notes` · `GET /search` · `POST /relevant` · `GET /stats` ·
 `POST /rebuild-edges` · `GET /export` · `POST /import` ·
 `POST /notes/:id/archive` · `POST /notes/:id/restore` · `POST /sweep-expired` ·
-`GET /changes`, plus open
+`GET /changes`, `POST /supersede/preview` · `POST /supersede/confirm` · `POST /supersede/undo`,
+`GET /notes/:id/history` · `POST /notes/:id/history/restore` · `DELETE /notes/:id/history` (admin), plus open
 `GET /health` (liveness) and `GET /ready` (DB-touch readiness, used by the
 Docker healthcheck) and the dashboard at `/`. Every route except `/health`,
 `/ready`, and the dashboard requires `Authorization: Bearer <token>`.
+
+`PUT /notes/:id` takes an optional `if_rev` (the `rev` you last read), as the MCP tool `state_write` does: if the note has
+been changed since, the edit is refused with `409 { error: "stale write: ..." }` instead of replacing the newer write. Without
+`if_rev` the last write wins, as before.
 `POST /relevant` takes `{ message, limit?, namespace? }` and mirrors the
 `state_relevant` tool (read-scoped, despite the POST method).
 `GET /stats` mirrors the `memory_stats` tool (read scope, namespace-gated
@@ -180,6 +191,8 @@ similarity edges, v5 `_meta` + gated FTS trigger, v6 edge indexes, v7
 `quarantine.written_by`; see [provenance.md](./provenance.md)), v14 (1.4.0) `notes.attested_writer` / `attested_by` /
 `merged_from_writers` (+ the matching `change_log.note_*` columns) and three tables: `trust_distrust` (the distrust
 rules, per namespace), `trust_attesters` (trusted export signers: key, pinned `server_id`, `label`, optional
-`not_after`) and `trust_log` (who changed the policy; newest 1000 rows kept); see [trust.md](./trust.md). Opening a
-v1-v13 database first writes a verified `<db>.pre-v14-backup`. There is no downgrade path: once a 1.1.0 binary
+`not_after`) and `trust_log` (who changed the policy; newest 1000 rows kept); see [trust.md](./trust.md), v15 (1.6.0) `notes.confidence` /
+`confidence_by` / `superseded_by` / `superseded_at` / `superseded_by_writer` and tables `note_history` (earlier versions, bounded per note),
+`supersede_used` (single-use confirmation codes) and `supersede_log`; see [replacing-memories.md](./replacing-memories.md). Opening a
+v1-v14 database first writes a verified `<db>.pre-v15-backup`. There is no downgrade path: once a 1.1.0 binary
 has opened a database, don't go back to 1.0.x.

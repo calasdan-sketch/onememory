@@ -1,0 +1,67 @@
+{
+  "id": "B21",
+  "suite": "contradiction",
+  "title": "A distrusted writer cannot replace a trusted note",
+  "what": "Replacing hides the original, so a writer the admin does not trust may not do it on their own.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede",
+    "trust"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} vault path",
+      "body": "Vault is {{v1}}."
+    },
+    {
+      "op": "distrust",
+      "as": "boss",
+      "writer": "mallory"
+    },
+    {
+      "op": "supersede_preview",
+      "as": "mallory",
+      "id": "pv",
+      "old": [
+        "n"
+      ],
+      "new_note": {
+        "title": "{{proj}} vault path now",
+        "body": "Vault is {{v2}}."
+      }
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} vault",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "pv",
+      "is": "denied",
+      "desc": "the distrusted writer is refused"
+    },
+    {
+      "check": "has",
+      "step": "s",
+      "ref": "n",
+      "desc": "the trusted note is still there"
+    }
+  ]
+}

@@ -1,0 +1,90 @@
+{
+  "id": "C21",
+  "suite": "isolation",
+  "title": "Merging notes across tenants",
+  "what": "Tenant B's admin tries to merge one of A's notes with one of its own. Refused; both notes survive.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    },
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    }
+  },
+  "needs": [
+    "merge"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "x",
+      "title": "{{proj}} dup note",
+      "body": "Dup {{canA}}."
+    },
+    {
+      "op": "write",
+      "as": "b1",
+      "ref": "y",
+      "title": "{{proj}} dup note copy",
+      "body": "Dup {{canB}}."
+    },
+    {
+      "op": "merge",
+      "as": "bAdmin",
+      "refs": [
+        "x",
+        "y"
+      ],
+      "ref": "m",
+      "id": "try"
+    },
+    {
+      "op": "search",
+      "as": "a1",
+      "q": "{{canA}}",
+      "id": "sa"
+    },
+    {
+      "op": "search",
+      "as": "b1",
+      "q": "{{canB}}",
+      "id": "sb"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "try",
+      "is": [
+        "denied",
+        "not_found"
+      ],
+      "desc": "the cross-tenant merge is refused",
+      "metric": "leak"
+    },
+    {
+      "check": "has",
+      "step": "sa",
+      "ref": "x",
+      "desc": "A's note survives",
+      "metric": "leak"
+    },
+    {
+      "check": "has",
+      "step": "sb",
+      "ref": "y",
+      "desc": "B's note survives",
+      "metric": "leak"
+    }
+  ]
+}

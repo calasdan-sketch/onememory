@@ -1,0 +1,74 @@
+{
+  "id": "A25",
+  "suite": "stale",
+  "title": "A note edited after the preview cannot be replaced by that preview",
+  "what": "If the old note changes between the preview and the confirm, the person saw something different from what would be hidden. The confirm must be refused.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "old",
+      "title": "{{proj}} owner",
+      "body": "Owner is {{v1}}."
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "new",
+      "title": "{{proj}} owner now",
+      "body": "Owner is now {{v2}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    },
+    {
+      "op": "update",
+      "as": "boss",
+      "ref": "old",
+      "body": "Owner is {{v3}} (edited after the preview)."
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "alice",
+      "id": "cf",
+      "from": "pv"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} owner",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "cf",
+      "is": "conflict",
+      "desc": "the confirm is refused because the note changed"
+    },
+    {
+      "check": "has",
+      "step": "s",
+      "ref": "old",
+      "desc": "the edited note is still found"
+    }
+  ]
+}

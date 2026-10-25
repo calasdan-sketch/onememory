@@ -1,0 +1,59 @@
+{
+  "id": "A04",
+  "suite": "stale",
+  "title": "Newer note beats an old note that is flagged stale",
+  "what": "The old value sits in a note that is 200 days old; a newer note holds the current value. Search must put the current one first, or at least flag the old one as stale.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "restore"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "old",
+      "title": "{{proj}} staging server",
+      "body": "The {{proj}} staging server IP is {{ip1}}.",
+      "age_days": 200
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "new",
+      "title": "{{proj}} staging server (current)",
+      "body": "The {{proj}} staging server IP is now {{ip2}}."
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} staging server ip",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "fresh_answer",
+      "step": "s",
+      "desc": "Current value first; the 200-day-old value is flagged stale if it shows up",
+      "current": "new",
+      "stale": [
+        "old"
+      ]
+    },
+    {
+      "check": "field",
+      "step": "s",
+      "path": "stale",
+      "desc": "the old note is flagged stale",
+      "of": "old",
+      "equals": true
+    }
+  ]
+}

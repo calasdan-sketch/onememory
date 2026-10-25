@@ -161,6 +161,58 @@ function applyStalePenalty(
 }
 
 /**
+ * A flagged-stale note never outranks a newer, fresh note about the SAME topic (1.6.0, GAP-RECENCY).
+ *
+ * The staleness penalty is a mild multiplier on the text-match score, so an old note whose words match the query a little
+ * better could still come first even though a newer note on the same subject is right there in the results. This pass looks
+ * only at stale hits and only at fresh hits that are close neighbours of them in the similarity graph (the same edges that
+ * power `neighbors`, built from the notes' own words), and moves the stale hit to just behind the newest such neighbour.
+ *
+ * It does not hide or drop anything, does not touch unrelated notes, and does nothing when the store has no edge between
+ * them (a deferred bulk import): a stable old fact with no newer neighbour keeps its place. Returns the ids that were
+ * moved and what they were put behind, for the explain view.
+ */
+/** A stale note whose read boost is at least this (about nine reads today, fewer if recent and many) is left where it ranks. */
+export const STALE_TWIN_ACTIVE_BOOST = 1.1;
+
+function demoteStaleTwins(
+  store: Store,
+  ranked: Array<{ note: NoteRecord; score: number }>,
+  cfg: StalenessConfig
+): { ranked: Array<{ note: NoteRecord; score: number }>; behind: Map<number, number> } {
+  const behind = new Map<number, number>();
+  if (ranked.length < 2) return { ranked, behind };
+  const out = [...ranked];
+  const staleIds = out.filter((h) => isStale(h.note, cfg).stale).map((h) => h.note.id);
+  if (staleIds.length === 0 || staleIds.length === out.length) return { ranked, behind };
+  for (const sid of staleIds) {
+    const si = out.findIndex((h) => h.note.id === sid);
+    const stale = out[si];
+    // A stale note somebody keeps coming back to (a clearly active read signal, boost >= 10%) keeps the place its reads earned:
+    // recency of USE is a relevance signal of its own (see accessBoostFactor), and this pass is only about notes nobody reads.
+    if (accessBoostFactor(stale.note.access_count, stale.note.last_accessed) >= STALE_TWIN_ACTIVE_BOOST) continue;
+    const near = store.neighbourIds(sid);
+    if (near.size === 0) continue;
+    // The LAST (lowest-ranked) fresh, newer neighbour below or above: the stale hit goes behind the lowest-ranked of them,
+    // so it is behind every newer fresh twin, wherever they sit.
+    let anchor = -1;
+    for (let i = 0; i < out.length; i++) {
+      const h = out[i];
+      if (h.note.id === sid || !near.has(h.note.id)) continue;
+      if (isStale(h.note, cfg).stale) continue;
+      if (Date.parse(h.note.updated_at) <= Date.parse(stale.note.updated_at)) continue;
+      anchor = i;
+    }
+    if (anchor > si) {
+      out.splice(si, 1);
+      out.splice(anchor, 0, stale); // after removal the anchor shifted up by one, so this lands right behind it
+      behind.set(sid, out[anchor - 1].note.id);
+    }
+  }
+  return { ranked: out, behind };
+}
+
+/**
  * Bump access counters for notes *returned* to the caller (the top N), never
  * for every note the scorer scanned. Importance weighting should reflect
  * actual reads, not index churn.
@@ -197,7 +249,7 @@ function finalizeResults(
   staleCfg: StalenessConfig
 ): NoteRecord[] {
   const ranked = accessRerankEnabled()
-    ? applyStalePenalty(boostAndRank(hits), staleCfg)
+    ? demoteStaleTwins(store, applyStalePenalty(boostAndRank(hits), staleCfg), staleCfg).ranked
     : [...hits].sort((a, b) => b.score - a.score); // native relevance only (stable)
   const notes = ranked.slice(0, limit).map((h) => h.note);
   bumpAccess(store, notes);
@@ -287,9 +339,10 @@ function finalizeExplained(
   // Capture native relevance per id BEFORE any boost, so the breakdown can
   // report the true base rather than the post-boost score.
   const baseById = new Map<number, number>(hits.map((h) => [h.note.id, h.score]));
-  const ranked = accessRerankEnabled()
-    ? applyStalePenalty(boostAndRank(hits), staleCfg)
-    : [...hits].sort((a, b) => b.score - a.score);
+  const demoted = accessRerankEnabled()
+    ? demoteStaleTwins(store, applyStalePenalty(boostAndRank(hits), staleCfg), staleCfg)
+    : { ranked: [...hits].sort((a, b) => b.score - a.score), behind: new Map<number, number>() };
+  const ranked = demoted.ranked;
   const top = ranked.slice(0, limit);
   bumpAccess(store, top.map((h) => h.note));
 
@@ -310,7 +363,9 @@ function finalizeExplained(
       ageDays: staleInfo.ageDays,
       stale: staleInfo.stale,
     };
-    return { note: h.note, breakdown: { ...partial, explanation: describeBreakdown(partial) } };
+    const behindId = demoted.behind.get(h.note.id);
+    const explanation = describeBreakdown(partial) + (behindId !== undefined ? ` Kept behind the newer note #${behindId} on the same topic.` : "");
+    return { note: h.note, breakdown: { ...partial, explanation } };
   });
 }
 
@@ -355,6 +410,8 @@ export interface SearchOpts {
   notWrittenBy?: string;
   /** Also return notes whose writer is on the namespace's distrust list. Default: they are left out. */
   includeDistrusted?: boolean;
+  /** Also return notes a confirmed replacement retired (always labelled `status: "superseded"`). Default: they are left out. */
+  includeSuperseded?: boolean;
 }
 
 /**
@@ -395,6 +452,7 @@ async function runSearchInner(
       : {}),
     ...writerOpts,
     ...(opts.includeDistrusted ? { includeDistrusted: true } : {}),
+    ...(opts.includeSuperseded ? { includeSuperseded: true } : {}),
   };
   const staleCfg = stalenessConfig();
 
@@ -500,6 +558,7 @@ async function runSearchExplainedInner(
       : {}),
     ...writerOpts,
     ...(opts.includeDistrusted ? { includeDistrusted: true } : {}),
+    ...(opts.includeSuperseded ? { includeSuperseded: true } : {}),
   };
   const staleCfg = stalenessConfig();
 

@@ -1,0 +1,63 @@
+{
+  "id": "C03",
+  "suite": "isolation",
+  "title": "Updating another tenant's note by id",
+  "what": "Tenant B tries to rewrite tenant A's note. Refused as 'not found', and the note is unchanged.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    }
+  },
+  "needs": [
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "n",
+      "title": "{{proj}} price list",
+      "body": "Prices {{canA}}."
+    },
+    {
+      "op": "update",
+      "as": "b1",
+      "ref": "n",
+      "body": "Prices {{canB}} (vandalised).",
+      "id": "try"
+    },
+    {
+      "op": "read",
+      "as": "a1",
+      "ref": "n",
+      "id": "after"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "try",
+      "is": [
+        "denied",
+        "not_found"
+      ],
+      "desc": "the cross-tenant update is refused",
+      "metric": "leak"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "body",
+      "desc": "tenant A's note is untouched",
+      "equals": "Prices {{canA}}.",
+      "metric": "leak"
+    }
+  ]
+}

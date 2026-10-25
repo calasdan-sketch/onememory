@@ -1,0 +1,71 @@
+{
+  "id": "C06",
+  "suite": "isolation",
+  "title": "Listing another tenant's notes",
+  "what": "Tenant B lists notes, asking for tenantA. Only tenant B's own notes may appear.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    }
+  },
+  "needs": [
+    "list"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "n",
+      "title": "{{proj}} hiring plan",
+      "body": "Hiring {{canA}}."
+    },
+    {
+      "op": "write",
+      "as": "b1",
+      "ref": "mine",
+      "title": "{{proj}} own note",
+      "body": "Mine {{canB}}."
+    },
+    {
+      "op": "list",
+      "as": "b1",
+      "id": "hinted",
+      "namespace": "tenantA"
+    },
+    {
+      "op": "list",
+      "as": "b1",
+      "id": "plain"
+    }
+  ],
+  "expect": [
+    {
+      "check": "no_text",
+      "step": "hinted",
+      "text": "{{canA}}",
+      "desc": "tenant A's text is not listed",
+      "metric": "leak"
+    },
+    {
+      "check": "no_text",
+      "step": "plain",
+      "text": "{{canA}}",
+      "desc": "tenant A's text is not listed",
+      "metric": "leak"
+    },
+    {
+      "check": "has",
+      "step": "plain",
+      "ref": "mine",
+      "desc": "tenant B sees its own note",
+      "metric": "unexpected_denial"
+    }
+  ]
+}

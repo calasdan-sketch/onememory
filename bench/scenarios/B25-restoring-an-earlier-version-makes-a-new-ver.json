@@ -1,0 +1,92 @@
+{
+  "id": "B25",
+  "suite": "contradiction",
+  "title": "Restoring an earlier version makes a new version",
+  "what": "Restoring does not erase anything: the text it replaces goes into the history too.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "history",
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "n",
+      "title": "{{proj}} rotation",
+      "body": "Rotation is {{v1}}."
+    },
+    {
+      "op": "update",
+      "as": "mallory",
+      "ref": "n",
+      "body": "Rotation is {{v2}}."
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "n",
+      "id": "before"
+    },
+    {
+      "op": "restore_version",
+      "as": "boss",
+      "ref": "n",
+      "version": 1,
+      "id": "rv"
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "n",
+      "id": "after"
+    },
+    {
+      "op": "history",
+      "as": "boss",
+      "ref": "n",
+      "id": "hist"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "rv",
+      "is": "ok",
+      "desc": "the restore works"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "body",
+      "equals": "Rotation is {{v1}}.",
+      "desc": "the earlier text is back"
+    },
+    {
+      "check": "field",
+      "step": "after",
+      "path": "rev",
+      "differs_from": {
+        "step": "before",
+        "path": "rev"
+      },
+      "desc": "it is a new version, not a rewind"
+    },
+    {
+      "check": "contains_text",
+      "step": "hist",
+      "text": "{{v2}}",
+      "desc": "the text that was replaced is still in the history"
+    }
+  ]
+}

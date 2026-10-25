@@ -1,0 +1,69 @@
+{
+  "id": "D15",
+  "suite": "provenance",
+  "title": "A confidence value is kept through an edit",
+  "what": "A change to the text must not drop the confidence, and a new value can be set later.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} guess2",
+      "body": "Probably {{tok}}.",
+      "confidence": 0.4
+    },
+    {
+      "op": "update",
+      "as": "alice",
+      "ref": "n",
+      "body": "Probably {{tok}} still."
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "n",
+      "id": "a"
+    },
+    {
+      "op": "update",
+      "as": "alice",
+      "ref": "n",
+      "confidence": 0.8
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "n",
+      "id": "b"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "a",
+      "path": "confidence",
+      "equals": 0.4,
+      "desc": "the confidence survives a text edit",
+      "metric": "field"
+    },
+    {
+      "check": "field",
+      "step": "b",
+      "path": "confidence",
+      "equals": 0.8,
+      "desc": "the confidence can be changed",
+      "metric": "field"
+    }
+  ]
+}
