@@ -444,14 +444,30 @@ export function createApiServer(
       // admin decision: a read or write token (or an agent holding one that a hostile
       // note talked into asking) gets a clear refusal, never the hidden notes.
       const isAdmin = scopeAllows(scope, "admin");
-      const refuseDistrustedOptIn = (): boolean => {
-        if (isAdmin) return false;
-        sendJson(res, 403, {
-          error: "include_distrusted needs an admin token: it shows notes from writers the admin put on the distrust list",
-        });
-        return true;
+      // A namespace-PINNED admin manages the rules of its OWN namespace only; the namespaces it merely has read grants on
+      // belong to their own admins, so the opt-in is honoured for the token's own namespace and nowhere else (it must say
+      // so with namespace=<own>, or name a note of its own namespace by id).
+      const pinnedWithGrants = (): boolean => nsCtx.active && readable(nsCtx).some((n) => n !== nsCtx.ownNamespace);
+      const refuseDistrustedOptIn = (nsHint?: string | null): boolean => {
+        if (!isAdmin) {
+          sendJson(res, 403, {
+            error: "include_distrusted needs an admin token: it shows notes from writers the admin put on the distrust list",
+          });
+          return true;
+        }
+        if (pinnedWithGrants() && (nsHint ?? "") !== nsCtx.ownNamespace) {
+          sendJson(res, 403, {
+            error:
+              `include_distrusted is honoured only for this token's own namespace ("${nsCtx.ownNamespace}"): pass namespace=${nsCtx.ownNamespace}. ` +
+              "The namespaces this token can only read are governed by their own admins.",
+          });
+          return true;
+        }
+        return false;
       };
-      if (flagParam(url, "include_distrusted") && refuseDistrustedOptIn()) return;
+      // (By-id reads carry no namespace parameter: they are checked against the note's own namespace where they read it.)
+      const byIdRead = req.method === "GET" && (/^\/notes\/\d+$/.test(path) || /^\/tasks\/\d+$/.test(path));
+      if (flagParam(url, "include_distrusted") && (byIdRead ? !isAdmin && refuseDistrustedOptIn() : refuseDistrustedOptIn(url.searchParams.get("namespace")))) return;
 
       // POST /notes
       if (req.method === "POST" && path === "/notes") {
@@ -494,10 +510,10 @@ export function createApiServer(
         // resolution there is no cross-namespace boundary, so the probe is
         // just a 404 check (denyUnreadable's canRead gate would 404 every
         // read when nsCtx.ownNamespace is "").
-        const probe = store.read(id);
+        const probe = store.read(id); // gate-ok: access probe: denyUnreadable/readVisible decide before anything is returned
         // A note whose writer an admin distrusts reads as "not found" unless
         // the caller opts in with ?include_distrusted=1 (admin only; then it is marked).
-        const wantDistrusted = flagParam(url, "include_distrusted");
+        const wantDistrusted = flagParam(url, "include_distrusted") && (!nsCtx.active || probe?.namespace === nsCtx.ownNamespace);
         if (nsCtx.active) {
           if (!denyUnreadable(nsCtx, res, probe)) return;
         } else if (!probe) {
@@ -549,7 +565,7 @@ export function createApiServer(
             // existing namespace), and the note must live in the server's
             // own namespace -- otherwise a PUT by id could rewrite a granted
             // namespace's notes (grants are read-only).
-            const existing = store.read(id);
+            const existing = store.read(id); // gate-ok: PUT: namespace check, then a hidden note reads as 404
             if (!denyUnwritable(nsCtx, res, existing)) return;
             delete parsed.namespace;
           }
@@ -558,7 +574,7 @@ export function createApiServer(
             sendJson(res, 404, { error: "not found" });
             return;
           }
-          if (parsed && parsed.tags !== undefined) assertPlainWriteTags(parsed.tags, store.read(id)?.tags);
+          if (parsed && parsed.tags !== undefined) assertPlainWriteTags(parsed.tags, store.read(id)?.tags); // gate-ok: tag-guard lookup only (no content returned)
           const warnings: LintFinding[] = [];
           const note = store.update(id, parsed, { lintWarnings: warnings });
           if (!note) {
@@ -579,7 +595,7 @@ export function createApiServer(
         if (nsCtx.active) {
           // Same own-namespace rule as the MCP state_delete tool: a read
           // grant never confers delete access.
-          if (!denyUnwritable(nsCtx, res, store.read(id))) return;
+          if (!denyUnwritable(nsCtx, res, store.read(id))) return; // gate-ok: archive/restore: denyUnwritable probe, hidden note is 404
         }
         const removed = store.delete(id);
         if (!removed) {
@@ -878,7 +894,7 @@ export function createApiServer(
           ...(bodyStr("not_written_by") ? { notWrittenBy: bodyStr("not_written_by") } : {}),
           ...(["1", "true", "yes"].includes(String((parsed as Record<string, unknown>).include_distrusted ?? "").toLowerCase()) ? { includeDistrusted: true } : {}),
         };
-        if (rwf.includeDistrusted && refuseDistrustedOptIn()) return;
+        if (rwf.includeDistrusted && refuseDistrustedOptIn(relNs ?? url.searchParams.get("namespace"))) return;
         // Results carry the same staleness fields as /search (the
         // vague-message path is the most likely to act on outdated facts).
         const withStaleness = (r: { keywords: string[]; results: NoteRecord[] }) => ({
@@ -952,7 +968,7 @@ export function createApiServer(
           searchedNamespaces = namespace ? [namespace] : [];
         }
         sendJson(res, 200, {
-          ...store.accessStats(namespaces),
+          ...store.accessStats(namespaces, { hideDistrusted: !isAdmin }),
           searchedNamespaces,
         });
         return;
@@ -1130,7 +1146,19 @@ export function createApiServer(
             const namespaces = readNs();
             try {
               const wantDistrusted = flagParam(url, "include_distrusted");
-              sendJson(res, 200, { task: getTask(store, Number(getId[1]), namespaces, { includeDistrusted: wantDistrusted }) });
+              const tid = Number(getId[1]);
+              if (wantDistrusted && nsCtx.active) {
+                // A pinned admin sees hidden tasks of its OWN namespace only; a task of a namespace it merely reads is shown as for any reader.
+                try {
+                  sendJson(res, 200, { task: getTask(store, tid, [nsCtx.ownNamespace], { includeDistrusted: true }) });
+                  return;
+                } catch (e) {
+                  if (!(e instanceof TaskNotFoundError)) throw e;
+                }
+                sendJson(res, 200, { task: getTask(store, tid, namespaces) });
+                return;
+              }
+              sendJson(res, 200, { task: getTask(store, tid, namespaces, { includeDistrusted: wantDistrusted }) });
             } catch (e) {
               if (e instanceof TaskNotFoundError) sendJson(res, 404, { error: "not found" });
               else throw e;
@@ -1170,7 +1198,7 @@ export function createApiServer(
           if (req.method === "POST" && path === "/ack") {
             const body = await jsonBody();
             if (!body) return;
-            if (truthyParam(String(body.include_distrusted ?? "")) && refuseDistrustedOptIn()) return;
+            if (truthyParam(String(body.include_distrusted ?? "")) && refuseDistrustedOptIn(url.searchParams.get("namespace"))) return;
             const namespaces = readNs();
             const r = ackChanges(store, {
               ackToken: typeof body.ack_token === "string" ? body.ack_token : "",
@@ -1346,7 +1374,7 @@ export function createApiServer(
         let first = true;
         try {
           for (;;) {
-            const page = store.exportBatch(afterId, EXPORT_PAGE_SIZE, { namespaces: exportNs, skipUnreadable, attest });
+            const page = store.exportBatch(afterId, EXPORT_PAGE_SIZE, { namespaces: exportNs, skipUnreadable, attest }); // gate-ok: GET /export is admin-only (a full backup)
             if (page.length === 0) break;
             afterId = page[page.length - 1].id;
             for (const note of page) {
@@ -1419,7 +1447,11 @@ export function createApiServer(
           // is idempotent. Off by default (unchanged behaviour).
           const dedupe =
             parsed.dedupe === true || ["1", "true"].includes((url.searchParams.get("dedupe") ?? "").toLowerCase());
-          const created = await store.importNotes(notes, { report, deferEdges, dedupe });
+          // require_attestation (body flag or ?require_attestation=1): reject notes without an attestation that verifies.
+          const requireAttestation =
+            (parsed as { require_attestation?: unknown }).require_attestation === true ||
+            ["1", "true"].includes((url.searchParams.get("require_attestation") ?? "").toLowerCase());
+          const created = await store.importNotes(notes, { report, deferEdges, dedupe, ...(requireAttestation ? { requireAttestation: true } : {}) });
           // Best-effort: index the restored notes for semantic/hybrid search
           // (no-op when embeddings are off). Without this, re-imported notes
           // would be invisible to semantic search until a manual `reindex`.
@@ -1451,6 +1483,8 @@ export function createApiServer(
       // DELETE /trust/distrust             ?namespace=&writer=     (or the same JSON body)
       // POST   /trust/attesters            { public_key, server_id?, label? }
       // DELETE /trust/attesters/:key_id
+      // POST   /trust/revoked              { key_id, reason? }     stop believing anything a key signed (a leaked key)
+      // DELETE /trust/revoked/:key_id
       // A token pinned to a namespace can only manage that namespace's rules (never "*"),
       // and cannot change the server-wide attester list.
       if (path === "/trust" || path.startsWith("/trust/")) {
@@ -1481,7 +1515,7 @@ export function createApiServer(
           if (req.method === "GET" && path === "/trust") {
             // Read-only: the key is reported only if one already exists (a listing never creates it).
             const view = store.trustView(pinned ? nsCtx.ownNamespace : undefined);
-            sendJson(res, 200, { ...store.peekIdentity(), distrust: view.distrust, attesters: view.attesters, log: view.log });
+            sendJson(res, 200, { ...store.peekIdentity(), distrust: view.distrust, attesters: view.attesters, revoked: view.revoked, log: view.log });
             return;
           }
           if (path === "/trust/distrust" && (req.method === "POST" || req.method === "DELETE")) {
@@ -1492,7 +1526,7 @@ export function createApiServer(
             const writer = url.searchParams.get("writer") ?? b.writer;
             if (req.method === "POST") {
               const added = store.distrustAdd(ns, writer as string);
-              sendJson(res, 200, { distrust: added, rules: store.trustView(pinned ? nsCtx.ownNamespace : undefined).distrust });
+              sendJson(res, 200, { distrust: added, matched_notes: store.distrustMatchCount(added.namespace, added.writer), rules: store.trustView(pinned ? nsCtx.ownNamespace : undefined).distrust });
             } else {
               const removed = store.distrustRemove(ns, writer as string);
               sendJson(res, 200, { removed, rules: store.trustView(pinned ? nsCtx.ownNamespace : undefined).distrust });
@@ -1523,6 +1557,26 @@ export function createApiServer(
               return;
             }
             sendJson(res, 200, { removed: store.attesterRemove(attDel[1]), attesters: store.attesterList() });
+            return;
+          }
+          if (path === "/trust/revoked" && req.method === "POST") {
+            if (pinned) {
+              sendJson(res, 403, { error: "the revocation list is server-wide: use an admin token that is not pinned to a namespace" });
+              return;
+            }
+            const b = await body();
+            if (!b) return;
+            const r = store.attesterRevoke(typeof b.key_id === "string" ? b.key_id : "", typeof b.reason === "string" ? b.reason : "");
+            sendJson(res, 200, { revoked: r, revocations: store.revocationList() });
+            return;
+          }
+          const revDel = /^\/trust\/revoked\/([0-9a-fA-F]{16})$/.exec(path);
+          if (revDel && req.method === "DELETE") {
+            if (pinned) {
+              sendJson(res, 403, { error: "the revocation list is server-wide: use an admin token that is not pinned to a namespace" });
+              return;
+            }
+            sendJson(res, 200, { removed: store.attesterUnrevoke(revDel[1]), revocations: store.revocationList() });
             return;
           }
           sendJson(res, 404, { error: "no such route" });

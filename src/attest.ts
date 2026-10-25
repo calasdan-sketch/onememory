@@ -19,7 +19,7 @@
 // true or safe, or that the exporting server's operators labelled honestly, and
 // it says nothing about a key nobody added to the trust list. See docs/trust.md.
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify, type KeyObject } from "node:crypto";
-import { chmodSync, existsSync, linkSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, constants as fsConstants, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 /** The version a new export signs. The verifier accepts every version in SUPPORTED_VERSIONS. */
@@ -168,6 +168,81 @@ export function tightenKeyFile(dataDir: string): void {
   }
 }
 
+/** A cheap fingerprint of the key file (inode, mtime, size), "" when there is none: changes when the file is replaced. */
+export function keyFileStamp(dataDir: string): string {
+  try {
+    const st = statSync(attestKeyPath(dataDir));
+    return `${st.ino}:${st.mtimeMs}:${st.size}`;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Planned rotation: write a NEW key file beside the old one (temp name, mode
+ * 0600) and atomically rename it over the current key, so there is never a moment
+ * without a key file. With `keepOldAs`, the old private key is first copied to that
+ * path (mode 0600); otherwise it is gone (the caller has already recorded the old
+ * PUBLIC key, which is all that verifying earlier exports needs).
+ */
+export function replaceSigningKey(dataDir: string, keepOldAs?: string): SigningKey {
+  const p = attestKeyPath(dataDir);
+  mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
+  const { privateKey } = generateKeyPairSync("ed25519");
+  const tmp = `${p}.${process.pid}.${Date.now()}.new`;
+  writeFileSync(tmp, privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600, flag: "wx" });
+  try {
+    chmodSync(tmp, 0o600);
+    if (keepOldAs && existsSync(p)) {
+      copyFileSync(p, keepOldAs, fsConstants.COPYFILE_EXCL);
+      chmodSync(keepOldAs, 0o600);
+    }
+    renameSync(tmp, p);
+  } catch (e) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* already gone */
+    }
+    throw e;
+  }
+  try {
+    chmodSync(p, 0o600);
+  } catch {
+    /* windows */
+  }
+  return fromPrivate(privateKey);
+}
+
+/**
+ * Copy the key file to `dest` (mode 0600) without ever writing through a symlink or over an existing
+ * file: the destination must not exist (not even as a dangling link) and is created exclusively.
+ */
+export function copyKeyFileExclusive(src: string, dest: string): void {
+  try {
+    lstatSync(dest);
+    throw Object.assign(new Error(`${dest} already exists; refusing to overwrite it`), { code: "EEXIST_DEST" });
+  } catch (e) {
+    if ((e as { code?: string }).code === "EEXIST_DEST") throw e;
+    /* ENOENT: free to create */
+  }
+  copyFileSync(src, dest, fsConstants.COPYFILE_EXCL);
+  try {
+    chmodSync(dest, 0o600);
+  } catch {
+    /* windows */
+  }
+}
+
+/** ONEMEMORY_ATTEST_MIN_VERSION: the oldest attestation version an import still believes (default 1, at most the current version). */
+export function attestMinVersion(): number {
+  const raw = (process.env.ONEMEMORY_ATTEST_MIN_VERSION ?? "").trim();
+  if (!raw) return 1;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) return 1;
+  return Math.min(n, ATTEST_VERSION);
+}
+
 /**
  * Load this data directory's signing key, creating it on first use. The file is
  * written atomically (temp file, then a rename that never replaces an existing
@@ -235,7 +310,7 @@ export interface TrustedAttester {
   /** Pin: only attestations naming this server id verify under the key. Empty = any server id except this database's own. */
   server_id: string;
   label: string;
-  /** Planned rotation: exports signed after this time (by the signed `exported_at`) are not believed. ISO-8601 or empty. */
+  /** Trust in the key ends at this time (checked against the verification time and the signed `exported_at`). An expiry, not a revocation. ISO-8601 or empty. */
   not_after?: string;
 }
 
@@ -245,15 +320,23 @@ export type VerifyReason =
   | "attester key not trusted"
   | "server id does not match the trusted key"
   | "attester key expired"
+  | "attester key revoked"
+  | "attestation version too old"
   | "signature does not match the note";
 
 export type VerifyResult = { ok: true; attester: Attestation; label: string } | { ok: false; reason: VerifyReason; key_id?: string; server_id?: string };
 
 /** Parsed public keys, cached by their base64url text: building a KeyObject costs more than the verify itself. */
 const PUBLIC_KEY_CACHE = new Map<string, KeyObject>();
+let publicKeyBuilds = 0;
+/** How many public KeyObjects were built (not served from the cache) since start: lets a test prove the cache works. */
+export function publicKeyBuildCount(): number {
+  return publicKeyBuilds;
+}
 function publicKeyObject(pub: string): KeyObject {
   let k = PUBLIC_KEY_CACHE.get(pub);
   if (!k) {
+    publicKeyBuilds++;
     k = createPublicKey({ key: { kty: "OKP", crv: "Ed25519", x: pub }, format: "jwk" });
     if (PUBLIC_KEY_CACHE.size >= 64) PUBLIC_KEY_CACHE.delete(PUBLIC_KEY_CACHE.keys().next().value as string);
     PUBLIC_KEY_CACHE.set(pub, k);
@@ -262,8 +345,20 @@ function publicKeyObject(pub: string): KeyObject {
 }
 
 /** Is `t` an ISO-8601 time that Date can read? */
-function isIso(t: unknown): t is string {
+export function isIso(t: unknown): t is string {
   return typeof t === "string" && t.length >= 10 && t.length <= 40 && !Number.isNaN(Date.parse(t));
+}
+
+/** Verification-time facts the caller supplies (all optional; the defaults are the permissive 1.4.1 behaviour). */
+export interface VerifyContext {
+  /** This database's server id, so the "an unpinned key may not speak for this server" rule does not depend on a key file existing. */
+  serverId?: string;
+  /** Key ids an admin revoked: nothing signed by them is believed, whatever its date says. */
+  revoked?: ReadonlySet<string>;
+  /** Oldest attestation version believed (ONEMEMORY_ATTEST_MIN_VERSION). */
+  minVersion?: number;
+  /** Verification time (ms since epoch); `not_after` is compared against it. Default: now. */
+  now?: number;
 }
 
 /**
@@ -276,7 +371,8 @@ export function verifyRecord(
   a: unknown,
   r: AttestedRecord,
   trusted: ReadonlyMap<string, TrustedAttester>,
-  own: { keyId: string; publicKey: string; serverId: string } | null | (() => { keyId: string; publicKey: string; serverId: string } | null)
+  own: { keyId: string; publicKey: string; serverId: string } | null | (() => { keyId: string; publicKey: string; serverId: string } | null),
+  ctx: VerifyContext = {}
 ): VerifyResult {
   if (a === undefined || a === null) return { ok: false, reason: "no attestation" };
   const x = a as Partial<Attestation>;
@@ -295,7 +391,10 @@ export function verifyRecord(
     return { ok: false, reason: "malformed attestation" };
   }
   const att = x as Attestation;
+  if (ctx.revoked?.has(att.key_id)) return { ok: false, reason: "attester key revoked", key_id: att.key_id, server_id: att.server_id };
+  if (ctx.minVersion !== undefined && att.v < ctx.minVersion) return { ok: false, reason: "attestation version too old", key_id: att.key_id, server_id: att.server_id };
   const ownKey = typeof own === "function" ? own() : own;
+  const ownServerId = ctx.serverId ?? ownKey?.serverId ?? "";
   let pub: string | undefined;
   let label = "";
   if (ownKey && att.key_id === ownKey.keyId) {
@@ -307,13 +406,17 @@ export function verifyRecord(
     const t = trusted.get(att.key_id);
     if (!t) return { ok: false, reason: "attester key not trusted", key_id: att.key_id, server_id: att.server_id };
     // A pinned key speaks for its one server. An UNPINNED entry (explicit any-server) may name any server except this one.
-    if (t.server_id ? t.server_id !== att.server_id : ownKey !== null && att.server_id === ownKey.serverId) {
+    if (t.server_id ? t.server_id !== att.server_id : ownServerId !== "" && att.server_id === ownServerId) {
       return { ok: false, reason: "server id does not match the trusted key", key_id: att.key_id, server_id: att.server_id };
     }
     if (t.not_after) {
-      // Rotation: only a v2 attestation carries a signed export time to compare; an older one under an expiring key is refused.
+      // Trust in this key ENDS at not_after, judged against the time of THIS verification. The export time inside the
+      // attestation is chosen (and signed) by the exporter, so it alone could be backdated by whoever holds the key; it
+      // is still checked as well, and a v1 attestation (no signed time) is refused under an expiring key.
+      // This is an expiry, not a revocation: to cut off a leaked key at once use `trust attester-revoke`.
       const cutoff = Date.parse(t.not_after);
-      if (att.v < 2 || !att.exported_at || (!Number.isNaN(cutoff) && Date.parse(att.exported_at) > cutoff)) {
+      const now = ctx.now ?? Date.now();
+      if (att.v < 2 || !att.exported_at || (!Number.isNaN(cutoff) && (now > cutoff || Date.parse(att.exported_at) > cutoff))) {
         return { ok: false, reason: "attester key expired", key_id: att.key_id, server_id: att.server_id };
       }
     }

@@ -205,7 +205,9 @@ function readBeats(store: Store, now: number): Map<string, Beat> {
 
 /** Heartbeat notes untouched for this many days are removed by the runner / server housekeeping (0 = never). */
 export function heartbeatPruneDays(): number {
-  const n = Number(process.env.ONEMEMORY_RUNNER_HEARTBEAT_PRUNE_DAYS);
+  const raw = (process.env.ONEMEMORY_RUNNER_HEARTBEAT_PRUNE_DAYS ?? "").trim();
+  if (raw === "") return 30; // unset or empty: the default (an empty string used to read as 0 = never prune)
+  const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 30;
 }
 

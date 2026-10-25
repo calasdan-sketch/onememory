@@ -4,6 +4,11 @@ Since 1.3.3 a note says who wrote it ([provenance.md](./provenance.md)). Since 1
 also say **whom not to believe**, and a server can **vouch for the writers it exports**. This page
 says exactly what each piece does, and what it does not prove.
 
+> **EXPERIMENTAL.** The signed attestations, cross-server writer ids (`<server_id>/<label>`), `trust rotate`,
+> `trust attester-revoke` and the `--any-server` escape hatch are new and have had little use outside tests.
+> Their formats, flags and verdict texts may change in a minor release. The local distrust list is the
+> stable part. Upgrading from 1.3.x: [upgrading.md](./upgrading.md).
+
 ## Vocabulary
 
 | Term | Meaning |
@@ -20,8 +25,8 @@ id only if it starts with a UUID and a slash; a label that merely contains a sla
 ## The distrust list (`distrust_writers`)
 
 A per-namespace list of writers whose notes are not to be shown to agents. `namespace` is a namespace
-or `*` (every namespace). The default list is empty and then **nothing changes**: every result is
-byte-for-byte what it was before.
+or `*` (every namespace). The default list is empty and then **nothing is hidden**: the same notes come back as before. (Result shapes
+only ever gain fields, so a note now also carries `writer_id` and so on.)
 
 ### Who can change it
 
@@ -31,15 +36,30 @@ not in any note. A token pinned to a namespace can manage only that namespace's 
 cannot change the server-wide attester list. A pinned admin also **sees** only its own namespace's
 rules, the global (`*`) rules that apply to it and the matching log lines: never another namespace's
 rules, never the attester list, never another namespace's runner host names. Every change is
-recorded in `trust_log` (who, when, what; the newest 1000 lines are kept) and in the audit log.
+recorded in `trust_log` (who, when, what) and in the audit log. The log is pruned **per namespace**
+(the newest 1000 lines of each namespace, and of the global `*` bucket, are kept), so a busy namespace cannot push
+another one's history out. A pinned admin does not see the server-wide `attester-*` and `key-rotate` lines.
+
+**The primary token (`ONEMEMORY_TOKEN`) is always an admin, and is never pinned.** It is the only token that can
+set `*` rules and see everything. A deployment that has distrust rules but only that one token gives every
+client admin rights, so `onememory doctor` warns about it: give clients their own `ONEMEMORY_TOKENS` entries.
+For a namespace-pinned admin that has `readsFrom` grants, `include_distrusted` is honoured **only for the
+token's own namespace** (pass `namespace=<own>`); asking for it across a granted namespace is refused.
+
+Names are compared after **NFKC normalisation** (full-width and compatibility forms fold to their plain
+form) with zero-width and other format characters removed, so `ａｄｍｉｎ` and `ad\u200bmin` are `admin`.
+Case is **not** folded: `Phone` and `phone` are two writers (tokens are case-sensitive).
+
+A distrusted-but-active write token **cannot edit the metadata** (tags, source, namespace) of a trusted
+note either, unless it is that note's own writer; otherwise it could re-label notes it does not own.
 
 | Surface | How |
 |---|---|
-| MCP | `trust_policy` (admin): `action` = `list`, `distrust`, `undistrust`, `add_attester`, `remove_attester` |
-| REST | `GET /trust`, `POST /trust/distrust {namespace, writer}`, `DELETE /trust/distrust?namespace=&writer=`, `POST /trust/attesters {public_key, server_id, label?, not_after?, any_server?}`, `DELETE /trust/attesters/<key_id>` (all admin, including the GET) |
-| CLI | `onememory trust [list]`, `trust distrust <writer> --namespace <ns\|*>`, `trust undistrust ...`, `trust attester-add <public-key> --server-id <id> [--label text] [--not-after <ISO time>] [--any-server]` (a base64url key can start with `-`: pass it as `--public-key <key>` or after `--`), `trust attester-remove <key-id>`, `trust identity`, `trust export-key --out <file>`, `trust rotate`, `trust --help`, all with `--json` |
+| MCP | `trust_policy` (admin): `action` = `list`, `distrust`, `undistrust`, `add_attester`, `remove_attester`, `revoke_attester`, `unrevoke_attester` |
+| REST | `GET /trust`, `POST /trust/distrust {namespace, writer}`, `DELETE /trust/distrust?namespace=&writer=`, `POST /trust/attesters {public_key, server_id, label?, not_after?, any_server?}`, `DELETE /trust/attesters/<key_id>`, `POST /trust/revoked {key_id, reason?}`, `DELETE /trust/revoked/<key_id>` (all admin, including the GET) |
+| CLI | `onememory trust [list]`, `trust distrust <writer> --namespace <ns\|*>`, `trust undistrust ...`, `trust attester-add <public-key> --server-id <id> [--label text] [--not-after <ISO time>] [--any-server]` (a base64url key can start with `-`: pass it as `--public-key <key>` or after `--`), `trust attester-remove <key-id>`, `trust attester-revoke <key-id> [--reason text]`, `trust attester-unrevoke <key-id>`, `trust identity`, `trust export-key --out <file>`, `trust rotate [--keep-old-private]`, `trust --help`, all with `--json` |
 
-At most 50 rules per namespace and 500 in total. A writer reference that could never match is refused
+At most 50 rules per namespace and 450 across namespaces (the rest is reserved for `*` rules). A writer reference that could never match is refused
 (an empty label, or a bare server id with no label).
 
 ### What a rule matches
@@ -103,7 +123,7 @@ found" to a non-admin for read, update (so a tags-only change cannot echo its bo
 and `task_put`; `client_key` replays and the janitor never touch it; consolidating a mix of hidden and
 visible notes is refused.
 
-**Also honoured since 1.4.1:** the markdown vault export (`onememory sync export`) leaves hidden notes out
+**Also honoured since 1.4.1:** the markdown vault export (`onememory export --format md --dir <path>`) leaves hidden notes out
 and prunes their earlier files; `--include-distrusted` writes them with `distrusted: true` in the front
 matter. The auto-merge janitor ignores hidden notes.
 
@@ -164,10 +184,24 @@ safe, and it loses the information. An attestation brings it back **for servers 
   Without the pin a trusted key could claim to be any server (including a peer you pinned another key
   for), so `attester-add` needs `--server-id`, and an unpinned entry needs the explicit `--any-server`
   (it is flagged `unpinned` in every listing and in the audit log). Even an unpinned key cannot claim
-  this database's own server id. A server's own key is trusted for its own server id only.
-- **Rotation / expiry:** `--not-after <ISO time>` trusts a key only for exports it signed up to that
-  time (the signed `exported_at`). To retire a key, set `not_after` instead of deleting it; notes
-  already imported keep their recorded provenance either way.
+  this database's own server id. A server's own key is trusted for its own server id only. An entry (or env
+  entry) naming **this** server's id is accepted when it is a *retired own key*; the current key cannot be
+  added, it is already trusted. `ONEMEMORY_TRUSTED_ATTESTERS` and `attester-add` follow the same rules.
+- **Expiry is not revocation.** `--not-after <ISO time>` trusts a key only for exports it signed up to that
+  time. It is judged against the **time of verification** as well as the signed `exported_at`: once the
+  date has passed, an import done today rejects everything that key signed, whatever date the file claims
+  (a v1 attestation has no signed export time, so it is rejected too). But before that date a key whose
+  holder has misbehaved is still believed. To stop trusting a key **now**, use `trust attester-revoke
+  <key-id>` (a list kept in the database that wins over every other source, including
+  `ONEMEMORY_TRUSTED_ATTESTERS`; `attester-unrevoke` lifts it). Notes already imported keep their
+  recorded provenance either way.
+- **Minimum version.** `ONEMEMORY_ATTEST_MIN_VERSION=2` refuses version 1 attestations (the 1.4.0 format,
+  which does not cover `created_at`, `source`, `expires_at`, `archived_at` or `rev`).
+- **Imported without a verified attestation.** A note that arrived without a verifiable attestation is
+  marked `imported_unverified: true` (shown in reads and in the provenance banner an agent sees). The
+  default still imports such notes, so backups and plain exports keep working. To refuse them instead, use
+  `onememory import --file x --require-attestation`, `POST /import` with `require_attestation: true`, or
+  `ONEMEMORY_IMPORT_REQUIRE_ATTESTATION=1`; they land in the report's `rejected` list.
 - **Verified**: the note keeps the original `written_by` in `attested_writer` and the attester's id in
   `attested_by`; the stamped `written_by`/`created_by` is still the importing admin. The attester's own
   earlier hops are kept in the taint set, so distrust follows the content through a chain of servers.
@@ -210,8 +244,11 @@ It does **not** prove:
 
 Anyone who can read the signing key can sign anything as that server: protect `.attest-key` like the
 at-rest encryption key (do not put the data directory in a synced folder). If it leaks, set
-`not_after` on (or remove) its entry in every trust list, then `onememory trust rotate` (the old key
-is kept as `.attest-key.<key_id>.old`; the new key has a new `key_id`, same `server_id`).
+`trust attester-revoke` on its key in every trust list, then `onememory trust rotate`. Rotation takes
+effect **in a running server** (no restart: the key file is re-checked on every use). The old public key
+is recorded as a *retired key of this server*, so notes this server exported earlier still verify when they
+come back; the old private key is not kept unless you pass `--keep-old-private` (then it is written as `.attest-key.<old key id>.old` next to
+the key file, mode 0600). The new key has a new `key_id`, the same `server_id`.
 
 ### Setting it up between two servers
 
@@ -233,13 +270,19 @@ The same pair as an environment variable on B: `ONEMEMORY_TRUSTED_ATTESTERS=<A's
 - `onememory backup` leaves `.attest-key` out by default and says so; `--include-attest-key` copies it
   (mode 0600) like `--include-approval-key` does. Guard such a backup like the encryption key.
 - Restoring a database **file** keeps `server_id` but, without the key, the new machine makes a **new**
-  key (and warns, because the database already holds notes): peers must add its public key. To keep
+  key. The warning "restored without its key" is printed only when the database remembers a previous key
+  (`_meta.attest_key_id`) that no longer matches: peers must add its public key. To trust your own earlier
+  exports again after such a restore, run `trust attester-add --server-id <this server's id> <old public key>`
+  (or put the entry in `ONEMEMORY_TRUSTED_ATTESTERS`). To keep
   the identity, restore the key too (`trust export-key --out <file>` writes a 0600 copy to keep
-  somewhere safe).
+  somewhere safe). `export-key` refuses to write through an existing file or a symlink (also a dangling one).
 - A restored database that imports its **own** earlier export verifies it with its own key, for its
   own server id only.
 
 ## Upgrading and rolling back
+
+The step-by-step version is [upgrading.md](./upgrading.md). In short:
+
 
 Schema v14 adds columns and three small tables; no note text is touched. The first time a database at
 v1 to v13 is opened by 1.4.x, OneMemory writes a consistent snapshot to
@@ -271,9 +314,13 @@ Runners older than 1.3.4 write a heartbeat with no writer marker, which 1.4.0 no
   is stamped with whoever imports it, the claim is shown as `imported_written_by`, and it is added to
   the taint set. **A file that simply omits every writer field carries no taint**: an unsigned file
   cannot prove who wrote it; only a verified attestation can.
-- The taint set is capped (200 names per note), and a rule list is bounded (50 per namespace).
-- Performance: with rules, `list`/`changes` evaluate the policy per row. Measured on a 300,000-note
-  database (median of 7): `list` (all namespaces, first page) 74 ms with no rules, 378 ms with 10 and
-  659 ms with 100 (1.4.0: 811 and 4267 ms); `/changes` over a year 577 / 929 / 1458 ms (1.4.0: 552 /
-  1317 / 5101 ms). Typical deployments have a handful of rules.
+- Taint stays with the note when an admin **moves it to another namespace**: a rule in the new namespace
+  matches the same names, a rule only in the old one no longer applies.
+- The taint set is capped (200 names per note, on import and on edit; names that match a rule are kept first), and a rule list is bounded (50 per namespace).
+- Performance: with rules, `list`/`changes` evaluate the policy per row, with one `json_each` membership test
+  over the taint set (1.4.2; 1.4.1 ran one `instr` probe per label). Measured on 100,000 notes that each carry a
+  30-name taint set (median of 7, first page of `list`, 1.4.1 -> 1.4.2): no rules 0.17 s -> 0.17 s, 10 `*` rules
+  1.31 s -> 1.09 s, 100 `*` rules 10.9 s -> 1.06 s; `/changes` with 100 rules 11.2 s -> 0.96 s. Cost grows with
+  the number of notes scanned times the taint-set size, not with the number of rules. Typical deployments have a
+  handful of rules and empty taint sets. Numbers from one Linux machine; yours will differ.
 - The unverified `imported_written_by` and `source` are claims; the "WHO WROTE THIS" block labels them so.

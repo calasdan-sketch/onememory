@@ -45,6 +45,9 @@ import {
   MAX_DISTRUST_RULES,
   MAX_DISTRUST_RULES_PER_NAMESPACE,
   MAX_TRUST_LOG_ROWS,
+  MAX_TRUST_LOG_ROWS_GLOBAL,
+  MAX_TAINT_NAMES,
+  capTaint,
   canonicalRuleWriter,
   NOTE_COLUMNS,
   distrustSql,
@@ -63,6 +66,11 @@ import {
   ephemeralKey,
   isPublicKey,
   keyIdOf,
+  isIso,
+  attestMinVersion,
+  keyFileStamp,
+  replaceSigningKey,
+  copyKeyFileExclusive,
   isServerId,
   loadOrCreateSigningKey,
   parseTrustedAttestersEnvDetailed,
@@ -74,6 +82,7 @@ import {
   type Attestation,
   type SigningKey,
   type TrustedAttester,
+  type VerifyContext,
   type VerifyReason,
 } from "./attest.js";
 
@@ -473,6 +482,12 @@ export interface NoteRecord {
   /** Set only on a restored note: the first writer the payload claimed (unverified). */
   imported_created_by?: string;
   /**
+   * Present (true) on a note an import brought in WITHOUT a verified attestation: whatever writer labels its file
+   * carried (or no longer carried) are claims, not proof of who wrote it. A default export is not signed, so
+   * every note restored from one has this flag. Never cleared by later edits.
+   */
+  imported_unverified?: true;
+  /**
    * Set only on a note imported with a VERIFIED attestation: the writer the
    * attesting server vouches for (its own `written_by` for the note). The
    * importing admin is still `written_by`. Cleared when the content is edited.
@@ -532,6 +547,7 @@ interface NoteRow {
   created_by: string | null;
   imported_written_by: string | null;
   imported_created_by: string | null;
+  imported_unverified?: number | null;
   attested_writer: string | null;
   attested_by: string | null;
   merged_from_writers: string | null;
@@ -546,6 +562,10 @@ interface NoteRow {
 }
 
 export const DEFAULT_NAMESPACE = "default";
+
+/** A pre-upgrade copy (`-backup`, a dated `-backup-YYYYMMDD-HHMMSS` kept copy) or an unfinished/killed one (`.<id>.partial` and its sidecars). */
+const PREMIGRATION_FILE_RE = /-backup(-\d{8}-\d{6}(-\d+)?)?(\.[0-9a-f]+\.partial(-journal|-wal|-shm)?)?$/;
+const PREMIGRATION_PARTIAL_RE = /\.[0-9a-f]+\.partial(-journal|-wal|-shm)?$/;
 
 /** AAD binding a sealed quarantine column to its column name and namespace. */
 function quarantineAad(col: string, namespace: string): string {
@@ -572,6 +592,7 @@ function rowToRecord(row: NoteRow, serverId = ""): NoteRecord {
     writer_id: makeWriterId(serverId, row.written_by ?? ""),
     ...(row.imported_written_by ? { imported_written_by: row.imported_written_by } : {}),
     ...(row.imported_created_by ? { imported_created_by: row.imported_created_by } : {}),
+    ...(Number(row.imported_unverified ?? 0) === 1 ? { imported_unverified: true as const } : {}),
     ...(attW && attBy ? { attested_writer: attW, attested_by: attBy, attested_writer_id: `${attBy}/${attW}` } : {}),
     ...(merged.length ? { merged_from_writers: merged } : {}),
     created_at: row.created_at,
@@ -1062,9 +1083,17 @@ export class Store {
   constructor(dbPath: string) {
     this.dbPath = dbPath;
     if (dbPath !== ":memory:") {
-      mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
+      try {
+        mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
+      } catch (e) {
+        throw new Error(Store.explainOpenError(e, dbPath));
+      }
     }
-    this.db = new DatabaseSync(dbPath);
+    try {
+      this.db = new DatabaseSync(dbPath);
+    } catch (e) {
+      throw new Error(Store.explainOpenError(e, dbPath));
+    }
     // busy_timeout FIRST: switching to WAL and migrating both need a lock
     // another process may be holding at the same moment.
     this.db.exec(`PRAGMA busy_timeout = ${Store.BUSY_TIMEOUT_MS};`);
@@ -1091,10 +1120,27 @@ export class Store {
       } catch {
         /* already closed */
       }
-      throw e;
+      throw Store.isReadOnlyError(e) ? new Error(Store.explainOpenError(e, dbPath)) : e;
     }
     // Notes are private: owner-only db + WAL/SHM (POSIX; no-op on Windows).
     if (dbPath !== ":memory:") for (const ext of ["", "-wal", "-shm"]) chmodQuiet(dbPath + ext, 0o600);
+  }
+
+  private static isReadOnlyError(e: unknown): boolean {
+    const m = e instanceof Error ? e.message : String(e);
+    const code = (e as { code?: string }).code ?? "";
+    return /readonly database|read-only|unable to open database file|attempt to write/i.test(m) || ["EROFS", "EACCES", "EPERM"].includes(code);
+  }
+
+  /** A one-line, actionable message for "the data directory cannot be written" (a `:ro` Docker volume, wrong owner), instead of SQLite's bare text. */
+  private static explainOpenError(e: unknown, dbPath: string): string {
+    const m = e instanceof Error ? e.message : String(e);
+    if (!Store.isReadOnlyError(e)) return m;
+    return (
+      `onememory cannot write to its data directory ${dirname(dbPath)} (${m}). The directory is read-only, or not writable by this user ` +
+      "(for example a Docker volume mounted :ro or created by root): mount it read-write or fix its owner and permissions. " +
+      "SQLite needs to create files next to the database (state.db-wal, state.db-shm) even to read it."
+    );
   }
 
   /**
@@ -1127,6 +1173,7 @@ export class Store {
     }
     if (found >= SCHEMA_VERSION) {
       this.ensureV14Extras();
+      Store.sweepStalePartials(this.dbPath); // an unfinished upgrade copy (a killed process) does not sit there forever
       return;
     }
     if (found >= 1) this.preMigrationBackup(found);
@@ -1136,6 +1183,7 @@ export class Store {
       if (v < SCHEMA_VERSION) {
         this.migrate(v);
         this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+        this.ensureV14Extras();
       }
       this.db.exec("COMMIT");
     } catch (e) {
@@ -1161,6 +1209,14 @@ export class Store {
     } catch {
       /* read-only file: not_after stays unset */
     }
+    try {
+      // 1.4.2: notes imported WITHOUT a verified attestation are flagged (their writer labels are only claims).
+      if (this.hasColumn("notes", "imported_unverified") === false && this.hasColumn("notes", "imported_written_by")) {
+        this.addColumn("notes", "imported_unverified", "INTEGER NOT NULL DEFAULT 0");
+      }
+    } catch {
+      /* read-only file: the flag stays unset until a writer opens the database */
+    }
   }
 
   /**
@@ -1176,8 +1232,9 @@ export class Store {
   private preMigrationBackup(from: number): void {
     if (this.dbPath === ":memory:") return;
     const dest = this.dbPath + `.pre-v${SCHEMA_VERSION}-backup`;
-    // A name of our own, so two processes opening the same old file at once never share (or delete) a copy in progress.
-    const part = `${dest}.${process.pid}.partial`;
+    // A name of our own (pid plus random), so two processes opening the same old file at once never share (or delete)
+    // a copy in progress, even two containers that are both pid 1 on a shared volume.
+    const part = `${dest}.${process.pid}${randomBytes(3).toString("hex")}.partial`;
     const dropPartial = (): void => {
       for (const f of [part, part + "-journal", part + "-wal", part + "-shm"]) {
         try {
@@ -1196,23 +1253,26 @@ export class Store {
         // while the copy ran, or by an older build that wrote straight to this name)
         // would otherwise be trusted forever and "restore" an empty database.
         const check = Store.verifyBackupFile(dest);
-        if (check.ok) {
+        if (check.ok && check.notes === have) {
           console.error(`[onememory] keeping the existing pre-upgrade copy ${dest} (${check.notes} notes, schema v${check.version}); not replacing it.`);
           return;
         }
-        console.error(`[onememory] the existing pre-upgrade copy ${dest} is not usable (${check.reason}); replacing it.`);
-        unlinkSync(dest);
+        if (check.ok) {
+          // A complete copy, but of a DIFFERENT state: this database was upgraded before, rolled back to an older version,
+          // used (notes added or removed) and is being upgraded again. Keep the old copy under a dated name, never lose it,
+          // and write a fresh one: the printed rollback advice must restore THIS state, not an older one.
+          const stamp = new Date(statSync(dest).mtimeMs).toISOString().replace(/[-:]/g, "").replace(/\..*$/, "").replace("T", "-");
+          let kept = `${dest}-${stamp}`;
+          for (let i = 2; existsSync(kept); i++) kept = `${dest}-${stamp}-${i}`;
+          renameSync(dest, kept);
+          console.error(`[onememory] the existing pre-upgrade copy held ${check.notes} notes but the database now holds ${have}; it was kept as ${kept} and a fresh copy is made.`);
+        } else {
+          console.error(`[onememory] the existing pre-upgrade copy ${dest} is not usable (${check.reason}); replacing it.`);
+          unlinkSync(dest);
+        }
       }
       dropPartial();
-      // Leftovers of a copy that was killed long ago (another process's, older than 10 minutes).
-      try {
-        for (const f of readdirSync(dirname(dest))) {
-          const full = join(dirname(dest), f);
-          if (f.startsWith(basename(dest) + ".") && /\.partial(-journal|-wal|-shm)?$/.test(f) && Date.now() - statSync(full).mtimeMs > 600_000) unlinkSync(full);
-        }
-      } catch {
-        /* best effort */
-      }
+      Store.sweepStalePartials(this.dbPath);
       // Room for the copy (about the size of the database) plus a margin.
       try {
         const dbSize = statSync(this.dbPath).size;
@@ -1228,26 +1288,77 @@ export class Store {
       } catch {
         /* statfs unavailable: try the copy anyway */
       }
-      // Written under a temporary name and renamed only when complete and verified.
-      this.db.exec(`VACUUM INTO '${part.replace(/'/g, "''")}'`);
-      chmodQuiet(part, 0o600);
-      const done = Store.verifyBackupFile(part, have);
-      if (!done.ok) throw new Error(`the copy did not verify (${done.reason})`);
+      // VACUUM INTO is one consistent snapshot even while an older onememory is still writing to this file, so the copy never
+      // needs to match the live note count: it is checked for integrity, and if the source moved during the copy that is said
+      // out loud. Written under a temporary name and renamed only when complete and verified (retried once; a rename that an
+      // antivirus scanner briefly blocks, as on Windows, is retried too).
+      let copyNotes = 0;
+      let lastReason = "";
+      let ok = false;
+      for (let attempt = 1; attempt <= 2 && !ok; attempt++) {
+        dropPartial();
+        try {
+          this.db.exec(`VACUUM INTO '${part.replace(/'/g, "''")}'`);
+          chmodQuiet(part, 0o600);
+          const done = Store.verifyBackupFile(part);
+          if (done.ok) {
+            ok = true;
+            copyNotes = done.notes;
+          } else lastReason = done.reason;
+        } catch (e) {
+          lastReason = (e as Error).message;
+        }
+      }
+      if (!ok) throw new Error(`the copy did not verify (${lastReason})`);
       if (existsSync(dest)) {
         dropPartial(); // another process finished its copy first
         return;
       }
-      renameSync(part, dest);
+      let renamed = false;
+      for (let i = 0; i < 3 && !renamed; i++) {
+        try {
+          renameSync(part, dest);
+          renamed = true;
+        } catch (e) {
+          if (i === 2) throw e;
+          const until = Date.now() + 100;
+          while (Date.now() < until) {
+            /* brief pause: a scanner or indexer may hold the new file for a moment */
+          }
+        }
+      }
       dropPartial();
+      const nowHave = Number((this.db.prepare("SELECT COUNT(*) AS c FROM notes").get() as { c: number }).c);
       console.error(
         `[onememory] upgrading the database from schema v${from} to v${SCHEMA_VERSION}; the original was copied to ${dest} ` +
           "(to roll back: stop every onememory process, MOVE that file over the database, install the older version). " +
           "It holds your notes as they were before the upgrade, including any you later delete or forget: remove it once you are happy " +
           "(`onememory backup --prune-premigration`)."
       );
+      if (nowHave !== copyNotes) {
+        console.error(
+          `[onememory] note: the database was being written while it was copied (the copy holds ${copyNotes} notes, the database now ${nowHave}). ` +
+            "The copy is a consistent snapshot, but stop every older onememory process before upgrading if you need a copy of the latest state."
+        );
+      }
     } catch (e) {
       dropPartial();
       console.error(`[onememory] could not copy the database before upgrading (${(e as Error).message}); continuing.`);
+    }
+  }
+
+  /** Leftovers of a pre-upgrade copy that was killed: `*.partial` files (and their journal/wal/shm sidecars) older than 10 minutes. */
+  static sweepStalePartials(dbPath: string): void {
+    if (dbPath === ":memory:") return;
+    try {
+      const dir = dirname(dbPath);
+      for (const f of readdirSync(dir)) {
+        if (!f.startsWith(basename(dbPath) + ".pre-v") || !PREMIGRATION_PARTIAL_RE.test(f)) continue;
+        const full = join(dir, f);
+        if (Date.now() - statSync(full).mtimeMs > 600_000) unlinkSync(full);
+      }
+    } catch {
+      /* best effort */
     }
   }
 
@@ -1287,7 +1398,7 @@ export class Store {
     const out: Array<{ path: string; bytes: number; age_days: number }> = [];
     try {
       for (const f of readdirSync(dir)) {
-        if (!f.startsWith(base + ".pre-v") || !/-backup(\.\d+\.partial)?$/.test(f)) continue;
+        if (!f.startsWith(base + ".pre-v") || !PREMIGRATION_FILE_RE.test(f)) continue;
         const full = join(dir, f);
         const st = statSync(full);
         out.push({ path: full, bytes: st.size, age_days: Math.floor((Date.now() - st.mtimeMs) / 86_400_000) });
@@ -1818,6 +1929,8 @@ export class Store {
       importedWrittenBy?: string;
       /** Restore path: the first writer an import payload CLAIMED (unverified). */
       importedCreatedBy?: string;
+      /** Restore path: the note came in without a verified attestation (flagged `imported_unverified`). */
+      importedUnverified?: boolean;
       /** Restore path, verified attestation only: the writer the attesting server vouches for ... */
       attestedWriter?: string;
       /** ... and that server's id. */
@@ -1901,8 +2014,8 @@ export class Store {
         .prepare(
           `INSERT INTO notes (namespace, title, body, tags, source, written_by, created_by, imported_written_by,
                               imported_created_by, attested_writer, attested_by, merged_from_writers,
-                              created_at, updated_at, rev, body_enc, expires_at, archived_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
+                              created_at, updated_at, rev, body_enc, expires_at, archived_at, imported_unverified)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
         )
         .run(
           namespace,
@@ -1921,7 +2034,8 @@ export class Store {
           updatedAt,
           startRev,
           expiresAt,
-          archivedAt
+          archivedAt,
+          opts.importedUnverified ? 1 : 0
         );
       id = Number(result.lastInsertRowid);
       if (encrypting) {
@@ -2327,7 +2441,7 @@ export class Store {
    * resolution passes the readable set; an MCP hint passes one). Omit it to
    * count the whole store (legacy no-resolution mode).
    */
-  accessStats(namespaces?: string[]): AccessStats {
+  accessStats(namespaces?: string[], opts: { hideDistrusted?: boolean } = {}): AccessStats {
     this.flushAccess(); // aggregates read the table
     // Archived notes are forgotten: they must not show up in totals or tops.
     const where =
@@ -2335,16 +2449,19 @@ export class Store {
         ? `WHERE archived_at IS NULL AND namespace IN (${namespaces.map(() => "?").join(",")})`
         : "WHERE archived_at IS NULL";
     const params: string[] = namespaces && namespaces.length > 0 ? [...namespaces] : [];
+    // Titles are note content: a distrusted writer's notes are never listed. The counts include them unless the
+    // caller (any non-admin surface) asks for `hideDistrusted`, so a reader cannot learn that hidden notes exist.
+    const dis = this.distrustFragment(NOTE_COLUMNS, namespaces && namespaces.length > 0 ? namespaces : undefined);
+    const hideSql = opts.hideDistrusted ? dis.sql : "";
+    const hideParams = opts.hideDistrusted ? dis.params : [];
     const totals = this.db
       .prepare(
         `SELECT COUNT(*) AS n,
                 COALESCE(SUM(access_count), 0) AS accesses,
                 COALESCE(SUM(CASE WHEN last_accessed IS NULL THEN 1 ELSE 0 END), 0) AS never
-         FROM notes ${where}`
+         FROM notes ${where}${hideSql}`
       )
-      .get(...params) as { n: number; accesses: number; never: number };
-    // Titles are note content: a distrusted writer's notes are not listed (counts above still include them).
-    const dis = this.distrustFragment(NOTE_COLUMNS, namespaces && namespaces.length > 0 ? namespaces : undefined);
+      .get(...params, ...hideParams) as { n: number; accesses: number; never: number };
     const top = this.db
       .prepare(
         `SELECT id, title, access_count FROM notes ${where}${dis.sql}
@@ -2360,7 +2477,7 @@ export class Store {
         access_count: Number(r.access_count),
       })),
       neverAccessed: Number(totals.never),
-      staleCount: this.staleCount(namespaces),
+      staleCount: this.staleCount(namespaces, opts),
     };
   }
 
@@ -2369,15 +2486,16 @@ export class Store {
    * staleness.ts). Staleness needs only tags + updated_at, so this scans a
    * narrow projection rather than full records; bodies never leave the DB.
    */
-  staleCount(namespaces?: string[]): number {
+  staleCount(namespaces?: string[], opts: { hideDistrusted?: boolean } = {}): number {
     const where =
       namespaces && namespaces.length > 0
         ? `WHERE archived_at IS NULL AND namespace IN (${namespaces.map(() => "?").join(",")})`
         : "WHERE archived_at IS NULL";
     const params: string[] = namespaces && namespaces.length > 0 ? [...namespaces] : [];
+    const dis = opts.hideDistrusted ? this.distrustFragment(NOTE_COLUMNS, namespaces && namespaces.length > 0 ? namespaces : undefined) : { sql: "", params: [] as string[] };
     const rows = this.db
-      .prepare(`SELECT tags, updated_at FROM notes ${where}`)
-      .all(...params) as Array<{ tags: string; updated_at: string }>;
+      .prepare(`SELECT tags, updated_at FROM notes ${where}${dis.sql}`)
+      .all(...params, ...dis.params) as Array<{ tags: string; updated_at: string }>;
     const cfg = stalenessConfig();
     let n = 0;
     for (const r of rows) {
@@ -2474,6 +2592,26 @@ export class Store {
     // vouched for the OLD content) no longer applies. Taint carried in
     // merged_from_writers stays.
     const restamp = contentChanged && !opts.keepWriter;
+    // A metadata-only edit (tags, source, namespace, TTL) leaves written_by alone, so on its own it would let a
+    // writer an admin distrusts rewrite the `source` or tags of a TRUSTED note without any mark. Refuse it: the
+    // writer would have to change the content (which hands the note over and taints it). Notes already hidden by
+    // the policy are unaffected, and so are internal callers that act as no one (library, CLI).
+    if (!contentChanged && !opts.keepWriter) {
+      const actor = opts.writtenBy !== undefined ? cleanWriter(opts.writtenBy) : currentWriter();
+      if (actor && actor !== existing.written_by) {
+        const rules = this.distrustRules();
+        if (rules.length) {
+          const sid = this.serverId();
+          const destNs = patch.namespace?.trim() || existing.namespace;
+          const actorFacts = (ns: string): WriterFacts => ({ namespace: ns, written_by: actor });
+          if ((matchesDistrust(rules, actorFacts(existing.namespace), sid) || matchesDistrust(rules, actorFacts(destNs), sid)) && !matchesDistrust(rules, existing, sid)) {
+            throw new ValidationError(
+              `writer ${JSON.stringify(actor)} is on the distrust list for namespace ${JSON.stringify(existing.namespace)}: it may not change the tags, source or namespace of note ${id}, which it did not write`
+            );
+          }
+        }
+      }
+    }
     const writer =
       contentChanged && !opts.keepWriter
         ? opts.writtenBy !== undefined
@@ -2529,7 +2667,13 @@ export class Store {
             add(cur.attested_writer);
             add(`${cur.attested_by}/${cur.attested_writer}`);
           }
-          mergedAfter = mergedToStorage(set);
+          const fresh = new Set<string>([cleanWriter(cur.written_by)]);
+          if (cur.attested_writer && cur.attested_by) {
+            fresh.add(cleanWriter(cur.attested_writer));
+            fresh.add(`${cur.attested_by}/${cur.attested_writer}`);
+          }
+          // Bounded like an import's claims (MAX_TAINT_NAMES): names an active rule matches are never the ones dropped.
+          mergedAfter = mergedToStorage(capTaint([...set], fresh, this.distrustRules(), namespace, this.serverId()));
         }
         if (cur && opts.alsoTouchedBy?.length) mergedAfter = mergedToStorage([...parseMerged(mergedAfter), ...opts.alsoTouchedBy]);
       }
@@ -3186,9 +3330,16 @@ export class Store {
        * default, so existing callers behave exactly as before.
        */
       dedupe?: boolean;
+      /**
+       * Reject every note that does not come with an attestation that verifies against a trusted key (default:
+       * ONEMEMORY_IMPORT_REQUIRE_ATTESTATION=1, else off, so plain 1.3.x-style backups keep importing). Without it such
+       * notes are imported, flagged `imported_unverified`.
+       */
+      requireAttestation?: boolean;
     } = {}
   ): Promise<NoteRecord[]> {
     const created: NoteRecord[] = [];
+    const requireAttestation = opts.requireAttestation ?? ["1", "true", "yes"].includes((process.env.ONEMEMORY_IMPORT_REQUIRE_ATTESTATION ?? "").trim().toLowerCase());
     // Attestations: checked against the keys the admin trusts (plus this
     // server's own key for its own server id). Counted into the report.
     const trusted = this.trustedAttesters();
@@ -3200,7 +3351,7 @@ export class Store {
       // cannot be recognised as ours (they import as unverified, claims kept).
       if (ownCache === undefined) {
         try {
-          const k = this.signingKey ?? (this.dbPath === ":memory:" ? null : peekSigningKey(this.keyDir));
+          const k = this.dbPath === ":memory:" ? this.signingKey : peekSigningKey(this.keyDir); // the file, not a cached key: a rotation may have replaced it
           ownCache = k ? { keyId: k.keyId, publicKey: k.publicKey, serverId: this.serverId() } : null;
         } catch {
           ownCache = null;
@@ -3208,6 +3359,7 @@ export class Store {
       }
       return ownCache;
     };
+    const verifyCtx: VerifyContext = { serverId: this.serverId(), revoked: this.revokedKeys(), minVersion: attestMinVersion(), now: Date.now() };
     const att: AttestationReport = { verified: 0, unverified: 0, reasons: {}, untrusted_keys: [] };
     if (opts.report) opts.report.attestations = att;
     const untrustedSeen = new Map<string, { key_id: string; server_id: string; notes: number }>();
@@ -3241,7 +3393,16 @@ export class Store {
           try {
             // A verified attestation lets the original writer be kept as
             // `attested_writer`; anything else is imported exactly as before.
-            const verdict = this.verifyImported(note, trusted, ownKey);
+            const verdict = this.verifyImported(note, trusted, ownKey, verifyCtx);
+            if (requireAttestation && !verdict.ok) {
+              att.unverified++;
+              att.reasons[verdict.reason] = (att.reasons[verdict.reason] ?? 0) + 1;
+              opts.report?.rejected.push({
+                title: note.title,
+                error: `no verified attestation (${verdict.reason}); import attestation is required (--require-attestation / ONEMEMORY_IMPORT_REQUIRE_ATTESTATION)`,
+              });
+              continue;
+            }
             const carried = verdict.ok ? this.attestedProvenance(note, verdict.attester.server_id) : null;
             created.push(
               this.create(
@@ -3260,6 +3421,7 @@ export class Store {
                   importedWrittenBy:
                     cleanWriter(note.imported_written_by) || cleanWriter(note.written_by) || undefined,
                   importedCreatedBy: cleanWriter(note.imported_created_by) || cleanWriter(note.created_by) || undefined,
+                  ...(verdict.ok ? {} : { importedUnverified: true }),
                   ...(carried
                     ? { attestedWriter: carried.writer, attestedBy: carried.by, mergedFromWriters: carried.merged }
                     : { mergedFromWriters: this.claimedTaint(note) }),
@@ -3325,7 +3487,8 @@ export class Store {
   private verifyImported(
     note: ImportNote,
     trusted: ReadonlyMap<string, TrustedAttester>,
-    own: () => { keyId: string; publicKey: string; serverId: string } | null
+    own: () => { keyId: string; publicKey: string; serverId: string } | null,
+    ctx: VerifyContext
   ): ReturnType<typeof verifyRecord> {
     const tags = Array.isArray(note.tags) ? note.tags : [];
     if (note.attestation === undefined || note.attestation === null) return { ok: false, reason: "no attestation" };
@@ -3351,7 +3514,8 @@ export class Store {
         rev: typeof note.rev === "number" ? note.rev : 0,
       },
       trusted,
-      own
+      own,
+      ctx
     );
   }
 
@@ -3377,8 +3541,8 @@ export class Store {
       add(note.attested_writer);
       if (note.attested_by) add(`${cleanWriter(note.attested_by)}/${cleanWriter(note.attested_writer)}`);
     }
-    if (Array.isArray(note.merged_from_writers)) for (const w of note.merged_from_writers.slice(0, 200)) add(w);
-    return [...out].slice(0, 200);
+    if (Array.isArray(note.merged_from_writers)) for (const w of note.merged_from_writers.slice(0, MAX_TAINT_NAMES)) add(w);
+    return [...out].slice(0, MAX_TAINT_NAMES);
   }
 
   /**
@@ -4462,7 +4626,7 @@ export class Store {
     }
     if (opts.notWrittenBy !== undefined) {
       const r = parseWriterRef(opts.notWrittenBy);
-      if (!r.serverId || r.serverId === localId.toLowerCase()) {
+      if (r.label && (!r.serverId || r.serverId === localId.toLowerCase())) {
         wbSql += " AND written_by <> ?";
         wbParams.push(r.label);
       }
@@ -4695,11 +4859,20 @@ export class Store {
     this.db
       .prepare("INSERT INTO trust_log (at, actor, action, namespace, subject) VALUES (?, ?, ?, ?, ?)")
       .run(new Date().toISOString(), actor, action, namespace, subject);
-    // Bounded: keep the newest MAX_TRUST_LOG_ROWS rows (the audit log keeps the full trail).
-    this.db
-      .prepare("DELETE FROM trust_log WHERE seq <= (SELECT MAX(seq) FROM trust_log) - ?")
-      .run(MAX_TRUST_LOG_ROWS);
+    this.pruneTrustLog(namespace);
     audit({ op: `trust.${action}`, namespace, label: actor, kind: "trust", detail: subject.slice(0, 200) });
+  }
+
+  /**
+   * Bounded per namespace: each namespace keeps its own newest MAX_TRUST_LOG_ROWS rows (the server-wide lines, namespace `*`,
+   * their own bucket of MAX_TRUST_LOG_ROWS_GLOBAL), so a pinned admin flooding its own namespace can only push out its own lines,
+   * never another admin's or the attester / key-rotation lines. The audit log keeps the full trail.
+   */
+  private pruneTrustLog(namespace: string): void {
+    const keep = namespace === ALL_NAMESPACES ? MAX_TRUST_LOG_ROWS_GLOBAL : MAX_TRUST_LOG_ROWS;
+    this.db
+      .prepare("DELETE FROM trust_log WHERE namespace = ? AND seq NOT IN (SELECT seq FROM trust_log WHERE namespace = ? ORDER BY seq DESC LIMIT ?)")
+      .run(namespace, namespace, keep);
   }
 
   /** The distrust list (every namespace). Cheap: a tiny table read per query, so a change elsewhere is seen at once. */
@@ -4732,10 +4905,29 @@ export class Store {
       }
       const n = Number((this.db.prepare("SELECT COUNT(*) AS c FROM trust_distrust").get() as { c: number }).c);
       if (n >= MAX_DISTRUST_RULES) throw new ValidationError(`the distrust list is full (${MAX_DISTRUST_RULES} entries); remove one first`);
+      // Namespace-specific rules may not use the room reserved for the `*` bucket, so ten namespaces
+      // (or ten pinned admins) cannot lock the server-wide admin out of adding a `*` rule.
+      if (ns !== ALL_NAMESPACES && n >= MAX_DISTRUST_RULES - MAX_DISTRUST_RULES_PER_NAMESPACE) {
+        throw new ValidationError(`the distrust list is full for namespace-specific entries (${MAX_DISTRUST_RULES - MAX_DISTRUST_RULES_PER_NAMESPACE}; the rest is kept for "*" entries); remove one first`);
+      }
       this.db.prepare("INSERT INTO trust_distrust (namespace, writer, added_at, added_by) VALUES (?, ?, ?, ?)").run(ns, canonical, at, addedBy);
       this.logTrust("distrust", ns, canonical);
     });
     return (this.db.prepare("SELECT namespace, writer, added_at, added_by FROM trust_distrust WHERE namespace = ? AND writer = ?").get(ns, canonical) as unknown) as DistrustRule;
+  }
+
+  /** How many stored notes the rule `(namespace, writer)` hides right now (0 usually means a misspelt label). */
+  distrustMatchCount(namespace: string, writer: string): number {
+    const parsed = canonicalRuleWriter(writer);
+    if (!parsed.ok) return 0;
+    const rule: DistrustRule = { namespace, writer: parsed.writer, added_at: "", added_by: "" };
+    const d = distrustSql([rule], this.serverId(), NOTE_COLUMNS);
+    if (!d.sql) return 0;
+    const nsSql = namespace === ALL_NAMESPACES ? "" : " AND notes.namespace = ?";
+    const nsParams = namespace === ALL_NAMESPACES ? [] : [namespace];
+    const all = Number((this.db.prepare(`SELECT COUNT(*) AS c FROM notes WHERE 1 = 1${nsSql}`).get(...nsParams) as { c: number }).c);
+    const visible = Number((this.db.prepare(`SELECT COUNT(*) AS c FROM notes WHERE 1 = 1${nsSql}${d.sql}`).get(...nsParams, ...d.params) as { c: number }).c);
+    return all - visible;
   }
 
   /** Take a writer off the list. True if it was there. */
@@ -4766,7 +4958,7 @@ export class Store {
         : this.db
             .prepare(
               `SELECT at, actor, action, namespace, subject FROM trust_log
-               WHERE (namespace = ? OR namespace = '*') AND action NOT LIKE 'attester-%' ORDER BY seq DESC LIMIT ?`
+               WHERE (namespace = ? OR namespace = '*') AND action NOT LIKE 'attester-%' AND action <> 'key-rotate' ORDER BY seq DESC LIMIT ?`
             )
             .all(pinnedNamespace, n)
     ) as unknown as Array<{ at: string; actor: string; action: string; namespace: string; subject: string }>;
@@ -4780,12 +4972,14 @@ export class Store {
   trustView(pinnedNamespace?: string): {
     distrust: DistrustRule[];
     attesters: ReturnType<Store["attesterList"]>;
+    revoked: ReturnType<Store["revocationList"]>;
     log: ReturnType<Store["trustLog"]>;
   } {
     const pinned = pinnedNamespace !== undefined;
     return {
       distrust: this.distrustRules().filter((r) => !pinned || r.namespace === pinnedNamespace || r.namespace === ALL_NAMESPACES),
       attesters: pinned ? [] : this.attesterList(),
+      revoked: pinned ? [] : this.revocationList(),
       log: this.trustLog(20, pinnedNamespace),
     };
   }
@@ -4821,27 +5015,58 @@ export class Store {
     return d.sql ? { sql: r.sql + d.sql, params: [...r.params, ...d.params] } : r;
   }
 
-  /** The attestation signing key of this database (created on first use; in memory only for `:memory:`). */
+  /**
+   * The attestation signing key of this database (created on first use; in memory only for `:memory:`).
+   * The key file is re-checked (one stat) on every use, so a `trust rotate` run from the CLI takes effect
+   * in an already-running server at its next export instead of only after a restart.
+   */
   private signing(): SigningKey {
-    if (!this.signingKey) {
-      if (this.dbPath === ":memory:") this.signingKey = ephemeralKey();
-      else {
-        const existed = peekSigningKey(this.keyDir) !== null;
-        this.signingKey = loadOrCreateSigningKey(this.keyDir);
-        if (!existed && this.countAll() > 0 && this.signingKeyMintedFor !== this.serverId()) {
-          // A new key for a database that already has notes and a server id: a restore that lost .attest-key.
-          this.signingKeyMintedFor = this.serverId();
-          console.error(
-            `[onememory] a NEW attestation key was created (${this.signingKey.keyId}) for the existing server id ${this.serverId()}. ` +
-              "If this database was restored from a backup, peers that trusted the old key must be given the new one (`onememory trust identity`); " +
-              "exports signed by the old key will not verify here as 'this server'. See docs/trust.md."
-          );
-        }
+    if (this.dbPath === ":memory:") return (this.signingKey ??= ephemeralKey());
+    const stamp = keyFileStamp(this.keyDir);
+    if (this.signingKey && stamp !== "" && stamp === this.signingStamp) return this.signingKey;
+    const existed = stamp !== "";
+    const before = this.signingKey?.keyId;
+    const key = loadOrCreateSigningKey(this.keyDir);
+    this.signingKey = key;
+    this.signingStamp = keyFileStamp(this.keyDir);
+    if (before && before !== key.keyId) {
+      console.error(`[onememory] the signing key file changed on disk (${before} -> ${key.keyId}); this process now signs with the new key.`);
+    }
+    this.rememberKey(key, !existed);
+    return key;
+  }
+  private signingStamp = "";
+  private signingKeyMintedFor = "";
+
+  /**
+   * Remember (in _meta) which key id this database signed with, so a LATER key-less restore can be recognised: the warning
+   * "a NEW attestation key was created" fires only when a recorded key id differs from the one just minted, i.e. when a
+   * key is provably lost. A database that never had a key (every 1.3.x -> 1.4 upgrade) has no marker and stays quiet.
+   */
+  private rememberKey(key: SigningKey, minted: boolean): void {
+    let prior: string | null = null;
+    try {
+      prior = this.getMeta("attest_key_id");
+    } catch {
+      prior = null;
+    }
+    if (minted && prior && prior !== key.keyId && this.signingKeyMintedFor !== key.keyId) {
+      this.signingKeyMintedFor = key.keyId;
+      console.error(
+        `[onememory] a NEW attestation key was created (${key.keyId}) for the existing server id ${this.serverId()}: this database earlier signed with key ${prior}, ` +
+          "whose key file is missing (a restore without it?). Peers that trusted the old key must be given the new one (`onememory trust identity`); " +
+          "exports signed by the old key will not verify here unless you add the old PUBLIC key (`onememory trust attester-add <old public key> --server-id " +
+          `${this.serverId()}\`). See docs/trust.md.`
+      );
+    }
+    if (prior !== key.keyId) {
+      try {
+        this.setMeta("attest_key_id", key.keyId);
+      } catch {
+        /* read-only database: the marker is recorded by the next writer */
       }
     }
-    return this.signingKey;
   }
-  private signingKeyMintedFor = "";
 
   /** server_id + public key + key id: what a peer needs to trust this server's attestations. Never the private key. Creates the key on first use. */
   identity(): { server_id: string; key_id: string; public_key: string; algorithm: "ed25519" } {
@@ -4851,43 +5076,64 @@ export class Store {
 
   /** Like identity(), but read-only: the key fields appear only if a key already exists (a listing must not mint one). */
   peekIdentity(): { server_id: string; key_id?: string; public_key?: string; algorithm?: "ed25519" } {
-    const k = this.signingKey ?? (this.dbPath === ":memory:" ? null : peekSigningKey(this.keyDir));
+    let k: SigningKey | null;
+    if (this.dbPath === ":memory:") k = this.signingKey;
+    else {
+      const stamp = keyFileStamp(this.keyDir);
+      k = this.signingKey && stamp !== "" && stamp === this.signingStamp ? this.signingKey : peekSigningKey(this.keyDir);
+      if (k && stamp !== "" && !this.getMeta("attest_key_id")) this.rememberKey(k, false);
+    }
     return k ? { server_id: this.serverId(), key_id: k.keyId, public_key: k.publicKey, algorithm: "ed25519" } : { server_id: this.serverId() };
   }
 
   /**
-   * Replace the signing key with a new one (planned rotation). The old key is
-   * kept beside it as `<key file>.<old key id>.old` (mode 0600) so exports it
-   * signed can still be verified by anyone who trusts it. Returns both ids.
+   * Replace the signing key with a new one (planned rotation, or after a leak). The OLD PUBLIC key is recorded as a
+   * trusted key of THIS server (a "retired own key"), so this server keeps recognising the exports it signed before;
+   * revoke it (`trust attester-revoke`) if it leaked. The old private key is not kept unless `keepOldPrivate` is set
+   * (then it is copied to `<key file>.<old key id>.old`, mode 0600). Running servers pick the new key up at their
+   * next signing (the key file is re-checked), so no restart is needed. Returns both ids.
    */
-  rotateSigningKey(): { old_key_id: string | null; new_key_id: string; public_key: string; old_key_file: string | null } {
+  rotateSigningKey(opts: { keepOldPrivate?: boolean } = {}): { old_key_id: string | null; new_key_id: string; public_key: string; old_key_file: string | null; old_public_key: string | null } {
     if (this.dbPath === ":memory:") throw new ValidationError("an in-memory database has no key file to rotate");
     const p = attestKeyPath(this.keyDir);
     const old = peekSigningKey(this.keyDir);
-    let oldFile: string | null = null;
-    if (old) {
-      oldFile = `${p}.${old.keyId}.old`;
-      renameSync(p, oldFile);
-      chmodQuiet(oldFile, 0o600);
-    }
-    this.signingKey = null;
-    const k = loadOrCreateSigningKey(this.keyDir);
+    if (existsSync(p) && !old) throw new ValidationError(`the attestation key ${p} is unreadable; restore it or move it aside before rotating`);
+    const oldFile = old && opts.keepOldPrivate ? `${p}.${old.keyId}.old` : null;
+    let k!: SigningKey;
+    this.transaction(() => {
+      if (old) {
+        // Recorded first: if the file swap below fails the old key stays in use AND stays recognised.
+        this.db
+          .prepare(
+            `INSERT INTO trust_attesters (key_id, public_key, server_id, label, added_at, added_by, not_after) VALUES (?, ?, ?, ?, ?, ?, '')
+             ON CONFLICT(key_id) DO NOTHING`
+          )
+          .run(old.keyId, old.publicKey, this.serverId(), "retired key of this server", new Date().toISOString(), this.trustActor());
+      }
+      k = replaceSigningKey(this.keyDir, oldFile ?? undefined);
+      this.logTrust("key-rotate", "*", `${old?.keyId ?? "-"} -> ${k.keyId}`);
+      try {
+        this.setMeta("attest_key_id", k.keyId);
+      } catch {
+        /* recorded by the next writer */
+      }
+    });
     this.signingKey = k;
-    this.db.prepare("INSERT INTO trust_log (at, actor, action, namespace, subject) VALUES (?, ?, 'key-rotate', '*', ?)").run(
-      new Date().toISOString(),
-      this.trustActor(),
-      `${old?.keyId ?? "-"} -> ${k.keyId}`
-    );
-    return { old_key_id: old?.keyId ?? null, new_key_id: k.keyId, public_key: k.publicKey, old_key_file: oldFile };
+    this.signingStamp = keyFileStamp(this.keyDir);
+    return { old_key_id: old?.keyId ?? null, new_key_id: k.keyId, public_key: k.publicKey, old_key_file: oldFile, old_public_key: old?.publicKey ?? null };
   }
 
-  /** Copy the signing key file to `dest` (mode 0600), for moving a server's identity to a new machine. Refuses to overwrite. */
+  /** Copy the signing key file to `dest` (mode 0600), for moving a server's identity to a new machine. Never overwrites, never writes through a symlink. */
   exportSigningKey(dest: string): { key_id: string; path: string } {
     const k = this.signing(); // make sure it exists
     const src = attestKeyPath(this.keyDir);
-    if (existsSync(dest)) throw new ValidationError(`${dest} already exists; refusing to overwrite it`);
-    copyFileSync(src, dest);
-    chmodQuiet(dest, 0o600);
+    try {
+      copyKeyFileExclusive(src, dest);
+    } catch (e) {
+      if (e instanceof ValidationError) throw e;
+      if ((e as { code?: string }).code === "EEXIST_DEST" || (e as { code?: string }).code === "EEXIST") throw new ValidationError(`${dest} already exists; refusing to overwrite it`);
+      throw e;
+    }
     return { key_id: k.keyId, path: dest };
   }
 
@@ -4954,11 +5200,11 @@ export class Store {
   }
 
   /**
-   * Trust a peer's attestation key. A key is trusted for ONE server: `server_id`
+   * Trust a peer's attestation key (EXPERIMENTAL, like all of attestations). A key is trusted for ONE server: `server_id`
    * is required, unless `any_server` is set (discouraged: the key's holder could
-   * then claim to be any peer). `not_after` (ISO-8601) ends trust for exports signed
-   * after that time. Adding a key that is already listed replaces its pin/expiry, and
-   * the log line says what changed.
+   * then claim to be any peer). `not_after` (ISO-8601) ends trust in the key at that time (judged when an import is
+   * verified): an expiry, not a revocation; use revokeAttester for a leaked key. Adding a key that is already listed
+   * replaces its pin/expiry, and the log line says what changed.
    */
   attesterAdd(input: { public_key: string; server_id?: string; label?: string; any_server?: boolean; not_after?: string }): {
     key_id: string;
@@ -4975,14 +5221,17 @@ export class Store {
     if (!sid && input.any_server !== true) {
       throw new ValidationError(
         "server_id is required: a trusted key speaks for ONE server (use the server_id printed by `onememory trust identity` on that server). " +
-          "Pass any_server only if you accept that this key's holder could claim to be any peer."
+          "Pass --any-server (any_server: true over the API) only if you accept that this key's holder could claim to be any peer."
       );
     }
-    if (sid && sid === this.serverId()) throw new ValidationError("server_id is this server's own id: a peer cannot speak for this server");
+    // A key pinned to THIS server's own id is a "retired own key": the public key this server signed with before a rotation
+    // or before a restore that lost its key file. It lets the server recognise its own earlier exports (the same meaning
+    // as an ONEMEMORY_TRUSTED_ATTESTERS entry naming this server's id). Only an admin can add one; revoke it if it leaked.
     const notAfter = (input.not_after ?? "").trim();
-    if (notAfter && Number.isNaN(Date.parse(notAfter))) throw new ValidationError("not_after must be an ISO-8601 time");
+    if (notAfter && !isIso(notAfter)) throw new ValidationError("not_after must be an ISO-8601 time such as 2027-01-31T00:00:00Z");
     const key_id = keyIdOf(key);
-    if (key_id === this.identity().key_id) throw new ValidationError("that is this server's own key: it is always trusted for this server's own exports");
+    if (key_id === this.identity().key_id) throw new ValidationError("that is this server's own current key: it is always trusted for this server's own exports");
+    if (this.revokedKeys().has(key_id)) throw new ValidationError(`key ${key_id} is on the revocation list; run \`onememory trust attester-unrevoke ${key_id}\` first if you really want to trust it again`);
     const label = cleanWriter(input.label ?? "").slice(0, 100);
     let replaced: { server_id: string; not_after: string } | undefined;
     this.transaction(() => {
@@ -5012,6 +5261,66 @@ export class Store {
     this.transaction(() => {
       removed = Number(this.db.prepare("DELETE FROM trust_attesters WHERE key_id = ?").run(id).changes) > 0;
       if (removed) this.logTrust("attester-remove", "*", id);
+    });
+    return removed;
+  }
+
+  /**
+   * Key ids an admin revoked: nothing signed by them is believed from now on, whatever date the signature claims
+   * (unlike `not_after`, which only expires trust). Kept in the database, so it survives restarts and backups.
+   */
+  revokedKeys(): Set<string> {
+    return new Set(Object.keys(this.revocations()));
+  }
+
+  /** The revocation list with who/when/why, for listing. */
+  revocationList(): Array<{ key_id: string; at: string; by: string; reason: string }> {
+    return Object.entries(this.revocations()).map(([key_id, v]) => ({ key_id, at: v.at, by: v.by, reason: v.reason }));
+  }
+
+  private revocations(): Record<string, { at: string; by: string; reason: string }> {
+    const raw = this.getMeta("revoked_attester_keys");
+    if (!raw) return {};
+    try {
+      const v = JSON.parse(raw) as unknown;
+      return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, { at: string; by: string; reason: string }>) : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /** Revoke a key (any attester's, or one of this server's retired keys). Refuses this server's CURRENT key (rotate first). */
+  attesterRevoke(keyId: string, reason = ""): { key_id: string; already: boolean } {
+    const id = typeof keyId === "string" ? keyId.trim().toLowerCase() : "";
+    if (!/^[0-9a-f]{16}$/.test(id)) throw new ValidationError("key_id must be the 16-hex-digit key id");
+    const cur = this.dbPath === ":memory:" ? this.signingKey : peekSigningKey(this.keyDir);
+    if (cur && cur.keyId === id) throw new ValidationError("that is this server's CURRENT signing key: run `onememory trust rotate` first, then revoke the retired key");
+    let already = false;
+    this.transaction(() => {
+      const all = this.revocations();
+      if (all[id]) {
+        already = true;
+        return;
+      }
+      all[id] = { at: new Date().toISOString(), by: this.trustActor(), reason: cleanWriter(reason).slice(0, 200) };
+      this.setMeta("revoked_attester_keys", JSON.stringify(all));
+      this.logTrust("attester-revoke", "*", `${id}${all[id].reason ? ` (${all[id].reason})` : ""}`);
+    });
+    return { key_id: id, already };
+  }
+
+  /** Take a key off the revocation list. True if it was there. */
+  attesterUnrevoke(keyId: string): boolean {
+    const id = typeof keyId === "string" ? keyId.trim().toLowerCase() : "";
+    if (!/^[0-9a-f]{16}$/.test(id)) throw new ValidationError("key_id must be the 16-hex-digit key id");
+    let removed = false;
+    this.transaction(() => {
+      const all = this.revocations();
+      if (!all[id]) return;
+      delete all[id];
+      this.setMeta("revoked_attester_keys", JSON.stringify(all));
+      removed = true;
+      this.logTrust("attester-unrevoke", "*", id);
     });
     return removed;
   }

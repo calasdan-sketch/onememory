@@ -31,7 +31,28 @@ permissions:
   id-token: write
 
 jobs:
+  # The same matrix CI runs on a push. A tag that is pushed before (or without) a green CI run must not
+  # reach npm, so publishing waits for build + test on every platform.
+  verify:
+    name: build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+
   publish:
+    needs: [verify]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

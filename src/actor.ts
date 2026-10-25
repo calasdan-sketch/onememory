@@ -50,8 +50,13 @@ export const WRITER_MAX = 100;
 /** The whitespace/control-character part of cleanWriter, without the length cap. */
 export function squashWriter(s: unknown): string {
   if (typeof s !== "string") return "";
+  // NFKC first, so a rule, a filter and a stored label spelled with different but canonically
+  // equivalent characters ("e" + combining accent vs the precomposed letter, full-width letters)
+  // are the same label; then invisible format characters (zero-width space/joiner, bidi marks, BOM)
+  // go, so they cannot make two labels that look identical differ. Letter case is NOT folded:
+  // labels are exact (`Alice` and `alice` are two writers).
   // eslint-disable-next-line no-control-regex
-  return s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\s]+/g, " ").trim();
+  return s.normalize("NFKC").replace(/\p{Cf}/gu, "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\s]+/g, " ").trim();
 }
 
 /**

@@ -566,26 +566,38 @@ describe("G: attestation keys, pinning, rotation, versions", () => {
     assert.equal(r.old_key_id, first.key_id);
     assert.notEqual(r.new_key_id, first.key_id);
     assert.equal(a.identity().key_id, r.new_key_id);
-    assert.ok(r.old_key_file && existsSync(r.old_key_file), "the old key is kept, not deleted");
+    assert.equal(r.old_key_file, null, "the old PRIVATE key is not kept by default");
+    assert.ok(!readdirSync(join(dir, "a")).some((f) => f.endsWith(".old")), "no .old file was left behind");
+    // ... but its PUBLIC key is recorded as a retired key of this server, so earlier exports still verify here
+    const retired = a.trustedAttesters().get(first.key_id);
+    assert.ok(retired, "the retired public key is a trusted key");
+    assert.equal(retired!.public_key, first.public_key);
+    assert.equal(retired!.server_id, a.serverId(), "pinned to this server's own id");
     assert.ok(a.trustLog(5).some((l) => l.action === "key-rotate"));
   });
 
-  test("the key file is re-tightened to 0600 at startup and the parsed public key is cached", { skip: process.platform === "win32" }, async () => {
+  test("the key file is re-tightened to 0600 at startup", { skip: process.platform === "win32" }, async () => {
     a.identity();
     const k = join(dir, "a", ATTEST_KEY_FILENAME);
     chmodSync(k, 0o644);
     const { tightenKeyFile } = await import("../src/attest.js");
     tightenKeyFile(join(dir, "a"));
     assert.equal(statSync(k).mode & 0o777, 0o600);
-    // the cache: many verifications of the same key reuse one parsed KeyObject (observable as a speed-up, not a count)
+  });
+
+  test("the parsed public key is cached: 200 verifications under one key build ONE KeyObject (and a second key builds one more)", async () => {
+    const { publicKeyBuildCount } = await import("../src/attest.js");
     as("alice", () => a.create({ title: "n", body: "b" }));
     const id = a.identity();
-    b.attesterAdd({ public_key: id.public_key, server_id: id.server_id });
     const notes = exported(a);
-    const t0 = process.hrtime.bigint();
-    for (let i = 0; i < 200; i++) verifyRecord(notes[0].attestation, notes[0] as any, new Map([[id.key_id, { public_key: id.public_key, server_id: id.server_id, label: "" }]]), null);
-    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
-    assert.ok(ms < 2000, `200 verifications took ${ms.toFixed(0)} ms`);
+    const trusted = new Map([[id.key_id, { public_key: id.public_key, server_id: id.server_id, label: "" }]]);
+    const before = publicKeyBuildCount();
+    for (let i = 0; i < 200; i++) assert.equal(verifyRecord(notes[0].attestation, notes[0] as any, trusted, null).ok, true);
+    const first = publicKeyBuildCount() - before;
+    assert.ok(first <= 1, `200 verifications built ${first} KeyObjects: the cache is not working`);
+    const after = publicKeyBuildCount();
+    for (let i = 0; i < 50; i++) verifyRecord(notes[0].attestation, notes[0] as any, trusted, null);
+    assert.equal(publicKeyBuildCount(), after, "a repeat verification builds nothing");
   });
 
   test("ONEMEMORY_TRUSTED_ATTESTERS: <server_id>=<key> entries or a JSON array; a bare key is reported, never trusted", () => {

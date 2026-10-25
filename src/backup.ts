@@ -7,12 +7,12 @@
 // we copy it too, with mode 0600, and say loudly that it must be stored
 // SEPARATELY from the backup -- a backup and its key in one place defeats the
 // encryption, and a backup without its key is unreadable.
-import { chmodSync, copyFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Store } from "./store.js";
 import { keyPath } from "./crypto.js";
-import { attestKeyPath, peekSigningKey } from "./attest.js";
+import { attestKeyPath, copyKeyFileExclusive, peekSigningKey } from "./attest.js";
 
 export interface BackupResult {
   dir: string;
@@ -38,45 +38,61 @@ export function backupStore(
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const db = join(dir, "state.db");
   if (existsSync(db)) throw new Error(`${db} already exists; choose another --out directory (backups never overwrite)`);
-  store.backupTo(db);
-  try {
-    chmodSync(db, 0o600);
-  } catch {
-    /* windows */
-  }
-  // The command-task approval key lets its holder mint approvals the runner
-  // honours. A backup must not carry it unless asked: restored without it,
-  // existing approvals fail their check ("stale") -- fail closed -- and the
-  // admin simply re-approves.
-  if (!opts.includeApprovalKey) {
-    const strip = new DatabaseSync(db);
-    try {
-      strip.prepare("DELETE FROM _meta WHERE key = 'approval_key'").run();
-      strip.exec("VACUUM");
-    } finally {
-      strip.close();
+  // Written under a temporary name and renamed only when complete and verified, so a failed or killed copy
+  // never leaves a corrupt state.db behind (which a retry would then refuse as "already exists").
+  const part = `${db}.partial`;
+  const dropPart = (): void => {
+    for (const f of [part, `${part}-journal`, `${part}-wal`, `${part}-shm`]) {
+      try {
+        unlinkSync(f);
+      } catch {
+        /* not there */
+      }
     }
-  }
-  // Prove the copy opens and is internally consistent before reporting success.
-  const copy = new DatabaseSync(db, { readOnly: true });
+  };
+  dropPart();
   let notes = 0;
   try {
-    const ic = copy.prepare("PRAGMA integrity_check").get() as { integrity_check: string };
-    if (ic.integrity_check !== "ok") throw new Error(`backup failed its integrity check: ${ic.integrity_check}`);
-    notes = Number((copy.prepare("SELECT COUNT(*) AS c FROM notes").get() as { c: number }).c);
-  } finally {
-    copy.close();
+    store.backupTo(part);
+    try {
+      chmodSync(part, 0o600);
+    } catch {
+      /* windows */
+    }
+    // The command-task approval key lets its holder mint approvals the runner
+    // honours. A backup must not carry it unless asked: restored without it,
+    // existing approvals fail their check ("stale") -- fail closed -- and the
+    // admin simply re-approves.
+    if (!opts.includeApprovalKey) {
+      const strip = new DatabaseSync(part);
+      try {
+        strip.prepare("DELETE FROM _meta WHERE key = 'approval_key'").run();
+        strip.exec("VACUUM");
+      } finally {
+        strip.close();
+      }
+    }
+    // Prove the copy opens and is internally consistent before reporting success.
+    const copy = new DatabaseSync(part, { readOnly: true });
+    try {
+      const ic = copy.prepare("PRAGMA integrity_check").get() as { integrity_check: string };
+      if (ic.integrity_check !== "ok") throw new Error(`backup failed its integrity check: ${ic.integrity_check}`);
+      notes = Number((copy.prepare("SELECT COUNT(*) AS c FROM notes").get() as { c: number }).c);
+    } finally {
+      copy.close();
+    }
+    if (existsSync(db)) throw new Error(`${db} appeared while the backup ran; choose another --out directory (backups never overwrite)`);
+    renameSync(part, db);
+  } catch (e) {
+    dropPart();
+    throw e;
   }
+  dropPart();
   let key: string | null = null;
   const kp = keyPath(dirname(dbPath));
   if (existsSync(kp)) {
     key = join(dir, ".key");
-    copyFileSync(kp, key);
-    try {
-      chmodSync(key, 0o600);
-    } catch {
-      /* windows */
-    }
+    copyKeyFileExclusive(kp, key);
   }
   // The attestation signing key is the server's signing identity. A database restored without it
   // keeps its server_id but mints a NEW key: peers that trusted the old key reject its exports, and
@@ -85,12 +101,7 @@ export function backupStore(
   const hasAttestKey = peekSigningKey(dirname(dbPath)) !== null;
   if (hasAttestKey && opts.includeAttestKey) {
     attestKey = join(dir, ".attest-key");
-    copyFileSync(attestKeyPath(dirname(dbPath)), attestKey);
-    try {
-      chmodSync(attestKey, 0o600);
-    } catch {
-      /* windows */
-    }
+    copyKeyFileExclusive(attestKeyPath(dirname(dbPath)), attestKey);
   }
   writeFileSync(
     join(dir, "README.txt"),

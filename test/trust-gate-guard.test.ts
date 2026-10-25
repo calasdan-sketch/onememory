@@ -20,44 +20,114 @@ const SRC = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "src");
 const as = <T>(label: string, fn: () => T): T => actorStore.run({ label, authed: true }, fn);
 const read = (f: string): string => readFileSync(join(SRC, f), "utf8");
 
-/** Every `store.read(` / `exportAll(` / `exportBatch(` call outside store.ts, with the reason it is not a leak. */
-const RAW_READS: Record<string, { read?: number; exportAll?: number; exportBatch?: number; why: string }> = {
-  "api.ts": {
-    read: 4,
-    exportBatch: 1,
-    why: "read: access probes and write-path lookups that run AFTER readVisible/denyUnreadable has decided (GET /notes/:id, PUT, archive, restore use readVisible); exportBatch: GET /export is admin-only and takes a ?include/no-attest choice",
-  },
-  "cli.ts": { read: 1, exportAll: 1, exportBatch: 1, why: "local shell commands (reindex, export, show): whoever runs them already has the database file" },
-  "consolidate.ts": { read: 2, exportAll: 1, why: "janitorPool filters through store.filterVisible; read: re-reads of ids the pool already admitted" },
-  "mcp-server-core.ts": { read: 4, exportAll: 1, why: "read: probes behind readVisible/canRead; exportAll: consolidation candidates, filtered with filterVisible" },
-  "sync.ts": { read: 2, exportAll: 1, why: "the vault export skips hidden notes itself (hiddenIds) unless --include-distrusted; read: merge-base lookups on import" },
-  "tasks.ts": { read: 6, why: "internal task flows: getTask uses readVisible; the others are update paths that first check visibility (ckeyHit, TaskNotFoundError)" },
+/**
+ * Every raw read of notes outside store.ts: `.read(` / `.exportAll(` / `.exportBatch(` on ANY receiver (an alias,
+ * `this.s.read(`, `deps.store.read(` all match), each carrying a `// gate-ok: <reason>` comment on the same line.
+ * The reasons are listed here per file, so the check is keyed on the call site and not on a count: adding a read, or
+ * swapping one safe read for an unsafe one in the same file, changes the list and fails.
+ */
+const RAW_SITE_RE = /\.(read|exportAll|exportBatch)\(/;
+const GATE_OK = "// gate-ok: ";
+const EXPECTED_SITES: Record<string, string[]> = {
+  "api.ts": [
+    "access probe: denyUnreadable/readVisible decide before anything is returned",
+    "PUT: namespace check, then a hidden note reads as 404",
+    "tag-guard lookup only (no content returned)",
+    "archive/restore: denyUnwritable probe, hidden note is 404",
+    "GET /export is admin-only (a full backup)",
+  ],
+  "cli.ts": [
+    "local shell command (reindex): the operator owns the database file",
+    "local shell command (show): the operator owns the database file",
+    "local shell command (lint scan): the operator owns the database file",
+    "local shell command (export): the operator owns the database file",
+  ],
+  "consolidate.ts": [
+    "admin consolidation by ids: mixed trusted/distrusted sources are refused below",
+    "candidate scan is filtered with store.filterVisible before use",
+    "re-read of an id the pool already admitted",
+  ],
+  "mcp-server-core.ts": [
+    "tag-guard lookup only (no content returned)",
+    "access probe: readVisible decides before anything is returned",
+    "admin delete: namespace check only",
+    "consolidation candidates (admin): filtered with filterVisible",
+    "consolidation candidates (admin): filtered with filterVisible",
+    "admin consolidate: namespace check only",
+  ],
+  "sync.ts": [
+    "the vault export skips hidden notes itself (hiddenIds) unless --include-distrusted",
+    "existence check only (deleted here?)",
+    "import merge-base lookup: compares hashes, returns nothing to a caller",
+  ],
+  "tasks.ts": [
+    "requireTaskRef: a distrusted task reads as absent",
+    "cycle check walks parent ids only",
+    "putTask update: visibility is checked on the next lines (distrusted is TaskNotFoundError)",
+    "claimTask: distrusted tasks are refused on the next line",
+    "approveTask: distrusted tasks are refused on the next line",
+    "finishCommandTask: runner-internal, writes a result, returns nothing",
+  ],
 };
 
-function count(text: string, re: RegExp): number {
-  return [...text.matchAll(re)].length;
+/** The raw-read call sites in a source text: [line number, text of the line]. Comment-only lines are ignored. */
+export function rawSites(text: string): Array<[number, string]> {
+  const out: Array<[number, string]> = [];
+  text.split("\n").forEach((line, i) => {
+    if (/^\s*(\/\/|\*|\/\*)/.test(line)) return;
+    if (RAW_SITE_RE.test(line.split(GATE_OK)[0])) out.push([i + 1, line]);
+  });
+  return out;
 }
 
+/** Unconditional `includeDistrusted: true` (not behind a `? { includeDistrusted: true } : {}` pass-through of an admin-gated flag), per file. */
+const INTERNAL_OPT_IN: Record<string, number> = { "api.ts": 1, "liveness.ts": 2, "mcp-server-core.ts": 1, "runner.ts": 2, "tasks.ts": 2 };
+
 describe("B: one gate for reading a note", () => {
-  test("no module reads notes raw without being on the reviewed list", () => {
-    const files = readdirSync(SRC).filter((f) => f.endsWith(".ts") && f !== "store.ts" && !/^runner/.test(f));
-    const seen: Record<string, { read: number; exportAll: number; exportBatch: number }> = {};
+  test("the scanner itself: it matches aliased receivers and ignores comments (positive control)", () => {
+    const sample = [
+      "const a = store.read(1);",
+      "const b = s.read(2); // gate-ok: x",
+      "const c = this.s.read(3);",
+      "const d = deps.store.exportAll({ live: true });",
+      "const e = self.store.exportBatch(0, 10);",
+      "// store.read(99) in a comment",
+      " * store.read(98) in a doc block",
+      "const f = readFileSync(p);",
+    ].join("\n");
+    assert.deepEqual(rawSites(sample).map(([n]) => n), [1, 2, 3, 4, 5]);
+  });
+
+  test("no module reads notes raw without a reviewed, reasoned call site", () => {
+    const files = readdirSync(SRC).filter((f) => f.endsWith(".ts") && f !== "store.ts");
+    const seen: Record<string, string[]> = {};
+    const unmarked: string[] = [];
+    for (const f of files) {
+      for (const [n, line] of rawSites(read(f))) {
+        const i = line.indexOf(GATE_OK);
+        if (i < 0) unmarked.push(`${f}:${n}  ${line.trim().slice(0, 100)}`);
+        else (seen[f] ??= []).push(line.slice(i + GATE_OK.length).trim());
+      }
+    }
+    assert.deepEqual(unmarked, [], "raw read without a `// gate-ok: <reason>` marker: route it through store.readVisible / filterVisible (or the SQL predicate), or mark it and list it in EXPECTED_SITES");
+    for (const f of Object.keys(seen)) seen[f].sort();
+    const expected = Object.fromEntries(Object.entries(EXPECTED_SITES).map(([f, v]) => [f, [...v].sort()]));
+    assert.deepEqual(seen, expected, "the set of reviewed raw reads changed: update EXPECTED_SITES in test/trust-gate-guard.test.ts with the reason it is safe");
+  });
+
+  test("no SQL on the notes table outside store.ts, and no new unconditional includeDistrusted opt-in", () => {
+    const files = readdirSync(SRC).filter((f) => f.endsWith(".ts") && f !== "store.ts");
+    const sql: string[] = [];
+    const optIn: Record<string, number> = {};
     for (const f of files) {
       const t = read(f);
-      const c = {
-        read: count(t, /\b(?:store|this\.store)\.read\(/g),
-        exportAll: count(t, /\bstore\.exportAll\(/g),
-        exportBatch: count(t, /\bstore\.exportBatch\(/g),
-      };
-      if (c.read || c.exportAll || c.exportBatch) seen[f] = c;
+      if (/\b(?:FROM|JOIN|UPDATE|INTO)\s+notes\b/i.test(t)) sql.push(f);
+      const n = t.split("\n").filter((l) => /includeDistrusted: ?true/.test(l) && !/\? \{ includeDistrusted: true \} : \{\}/.test(l) && !/^\s*\/\//.test(l)).length;
+      if (n) optIn[f] = n;
     }
-    const expected = Object.fromEntries(Object.entries(RAW_READS).map(([f, e]) => [f, { read: e.read ?? 0, exportAll: e.exportAll ?? 0, exportBatch: e.exportBatch ?? 0 }]));
-    assert.deepEqual(
-      seen,
-      expected,
-      "a raw store read was added or removed. Route it through store.readVisible / filterVisible (or the SQL predicate), " +
-        "then update RAW_READS in test/trust-gate-guard.test.ts with the reason it is safe."
-    );
+    // backup.ts only counts the notes of the COPY it just made.
+    assert.deepEqual(sql.sort(), ["backup.ts"], "SQL on the notes table belongs in store.ts, behind the gate");
+    assert.deepEqual(optIn, INTERNAL_OPT_IN, "an unconditional includeDistrusted: true was added or removed: review it, then update INTERNAL_OPT_IN");
   });
 
   test("every HTTP GET route and every MCP tool is classified", () => {
@@ -80,81 +150,116 @@ describe("B: one gate for reading a note", () => {
 });
 
 describe("B: the canary never reaches a non-admin reader through any classified read route", () => {
-  test("HTTP: GET routes", async () => {
+  /** Seed one namespace: the evil writer's notes/tasks/handoff (hidden) next to good, trusted ones (the positive controls). */
+  function seed(): { s: Store; CANARY: string; evilNote: number; evilTask: number; goodNote: number; goodTask: number } {
     const s = new Store(":memory:");
     const CANARY = "CANARYQX7";
     const e = as("evil", () => s.create({ namespace: "work", title: `${CANARY} title`, body: `${CANARY} body zebra` }));
     as("evil", () => putTask(s, { title: `${CANARY} task`, namespace: "work" }));
     const et = as("evil", () => putTask(s, { title: `${CANARY} task two`, namespace: "work" })).task;
     as("evil", () => writeHandoff(s, { surface: "evil-box", summary: `${CANARY} summary`, namespace: "work" }));
-    as("good", () => s.create({ namespace: "work", title: "plain", body: "zebra but fine" }));
+    as("evil", () => s.create({ namespace: "work", title: `${CANARY} twin`, body: `${CANARY} body zebra` }));
+    const g = as("good", () => s.create({ namespace: "work", title: "plain", body: "zebra but fine" }));
+    const gt = as("good", () => putTask(s, { title: "plain task", namespace: "work" })).task;
+    as("good", () => writeHandoff(s, { surface: "good-box", summary: "plain summary", namespace: "work" }));
     for (let i = 0; i < 3; i++) s.touch(e.id);
     s.distrustAdd("work", "evil");
+    return { s, CANARY, evilNote: e.id, evilTask: et.id, goodNote: g.id, goodTask: gt.id };
+  }
+
+  test("HTTP: GET routes (a trusted marker must show up where the route lists things)", async () => {
+    const { s, CANARY, evilNote, evilTask, goodNote, goodTask } = seed();
     const TOKEN = "r".repeat(32);
-    const server = createApiServer(s, [{ token: TOKEN, scope: "read", label: "reader" }]);
+    const WTOKEN = "w".repeat(32);
+    const server = createApiServer(s, [
+      { token: TOKEN, scope: "read", label: "reader" },
+      { token: WTOKEN, scope: "write", label: "writer" },
+    ]);
     await new Promise<void>((r) => server.listen(0, r));
     const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     try {
-      const paths = [
-        "/notes?namespace=work",
-        `/notes/${e.id}`,
-        "/search?q=zebra&namespace=work",
-        "/stats?namespace=work",
-        "/changes?since=1h&namespace=work",
-        "/tasks?namespace=work",
-        `/tasks/${et.id}`,
-        "/handoffs?namespace=work",
-        "/catch-up?namespace=work&consumer=zz",
+      // [path, expected status, text that MUST be in the body (positive control; "" = none)]
+      const routes: Array<[string, number, string]> = [
+        ["/notes?namespace=work", 200, "plain"],
+        [`/notes/${evilNote}`, 404, ""],
+        [`/notes/${goodNote}`, 200, "zebra but fine"],
+        ["/search?q=zebra&namespace=work", 200, "plain"],
+        ["/stats?namespace=work", 200, "totalNotes"],
+        ["/changes?since=1h&namespace=work", 200, "plain"],
+        ["/tasks?namespace=work", 200, "plain task"],
+        [`/tasks/${evilTask}`, 404, ""],
+        [`/tasks/${goodTask}`, 200, "plain task"],
+        ["/handoffs?namespace=work", 200, "good-box"],
+        ["/catch-up?namespace=work&consumer=zz", 200, "plain"],
       ];
-      for (const p of paths) {
+      for (const [p, status, must] of routes) {
         const r = await fetch(base + p, { headers: { Authorization: `Bearer ${TOKEN}` } });
         const text = await r.text();
+        assert.equal(r.status, status, `${p} -> ${r.status}: ${text.slice(0, 120)}`);
         assert.ok(!text.includes(CANARY), `${p} leaked the canary: ${text.slice(0, 200)}`);
+        if (must) assert.ok(text.includes(must), `${p} did not return the trusted marker ${JSON.stringify(must)} (a typo'd route or argument would pass the leak check by returning nothing): ${text.slice(0, 200)}`);
       }
+      // /stats counts: the hidden notes are not counted for a non-admin
+      const st = (await (await fetch(`${base}/stats?namespace=work`, { headers: { Authorization: `Bearer ${TOKEN}` } })).json()) as { totalNotes: number };
+      assert.equal(st.totalNotes, 3 /* plain note + plain task + good handoff; the 5 evil ones are not counted */, "totalNotes excludes the hidden notes for a non-admin");
       const rel = await fetch(`${base}/relevant`, { method: "POST", headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" }, body: JSON.stringify({ message: "zebra", namespace: "work" }) });
-      assert.ok(!(await rel.text()).includes(CANARY));
+      const relText = await rel.text();
+      assert.ok(!relText.includes(CANARY));
+      assert.ok(relText.includes("plain"), "/relevant returns the trusted note");
+      // write routes echo content too: a hidden id is a 404, never an echo
+      const put = await fetch(`${base}/notes/${evilNote}`, { method: "PUT", headers: { Authorization: `Bearer ${WTOKEN}`, "Content-Type": "application/json" }, body: JSON.stringify({ tags: ["x"] }) });
+      assert.equal(put.status, 404);
+      assert.ok(!(await put.text()).includes(CANARY));
+      const post = await fetch(`${base}/notes`, { method: "POST", headers: { Authorization: `Bearer ${WTOKEN}`, "Content-Type": "application/json" }, body: JSON.stringify({ title: "fresh", body: "zebra", namespace: "work" }) });
+      assert.equal(post.status, 201);
+      assert.ok(!(await post.text()).includes(CANARY));
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
       s.close();
     }
   });
 
-  test("MCP: note-returning tools", async () => {
-    const s = new Store(":memory:");
-    const CANARY = "CANARYQX7";
-    const e = as("evil", () => s.create({ namespace: "work", title: `${CANARY} title`, body: `${CANARY} body zebra` }));
-    const et = as("evil", () => putTask(s, { title: `${CANARY} task`, namespace: "work" })).task;
-    as("evil", () => writeHandoff(s, { surface: "evil-box", summary: `${CANARY} summary`, namespace: "work" }));
-    as("evil", () => s.create({ namespace: "work", title: `${CANARY} twin`, body: `${CANARY} body zebra` }));
-    as("good", () => s.create({ namespace: "work", title: "plain", body: "zebra but fine" }));
-    for (let i = 0; i < 3; i++) s.touch(e.id);
-    s.distrustAdd("work", "evil");
-    const server = createMcpServer(s, "write", {}, { label: "good", authed: true });
-    const [c1, c2] = InMemoryTransport.createLinkedPair();
-    const client = new Client({ name: "t", version: "1" });
-    await Promise.all([client.connect(c1), server.connect(c2)]);
+  test("MCP: note-returning tools, with an admin client for the admin-only ones", async () => {
+    const { s, CANARY, evilNote, evilTask, goodNote, goodTask } = seed();
+    const connect = async (scope: "write" | "admin") => {
+      const server = createMcpServer(s, scope, {}, { label: scope === "admin" ? "boss" : "good", authed: true });
+      const [c1, c2] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: "t", version: "1" });
+      await Promise.all([client.connect(c1), server.connect(c2)]);
+      return client;
+    };
+    const writer = await connect("write");
+    const admin = await connect("admin");
     try {
-      const calls: Array<[string, Record<string, unknown>]> = [
-        ["state_read", { id: e.id }],
-        ["state_search", { query: "zebra", namespace: "work" }],
-        ["state_relevant", { message: "zebra", namespace: "work" }],
-        ["state_list", { namespace: "work" }],
-        ["memory_stats", { namespace: "work" }],
-        ["memory_consolidation_candidates", { namespace: "work", threshold: 0.5 }],
-        ["memory_since", { since: "1h", namespace: "work" }],
-        ["task_get", { id: et.id }],
-        ["task_list", { namespace: "work" }],
-        ["catch_up", { namespace: "work", consumer: "zz" }],
-        ["memory_ack", { consumer: "zz", namespace: "work", ack_token: "bogus" }],
-        ["state_write", { id: e.id, tags: ["x"] }],
+      // [client, tool, args, expect an error result, text that MUST be in the result]
+      const calls: Array<[Client, string, Record<string, unknown>, boolean, string]> = [
+        [writer, "state_read", { id: evilNote }, true, ""],
+        [writer, "state_read", { id: goodNote }, false, "zebra but fine"],
+        [writer, "state_search", { query: "zebra", namespace: "work" }, false, "plain"],
+        [writer, "state_relevant", { message: "zebra", namespace: "work" }, false, "plain"],
+        [writer, "state_list", { namespace: "work" }, false, "plain"],
+        [writer, "memory_stats", { namespace: "work" }, false, "totalNotes"],
+        [writer, "memory_consolidation_candidates", { namespace: "work", threshold: 0.5 }, true, "admin"],
+        [admin, "memory_consolidation_candidates", { namespace: "work", threshold: 0.5 }, false, ""],
+        [writer, "memory_since", { since: "1h", namespace: "work" }, false, "plain"],
+        [writer, "task_get", { id: evilTask }, true, ""],
+        [writer, "task_get", { id: goodTask }, false, "plain task"],
+        [writer, "task_list", { namespace: "work" }, false, "plain task"],
+        [writer, "catch_up", { namespace: "work", consumer: "zz" }, false, "plain"],
+        [writer, "memory_ack", { consumer: "zz", namespace: "work", ack_token: "bogus" }, true, ""],
+        [writer, "state_write", { id: evilNote, tags: ["x"] }, true, ""],
+        [writer, "state_write", { title: "fresh", body: "zebra", namespace: "work" }, false, "fresh"],
       ];
-      for (const [name, args] of calls) {
+      for (const [client, name, args, wantError, must] of calls) {
         const r: any = await client.callTool({ name, arguments: args });
         const text = JSON.stringify(r);
         assert.ok(!text.includes(CANARY), `${name} leaked the canary: ${text.slice(0, 200)}`);
+        assert.equal(Boolean(r.isError), wantError, `${name} ${JSON.stringify(args)}: unexpected ${r.isError ? "error" : "success"}: ${text.slice(0, 160)}`);
+        if (must) assert.ok(text.includes(must), `${name} did not return ${JSON.stringify(must)}: ${text.slice(0, 200)}`);
       }
     } finally {
-      await client.close();
+      await writer.close();
+      await admin.close();
       s.close();
     }
   });

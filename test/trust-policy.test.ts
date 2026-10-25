@@ -168,8 +168,11 @@ describe("distrust list: store level", () => {
     for (let i = 0; i < 50; i++) s.distrustAdd("default", `w${i}`);
     assert.throws(() => s.distrustAdd("default", "one-too-many"), /full \(50 entries\)/);
     s.distrustAdd("default", "w3"); // re-adding an existing rule is not "one more"
-    for (let n = 0; n < 9; n++) for (let i = 0; i < 50; i++) s.distrustAdd(`ns${n}`, `w${i}`);
-    assert.throws(() => s.distrustAdd("ns9", "one-too-many"), /too many|at most|500/i);
+    // namespace-specific entries stop at 450 so ten namespaces cannot lock the "*" bucket out
+    for (let n = 0; n < 8; n++) for (let i = 0; i < 50; i++) s.distrustAdd(`ns${n}`, `w${i}`);
+    assert.throws(() => s.distrustAdd("ns8", "one-too-many"), /namespace-specific/);
+    for (let i = 0; i < 50; i++) s.distrustAdd("*", `star${i}`); // ... and "*" still has its own room
+    assert.throws(() => s.distrustAdd("*", "one-too-many"), /full \(50 entries\)/);
   });
 
   test("changes are audit-logged in the database with who made them", () => {

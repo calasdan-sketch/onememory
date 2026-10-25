@@ -242,15 +242,17 @@ REST mirrors them (`/notes`, `/search`, `/relevant`, `/changes`, `/tasks`, `/han
 onememory start | mcp | doctor | init
 onememory changes --since last --consumer laptop
 onememory runner-status                           # is each PC's runner listening? commands waiting?
-onememory trust [list | distrust <w> | undistrust <w> | identity | attester-add <key> | attester-remove <id>]
+onememory trust [list | distrust <w> | undistrust <w> | identity | attester-add <key> --server-id <id> | attester-remove <id> | attester-revoke <id>]
+onememory trust [export-key --out <file> | rotate]         # EXPERIMENTAL: signed attestations (docs/trust.md)
 onememory watch --consumer pc [--exec program args...]     # react to changes as they land
-onememory backup [--out dir] [--include-approval-key]       # hot copy of the database (+ key)
+onememory backup [--out dir] [--include-approval-key] [--include-attest-key]   # hot copy of the database (+ keys)
 onememory export --format md --dir ~/memory     onememory import --dir ~/memory
+onememory export --format json [--attest] --out a.json     onememory import --file a.json [--require-attestation]
 onememory quarantine [list | approve <id> | reject <id>]
 onememory consolidate | rebuild-edges | reindex | relevant "…" | recall
 ```
 
-`onememory help` explains each. The CLI runs with full local trust (no
+`onememory help` explains each. Upgrading an existing 1.3.x install: [docs/upgrading.md](./docs/upgrading.md). The CLI runs with full local trust (no
 token).
 
 ---
@@ -277,7 +279,7 @@ writer on a per-namespace **distrust list** (`onememory trust distrust <writer> 
 read path unless an **admin** passes `include_distrusted`, they stay hidden after anyone else edits them, and a
 distrusted command task is never run. A JSON export made with `--attest` (`?attest=1`; the default export is the
 plain `{"notes": [...]}` as in 1.3.x) carries a per-note Ed25519 **attestation**; an import that trusts the exporting server's key keeps the
-original author as `attested_writer`, otherwise it flattens provenance as before. What that proves and what it
+original author as `attested_writer`, otherwise it flattens provenance as before and marks the note `imported_unverified`. (Attestations are **EXPERIMENTAL** in 1.4.x.) What that proves and what it
 does not: [docs/trust.md](./docs/trust.md).
 
 ## Security in one paragraph

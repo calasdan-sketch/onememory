@@ -230,13 +230,19 @@ describe("attestations: signing and verifying", () => {
   test("attester-add validates input and refuses to let a peer speak for this server", () => {
     assert.throws(() => b.attesterAdd({ public_key: "short" }), /public_key/);
     assert.throws(() => b.attesterAdd({ public_key: a.identity().public_key, server_id: "nope" }), /UUID/);
-    assert.throws(() => b.attesterAdd({ public_key: a.identity().public_key, server_id: b.serverId() }), /own id/);
+    // A key pinned to THIS server's own id is a "retired own key" (a rotation, or a restore that lost the key file): allowed,
+    // the same way an ONEMEMORY_TRUSTED_ATTESTERS entry naming this server's id is. Its CURRENT key is refused.
+    const retired = b.attesterAdd({ public_key: a.identity().public_key, server_id: b.serverId() });
+    assert.equal(retired.server_id, b.serverId());
+    assert.equal(b.attesterRemove(retired.key_id), true);
+    assert.throws(() => b.attesterAdd({ public_key: b.identity().public_key, server_id: b.serverId() }), /current key/);
+    assert.throws(() => b.attesterAdd({ public_key: a.identity().public_key, server_id: "00000000-0000-4000-8000-000000000000", not_after: "1" }), /ISO-8601/);
     assert.throws(() => b.attesterRemove("zz"), /key_id/);
     assert.throws(() => b.attesterAdd({ public_key: a.identity().public_key, label: "pal" }), /server_id is required/, "a key must be pinned to a server");
     assert.throws(() => b.attesterAdd({ public_key: a.identity().public_key, server_id: a.serverId(), not_after: "never" }), /not_after/);
     const added = b.attesterAdd({ public_key: a.identity().public_key, label: "pal", any_server: true });
     assert.equal(added.key_id, a.identity().key_id);
-    assert.deepEqual(b.trustLog(5).map((l) => l.action), ["attester-add"]);
+    assert.deepEqual(b.trustLog(5).map((l) => l.action), ["attester-add", "attester-remove", "attester-add"]);
     assert.match(b.trustLog(1)[0].subject, /ANY-SERVER/);
     // re-adding with a pin replaces the entry and says so
     const pinned = b.attesterAdd({ public_key: a.identity().public_key, server_id: a.serverId() });

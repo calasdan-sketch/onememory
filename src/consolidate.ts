@@ -496,7 +496,7 @@ export function resolveConsolidationNotes(store: Store, ids: number[]): NoteReco
     throw new ValidationError("consolidation needs at least 2 distinct note ids");
   }
   const notes = uniqueIds.map((id) => {
-    const n = store.read(id);
+    const n = store.read(id); // gate-ok: admin consolidation by ids: mixed trusted/distrusted sources are refused below
     if (!n) throw new ValidationError(`no note with id ${id}`);
     if (n.archived_at) {
       // Merging deletes the sources and creates a LIVE note: that would
@@ -615,7 +615,7 @@ function janitorPool(store: Store, opts: JanitorOptions): NoteRecord[] {
   // Notes touched by a distrusted writer never enter the pool: merging a
   // distrusted copy of a trusted note would make the merged note hidden and
   // the trusted original vanish from every default read.
-  const live = store.exportAll({ live: true });
+  const live = store.exportAll({ live: true }); // gate-ok: candidate scan is filtered with store.filterVisible before use
   const visible = store.filterVisible(live);
   return opts.ownNamespace ? visible.filter((n) => n.namespace === opts.ownNamespace) : visible;
 }
@@ -721,7 +721,7 @@ export function consolidateNotes(
     // against a pre-transaction read, and a concurrent writer may have
     // changed or deleted them since. Abort (full rollback) on any mismatch.
     for (const [id, expectedRev] of expectedRevs) {
-      const current = store.read(id);
+      const current = store.read(id); // gate-ok: re-read of an id the pool already admitted
       if (!current) {
         throw new ValidationError(
           `note ${id} was deleted while preparing the merge; aborting`

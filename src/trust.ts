@@ -28,8 +28,12 @@ export const ALL_NAMESPACES = "*";
 export const MAX_DISTRUST_RULES = 500;
 /** Most rules one namespace (or the `*` bucket) keeps, so one tenant's admin cannot use up everybody's room. */
 export const MAX_DISTRUST_RULES_PER_NAMESPACE = 50;
-/** Trust-log rows kept (older rows are pruned on write). */
+/** Trust-log rows kept per namespace (older rows of THAT namespace are pruned on write). */
 export const MAX_TRUST_LOG_ROWS = 1000;
+/** Trust-log rows kept for the server-wide lines (namespace `*`: attesters, key rotation, `*` rules). Pruned separately. */
+export const MAX_TRUST_LOG_ROWS_GLOBAL = 1000;
+/** Most writer names one note's taint set (merged_from_writers) keeps. */
+export const MAX_TAINT_NAMES = 200;
 
 /** `<server_id>/<label>`, or "" when either part is missing (an unknown writer has no id). */
 export function makeWriterId(serverId: string, label: string): string {
@@ -110,6 +114,20 @@ export function mergedToStorage(list: Iterable<string>): string {
   return u.length ? JSON.stringify(u) : "";
 }
 
+/**
+ * Keep a taint set within MAX_TAINT_NAMES. Names an active rule matches in
+ * `namespace`, and the `fresh` ones just added, are never dropped; the rest are
+ * kept in their existing order until the cap is reached.
+ */
+export function capTaint(names: readonly string[], fresh: ReadonlySet<string>, rules: readonly DistrustRule[], namespace: string, localId: string): string[] {
+  if (names.length <= MAX_TAINT_NAMES) return [...names];
+  const ruled = (n: string): boolean => matchesDistrust(rules, { namespace, written_by: "", merged_from_writers: [n] }, localId);
+  const first: string[] = [];
+  const rest: string[] = [];
+  for (const n of names) (fresh.has(n) || ruled(n) ? first : rest).push(n);
+  return [...first, ...rest].slice(0, MAX_TAINT_NAMES);
+}
+
 function ruleApplies(rule: DistrustRule, namespace: string): boolean {
   return rule.namespace === ALL_NAMESPACES || rule.namespace === namespace;
 }
@@ -158,6 +176,17 @@ export const NOTE_COLUMNS: WriterColumns = {
  */
 export function mergedHasSql(col: string): string {
   return `(instr(${col}, ?) > 0 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN ${col} <> '' THEN ${col} ELSE '[]' END) WHERE value = ?))`;
+}
+
+/**
+ * "Is any of `n` tokens an element of the JSON array in column `col`?" with
+ * the same exactness as `Array.includes` over parseMerged (strings only): ONE
+ * json_each pass per tainted row, whatever the number of tokens. Rows with an
+ * empty taint set (nearly all) cost one string comparison. `n` bound
+ * parameters: the tokens themselves.
+ */
+export function mergedHasAnySql(col: string, n: number): string {
+  return `(${col} <> '' AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(${col}) THEN ${col} ELSE '[]' END) WHERE type = 'text' AND value IN (${Array(n).fill("?").join(",")})))`;
 }
 
 /**
@@ -215,8 +244,10 @@ export function distrustSql(
     }
     if (tokens.size) {
       // One cheap emptiness test guards every token probe: nearly every row has no merged writers.
-      parts.push(`(${cols.merged} <> '' AND (${[...tokens].map(() => mergedHasSql(cols.merged)).join(" OR ")}))`);
-      for (const t of tokens) gp.push(JSON.stringify(t), t);
+      // One json_each pass over the row's taint set tests every token at once (an IN list), instead of one
+      // instr probe per token: cost no longer multiplies rules x taint-set size. json_valid guards a hand-damaged value.
+      parts.push(mergedHasAnySql(cols.merged, tokens.size));
+      for (const t of tokens) gp.push(t);
     }
     if (!parts.length) continue;
     const any = `(${parts.join(" OR ")})`;
@@ -264,14 +295,16 @@ export function writerFilterSql(
       ? { sql: `(${cols.attBy} = ? AND ${cols.attWriter} = ?)`, params: [ref.serverId, ref.label] }
       : { sql: `${cols.writer} = ?`, params: [ref.label] };
   }
+  // An empty value names nobody: "not written by nobody" excludes nothing (it used to hide every note).
+  if (!ref.label) return { sql: "1 = 1", params: [] };
   return foreign
     ? {
-        sql: `(NOT (${cols.attBy} = ? AND ${cols.attWriter} = ?) AND NOT ${mergedHasSql(cols.merged)})`,
-        params: [ref.serverId, ref.label, JSON.stringify(`${ref.serverId}/${ref.label}`), `${ref.serverId}/${ref.label}`],
+        sql: `(NOT (${cols.attBy} = ? AND ${cols.attWriter} = ?) AND NOT ${mergedHasAnySql(cols.merged, 1)})`,
+        params: [ref.serverId, ref.label, `${ref.serverId}/${ref.label}`],
       }
     : {
-        sql: `(${cols.writer} <> ? AND ${cols.attWriter} <> ? AND NOT ${mergedHasSql(cols.merged)})`,
-        params: [ref.label, ref.label, JSON.stringify(ref.label), ref.label],
+        sql: `(${cols.writer} <> ? AND ${cols.attWriter} <> ? AND NOT ${mergedHasAnySql(cols.merged, 1)})`,
+        params: [ref.label, ref.label, ref.label],
       };
 }
 
@@ -282,11 +315,12 @@ export function writerFilterSql(
  */
 export function writerTaintFilterSql(cols: WriterColumns, value: string, localId: string): { sql: string; params: string[] } {
   const ref = parseWriterRef(value);
+  if (!ref.label) return { sql: "1 = 1", params: [] };
   const foreign = ref.serverId !== "" && ref.serverId !== localId.toLowerCase();
   return foreign
     ? {
-        sql: `(NOT (${cols.attBy} = ? AND ${cols.attWriter} = ?) AND NOT ${mergedHasSql(cols.merged)})`,
-        params: [ref.serverId, ref.label, JSON.stringify(`${ref.serverId}/${ref.label}`), `${ref.serverId}/${ref.label}`],
+        sql: `(NOT (${cols.attBy} = ? AND ${cols.attWriter} = ?) AND NOT ${mergedHasAnySql(cols.merged, 1)})`,
+        params: [ref.serverId, ref.label, `${ref.serverId}/${ref.label}`],
       }
-    : { sql: `(${cols.attWriter} <> ? AND NOT ${mergedHasSql(cols.merged)})`, params: [ref.label, JSON.stringify(ref.label), ref.label] };
+    : { sql: `(${cols.attWriter} <> ? AND NOT ${mergedHasAnySql(cols.merged, 1)})`, params: [ref.label, ref.label] };
 }

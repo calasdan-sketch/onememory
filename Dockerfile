@@ -29,7 +29,7 @@ USER node
 EXPOSE 8790 8791
 
 # Readiness probe hits /ready (which actually touches the DB), not just /health.
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=3s --start-period=60s --retries=3 \
   CMD wget -qO- http://127.0.0.1:8790/ready || exit 1
 
 CMD ["node", "dist/src/cli.js", "start"]

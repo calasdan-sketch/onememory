@@ -6,6 +6,75 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-10-24
+
+A third expert review of 1.4.1 (coding, security, architecture, developer experience, infrastructure) found
+the holes below; every confirmed one is fixed. **Upgrading from 1.3.x: read
+[docs/upgrading.md](./docs/upgrading.md).** The schema stays **v14** (one idempotent column,
+`notes.imported_unverified`, is added on open). Result shapes only gained fields.
+
+**EXPERIMENTAL:** signed attestations, cross-server writer ids, `trust rotate`, `trust attester-revoke` and
+`--any-server` are marked as such in the docs, the CLI help and the MCP tool descriptions; their formats may
+change in a minor release.
+
+### Security
+- **A distrusted but still-active write token can no longer edit the metadata (tags, source, namespace) of a
+  trusted note** it did not write (it used to re-label it without touching the content). The edit path also caps
+  the taint set at 200 names, keeping the names an active rule matches.
+- **`include_distrusted` for a namespace-pinned admin is honoured only in the token's own namespace**
+  (REST, MCP, by-id reads and tasks). Asking across a granted namespace is refused. The primary token is always
+  an admin: documented, and `onememory doctor` warns when distrust rules exist and it is the only token.
+- **Notes imported without a verified attestation are marked `imported_unverified`** (shown in reads and in the
+  provenance banner). `--require-attestation`, `require_attestation` on `/import` and
+  `ONEMEMORY_IMPORT_REQUIRE_ATTESTATION=1` reject them. The default import behaviour is unchanged.
+- **Keys.** `trust rotate` takes effect in a running server (the key file is re-checked on use). The retired
+  public key is recorded as a retired key of this server, so earlier exports keep verifying; the old private
+  key is no longer kept unless `--keep-old-private`. `ONEMEMORY_TRUSTED_ATTESTERS` and `attester-add` follow
+  the same rules (both accept a retired own key; neither accepts the current one). `not_after` is judged
+  against the time of verification, so a backdated `exported_at` no longer bypasses it; it is documented as an
+  **expiry, not a revocation**. New `trust attester-revoke` / `attester-unrevoke` (CLI, REST, MCP) and
+  `ONEMEMORY_ATTEST_MIN_VERSION` (refuse version 1 attestations). `trust export-key` no longer writes through
+  an existing file or a dangling symlink. The "restored without its key" warning fires only when the database
+  remembers a previous key that is now missing.
+- **Trust log:** pruned per namespace (a flooding namespace cannot push out another's history); `key-rotate`
+  rows are hidden from pinned admins; namespace-specific rules cap at 450 in total so `*` rules always fit.
+- `/stats` `totalNotes` and the other counters exclude hidden notes for non-admins; a task cannot name a hidden
+  task as its parent or blocker (same error as a missing one); writer labels are NFKC-normalised with
+  zero-width characters removed (case is still exact); a library `notWrittenBy: ""` no longer hides every note.
+- `distrust` reports `matched_notes`, so a typo in a label (0 matches) is visible.
+
+### Performance
+- The distrust predicate uses **one `json_each` membership test per row** instead of one `instr` probe per
+  label, with equivalence tests against the old predicate and the JS rule check (random data).
+  Measured on 100,000 notes with a 30-name taint set on every note (median of 7, first page of `list`): 100 `*` rules 10.9 s -> 1.06 s, 10 rules 1.31 s -> 1.09 s, no rules unchanged (0.17 s). `/changes` with 100 rules 11.2 s -> 0.96 s.
+- The markdown vault export was quadratic in the number of hidden notes; it is linear now.
+- `import --file` streams the file in batches of 500 instead of parsing it whole. A 5,000-note, 4.3 MB file: peak memory 369 MB -> 135 MB and 16.9 s -> 2.0 s; a 30,000-note, 25.8 MB file imports in 11.9 s at a peak of 283 MB (the old path did not finish within 2 minutes). A multi-batch
+  restore defers the similarity graph; run `onememory rebuild-edges` afterwards (the command says so).
+
+### Changed
+- Backups: the copy is built as `state.db.partial`, verified and renamed; stale `-journal` sidecars, partial
+  copies and an existing pre-upgrade copy of a different state are handled (the old one is kept under a dated
+  name); a source that changes during the copy is reported. A read-only data directory gets a readable error.
+- `.github/workflows/publish.yml` waits for the full build and test matrix (ubuntu, windows, macos).
+- The test script preloads `test/setup-env.ts`, so a developer's `ONEMEMORY_*` environment cannot change a
+  result. The gate-guard test has positive controls, matches any receiver, uses a keyed allow-list and an admin
+  client for the consolidation candidates.
+- The CLI error for an unpinned attester names `--any-server` (`any_server: true` over the API).
+
+### Documentation
+- New [docs/upgrading.md](./docs/upgrading.md). `docs/configuration.md` lists every `ONEMEMORY_*` variable
+  once with its real default (a test greps the code for them). README `attester-add` carries `--server-id`;
+  `trust.md` no longer names a nonexistent command; the feed field names are in the glossary; the RUNNER_ID
+  fallback text matches the code (`COMPUTERNAME`, then `HOSTNAME`, then `default`).
+
+### Tests
+- 1237 -> 1285 tests (new: `test/trust-142.test.ts`, the rewritten gate guard); `npx tsc --noEmit` clean; the full suite, including the packed-tarball smoke test, passed three times in a row.
+
+### Not done
+- A lock for two processes migrating at once, `ONEMEMORY_REQUIRE_PREMIGRATION_BACKUP`, an admin
+  `clear-taint` command, hiding admin-only tools from a non-admin `tools/list`, and reserving the runner
+  namespace were reviewed and left for a later version.
+
 ## [1.4.1] - 2026-10-24
 
 A second expert review of 1.4.0 (coding, security, architecture, developer experience, infrastructure) found
@@ -48,7 +117,7 @@ real holes in the trust feature. All are fixed here; schema is **unchanged at v1
 
 ### Changed
 - **`GET /export` and `onememory export --format json` are back to the 1.3.x shape by default**:
-  `{"notes": [...]}`, byte for byte. The header and signatures are opt-in: `?attest=1` / `--attest`
+  `{"notes": [...]}` (the same top-level shape; the notes themselves carry the newer fields). The header and signatures are opt-in: `?attest=1` / `--attest`
   (`--no-attest` and `?attest=0` are accepted no-ops). `POST /import` and `import --file` read the plain
   object, the attested envelope and a bare array. *(1.4.0 had made the envelope the default and described
   `?attest=0` wrongly; see the correction in that entry.)*

@@ -1,6 +1,6 @@
 # Configuration
 
-All environment variables are optional:
+All environment variables are optional. This table lists **every** `ONEMEMORY_*` variable the code reads (a test fails when one is missing):
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -13,17 +13,39 @@ All environment variables are optional:
 | `ONEMEMORY_AUDIT_LOG` | `<data dir>/audit.log` | Audit log path (create/update/delete, task / handoff / catch_up / approve entries with the token label and kind; never note text or tokens) |
 | `ONEMEMORY_AUDIT_MAX_BYTES` | `5000000` | Rotate audit.log when it reaches this size (`0` = never) |
 | `ONEMEMORY_AUDIT_KEEP` | `5` | Rotated audit files kept (`audit.log.1` ... `.N`) |
-| `ONEMEMORY_RUNNER_TASK_NAMESPACE` | unset | Runner only: namespace whose admin-approved command tasks the runner executes. Unset = command tasks off. See [RUNNER.md](https://github.com/calasdan-sketch/onememory/blob/main/docs/RUNNER.md) |
+| `ONEMEMORY_RUNNER_TASK_NAMESPACE` | unset | Runner and server: namespace whose admin-approved command tasks the runner executes. Unset = command tasks off. See [RUNNER.md](https://github.com/calasdan-sketch/onememory/blob/main/docs/RUNNER.md) |
 | `ONEMEMORY_RUNNER_STALE_SECONDS` | `600` (30 s - 7 d) | API/MCP/CLI side: heartbeat age after which `runner_status` calls the runner stale. Never less than three of the runner's own beat intervals (the heartbeat publishes its interval), so a slow beat cannot read as permanently offline. See [RUNNER.md](https://github.com/calasdan-sketch/onememory/blob/main/docs/RUNNER.md) |
 | `ONEMEMORY_APPROVAL_TTL_SECONDS` | `86400` (60 s - 30 d) | How long an admin approval of a command task stays valid before it expires and needs approving again |
-| `ONEMEMORY_RUNNER_ID` | machine name | Server-side fallback for the runner's machine name when no heartbeat has been seen (the runner's own heartbeat wins). Counted commands are the ones whose `target` is this name |
+| `ONEMEMORY_RUNNER_ID` | `COMPUTERNAME`, else `HOSTNAME`, else `default` | The runner's machine name (the runner's own heartbeat wins). Server side: fallback for the name when no heartbeat has been seen. Counted commands are the ones whose `target` is this name. Note: `COMPUTERNAME` is set on Windows and `HOSTNAME` is usually **not exported** by Linux/macOS shells, so on those set `ONEMEMORY_RUNNER_ID` explicitly or the name is `default` |
 | `ONEMEMORY_RUNNER_ACCEPT_LEGACY` | unset | Server side: `1` = also believe runner heartbeats with no writer marker (runners older than 1.3.4). Default off since 1.4.0; a stopgap until the runners are updated. See [RUNNER.md](https://github.com/calasdan-sketch/onememory/blob/main/docs/RUNNER.md) |
-| `ONEMEMORY_TRUSTED_ATTESTERS` | unset | Export signers whose note attestations an import believes. Either comma/space/newline separated `<server_id>=<public key>` entries (the server id is a UUID, the key 43 characters of base64url), or a JSON array `[{"public_key":"<key>","server_id":"<uuid>","label":"text"}]`. **A bare public key is not accepted**: a key must be pinned to the one server it speaks for. The server logs a loud warning (once) naming every entry it ignored, and when the variable yields nothing at all. Merged with the list an admin keeps in the database (`onememory trust attester-add --server-id ...`). A server's own key is always trusted for its own server id only. See [trust.md](./trust.md) |
+| `ONEMEMORY_TRUSTED_ATTESTERS` | unset | Export signers whose note attestations an import believes. Either comma/space/newline separated `<server_id>=<public key>` entries (the server id is a UUID, the key 43 characters of base64url), or a JSON array `[{"public_key":"<key>","server_id":"<uuid>","label":"text"}]`. **A bare public key is not accepted**: a key must be pinned to the one server it speaks for. The server logs a loud warning (once) naming every entry it ignored, and when the variable yields nothing at all. Merged with the list an admin keeps in the database (`onememory trust attester-add --server-id ...`). A server's own current key is always trusted for its own server id only; an entry naming **this** server's id is a *retired own key* (see `trust rotate`), exactly like `attester-add` with this server's id. Keys on the revocation list (`trust attester-revoke`) are ignored here too. **EXPERIMENTAL.** See [trust.md](./trust.md) |
 | `ONEMEMORY_ATTEST_KEY_FILE` | `<db dir>/.attest-key` | Where the database's Ed25519 signing key lives (created mode `0600` on first signed export or `onememory trust identity`, never exported; tightened back to `0600` at every start; not in `onememory backup` unless `--include-attest-key`). Two databases in one directory share the default file: use one directory per database or set this per database. If the location cannot be created, imports of unsigned files still work |
-| `ONEMEMORY_RUNNER_HEARTBEAT_PRUNE_DAYS` | `30` (`0` = never) | Housekeeping (server start, the runner's own sweep): delete the heartbeat note of a runner id that has not beaten for this many days (renamed hosts, containers, CI). A live runner re-creates its note on its next beat |
-| `ONEMEMORY_RUNNER_*` (others) | | The remaining `ONEMEMORY_RUNNER_*` variables (poll interval, allow-list, time-outs, results namespace, ...) configure the command runner itself, which is not part of the npm package. They are documented in [RUNNER.md](https://github.com/calasdan-sketch/onememory/blob/main/docs/RUNNER.md) |
+| `ONEMEMORY_RUNNER_HEARTBEAT_PRUNE_DAYS` | `30` (`0` = never; empty = `30`) | Housekeeping (server start, the runner's own sweep): delete the heartbeat note of a runner id that has not beaten for this many days (renamed hosts, containers, CI). A live runner re-creates its note on its next beat |
+| `ONEMEMORY_RUNNER_HEARTBEAT_MS` | `180000` | Runner: how often it publishes its heartbeat. Server side: fallback for the runner's beat interval when a heartbeat does not carry one |
+| `ONEMEMORY_RUNNER_NAMESPACE` | `commands` | Runner and signing helper: namespace holding signed command notes (not the command-task namespace) |
+| `ONEMEMORY_RUNNER_RESULTS_NAMESPACE` | `results` | Runner: namespace its results are written to |
+| `ONEMEMORY_RUNNER_POLL_MS` | `30000` | Runner: how often it polls for work |
+| `ONEMEMORY_RUNNER_FRESHNESS_MS` | `300000` | Runner: signed commands older than this are refused |
+| `ONEMEMORY_RUNNER_TIMEOUT_MS` | `120000` | Runner: default time-out for one action |
+| `ONEMEMORY_RUNNER_MAX_REJECTS_PER_POLL` | `200` | Runner: rejected notes handled per poll |
+| `ONEMEMORY_RUNNER_MAX_PER_POLL` | `10` | Runner: actions run per poll |
+| `ONEMEMORY_RUNNER_MAX_PER_WINDOW` | `60` | Runner: actions run per rate window |
+| `ONEMEMORY_RUNNER_WINDOW_MS` | `600000` | Runner: the rate window for `ONEMEMORY_RUNNER_MAX_PER_WINDOW` |
+| `ONEMEMORY_RUNNER_RETENTION_DAYS` | `30` | Runner: days result notes are kept |
+| `ONEMEMORY_RUNNER_PRUNE_EVERY_MS` | `3600000` | Runner: how often it prunes old results |
+| `ONEMEMORY_RUNNER_ALLOW` | `data/runner-allow.json` | Runner: the allow-list (JSON) of actions it may run; none = nothing runs |
+| `ONEMEMORY_RUNNER_SECRET` | unset | Runner and signing helper: the shared secret that signs and verifies command notes. Required to run or sign anything |
+| `ONEMEMORY_TASK_COMMAND_QUOTA` | `100` | Most queued command tasks per namespace; more are refused |
+| `ONEMEMORY_CHANGE_LOG_PURGE_MS` | `3600000` (min `100`) | How often the server prunes the 90-day change log and stale runner heartbeats. Shortened by tests only |
+| `ONEMEMORY_TARPIT_STEP_MS` | `250` | Authentication failures from one client are delayed by this much more each time ... |
+| `ONEMEMORY_TARPIT_CAP_MS` | `2000` | ... up to this ceiling (brute-force slow-down) |
+| `ONEMEMORY_ENABLE_SIGN_PAGE` | unset (off) | `1` serves the runner signing page (`/sign`, `/signer.js`); otherwise both paths 404 |
+| `ONEMEMORY_CONSUMER` | set by `onememory watch` | Not a setting: `onememory watch` puts the consumer name in the environment of the command it runs |
+| `ONEMEMORY_CHANGE_COUNT` | set by `onememory watch` | Not a setting: the number of changes handed to the command `onememory watch` runs |
+| `ONEMEMORY_ATTEST_MIN_VERSION` | `1` (at most the current version, `2`) | Oldest attestation version an import believes. `2` once every peer exports with 1.4.1 or later (a version-1 attestation signs fewer fields). **EXPERIMENTAL** (see [trust.md](./trust.md)) |
+| `ONEMEMORY_IMPORT_REQUIRE_ATTESTATION` | unset (off) | `1` = an import (`onememory import --file`, `POST /import`) rejects every note that does not come with an attestation that verifies against a trusted key. Off by default: notes imported without one are accepted and flagged `imported_unverified`. Per import: `--require-attestation`, `?require_attestation=1`. See [trust.md](./trust.md) |
 | `ONEMEMORY_NO_CHMOD` | unset | `1` = never tighten data-dir permissions to 0700/0600 (for deliberately shared dirs) |
-| `ONEMEMORY_TOKEN` | auto-generated → `<data dir>/.token` | Primary (admin) bearer token; required to bind a public interface |
+| `ONEMEMORY_TOKEN` | auto-generated → `<data dir>/.token` | Primary bearer token; required to bind a public interface. **It is always an admin token**, so an agent holding it can switch the distrust policy off (`include_distrusted`): give agents a `write` or `read` token from `ONEMEMORY_TOKENS` and keep the primary one off them (`onememory doctor` warns when distrust rules exist and no other token does) |
 | `ONEMEMORY_TOKENS` | unset | Optional JSON array of extra scoped tokens: `[{"token":"…","scope":"read\|write\|admin","label":"…","namespace":"…"}]` (also readable from `<data dir>/tokens.json`). `namespace` optionally pins a token to one namespace — per-token isolation on a shared server, so several agents can share one bridge without seeing each other's notes. See [token-namespaces.md](./token-namespaces.md) |
 | `ONEMEMORY_BIND` | `127.0.0.1` | Interface to bind (`0.0.0.0` inside Docker) |
 | `ONEMEMORY_PORT` | `8790` | HTTP API + dashboard port |
@@ -38,7 +60,6 @@ All environment variables are optional:
 | `ONEMEMORY_ALLOWED_ORIGINS` | unset | Comma-separated browser Origins allowed to call the API (for a browser on the tunnel domain); loopback is always allowed |
 | `ONEMEMORY_RATE_MAX` | `120` | Max requests per client per window |
 | `ONEMEMORY_RATE_WINDOW_MS` | `10000` | Rate-limit window in milliseconds |
-| `ONEMEMORY_AUDIT_LOG` | `~/.onememory/audit.log` (`$ONEMEMORY_HOME/audit.log`) | Append-only audit log path (records operations, never note content) |
 | `ONEMEMORY_TIMEZONE` | system timezone | IANA timezone for interpreting `when` time phrases in search (e.g. `America/Winnipeg`); invalid names fall back to `UTC` |
 | `ONEMEMORY_AUTO_CONSOLIDATE_INTERVAL` | unset (off) | Background dedup interval: `24h`, `30m`, `90s`, or bare seconds (`3600`). Logs candidates ≥ 0.95; auto-merges only near-identical pairs ≥ 0.99 |
 | `ONEMEMORY_STALE_DAYS` | `90` | Notes older than this (by `updated_at`) are flagged stale |

@@ -405,8 +405,9 @@ function clientKey(v: unknown): string | undefined {
 /** A task other than `selfId`, alive, in `ns`: a valid parent / blocker. */
 function requireTaskRef(store: Store, id: number, ns: string, selfId: number | null, what: string): NoteRecord {
   if (selfId !== null && id === selfId) throw new ValidationError(`${what}: a task cannot reference itself`);
-  const n = store.read(id);
-  if (!n || n.archived_at || !isTaskNote(n) || n.namespace !== ns) {
+  const n = store.read(id); // gate-ok: requireTaskRef: a distrusted task reads as absent
+  // A task the distrust list hides reads as absent here, with the very same error: naming it must not confirm it exists.
+  if (!n || n.archived_at || !isTaskNote(n) || n.namespace !== ns || store.isDistrusted(n)) {
     throw new ValidationError(`${what}: no task with id ${id} in this namespace`);
   }
   return n;
@@ -416,7 +417,7 @@ function assertNoCycle(store: Store, selfId: number, parentId: number): void {
   let cur: number | null = parentId;
   for (let i = 0; cur !== null && i < 64; i++) {
     if (cur === selfId) throw new ValidationError("parent_id would create a cycle");
-    const n = store.read(cur);
+    const n = store.read(cur); // gate-ok: cycle check walks parent ids only
     cur = n ? stateOf(n).parent : null;
   }
 }
@@ -534,7 +535,7 @@ export function putTask(
       throw new ValidationError("nothing to update: pass at least one of title, status, next_step, owner, notes, priority, due, parent_id, blocked_by, command");
     }
     if (title !== undefined && !title) throw new ValidationError("title cannot be empty");
-    const existing = store.read(input.id);
+    const existing = store.read(input.id); // gate-ok: putTask update: visibility is checked on the next lines (distrusted is TaskNotFoundError)
     if (
       !existing ||
       existing.archived_at ||
@@ -737,7 +738,7 @@ export function listTasks(store: Store, opts: TaskListOpts = {}): { tasks: Task[
 function distrustedTaskError(id: number): ValidationError {
   return new ValidationError(
     `task #${id} was written by a writer on this namespace's distrust list; it cannot be claimed or approved. ` +
-      "An admin can review it (include_distrusted) and, if it is fine, rewrite it under a trusted writer or take the writer off the list."
+      "An admin can review it (include_distrusted) and, if it is fine, copy it into a new task under a trusted writer (rewriting it keeps the writer on its taint list) or take the writer off the list."
   );
 }
 
@@ -788,7 +789,7 @@ export function claimTask(
     ttl = input.ttl_seconds;
   }
   for (let attempt = 0; attempt < 5; attempt++) {
-    const existing = store.read(input.id);
+    const existing = store.read(input.id); // gate-ok: claimTask: distrusted tasks are refused on the next line
     if (
       !existing ||
       existing.archived_at ||
@@ -874,7 +875,7 @@ export function approveTask(
   scope: WriteScope = {}
 ): Task {
   if (!Number.isInteger(input.id) || input.id < 1) throw new ValidationError("id must be a positive integer");
-  const existing = store.read(input.id);
+  const existing = store.read(input.id); // gate-ok: approveTask: distrusted tasks are refused on the next line
   if (
     !existing ||
     existing.archived_at ||
@@ -961,7 +962,7 @@ export function finishCommandTask(
   id: number,
   outcome: { ok: boolean; status: string; exit_code?: number | null; output?: string; reason?: string }
 ): void {
-  const n = store.read(id);
+  const n = store.read(id); // gate-ok: finishCommandTask: runner-internal, writes a result, returns nothing
   if (!n || !isTaskNote(n)) return;
   const body = parseBody(n.body);
   const result: Record<string, unknown> = {

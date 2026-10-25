@@ -30,6 +30,7 @@ import {
   claimTask,
   approveTask,
   TASK_STATUSES,
+  TaskNotFoundError,
   TASK_LIMITS,
 } from "./tasks.js";
 import { ackChanges } from "./changes.js";
@@ -221,9 +222,24 @@ export function createMcpServer(
     registerRaw(name, cfg, (...args: unknown[]) => {
       // include_distrusted turns the trust policy OFF for the call: admin only, for every tool.
       // A read/write connection (or an agent a hostile note talked into asking) gets a refusal.
-      const first = args[0] as { include_distrusted?: unknown } | undefined;
+      const first = args[0] as { include_distrusted?: unknown; namespace?: unknown } | undefined;
       if (first && first.include_distrusted === true && !scopeAllows(scope, "admin")) {
         return errorResult("include_distrusted needs an admin connection: it shows notes from writers the admin put on the distrust list");
+      }
+      // A namespace-pinned admin: honoured for its OWN namespace only (the ones it merely reads belong to their own admins).
+      // By-id tools (state_read, task_get) are checked against the note's namespace where they read it.
+      if (
+        first &&
+        first.include_distrusted === true &&
+        nsActive &&
+        name !== "state_read" &&
+        name !== "task_get" &&
+        readable().some((n) => n !== ownNs) &&
+        first.namespace !== ownNs
+      ) {
+        return errorResult(
+          `include_distrusted is honoured only for this connection's own namespace ("${ownNs}"): pass namespace "${ownNs}". The namespaces it can only read are governed by their own admins.`
+        );
       }
       return actorStore.run({ label: conn.label ?? "", authed: conn.authed === true }, () => (handler as (...x: unknown[]) => unknown)(...args));
     });
@@ -346,7 +362,7 @@ export function createMcpServer(
         const denied = denyIfUnder("write");
         if (denied) return errorResult(denied);
         // task / handoff / task.* tags belong to task_put and session_handoff.
-        if (tags !== undefined) assertPlainWriteTags(tags, id !== undefined ? store.read(id)?.tags : undefined);
+        if (tags !== undefined) assertPlainWriteTags(tags, id !== undefined ? store.read(id)?.tags : undefined); // gate-ok: tag-guard lookup only (no content returned)
         if (id !== undefined) {
           // When namespace resolution is active the model-supplied namespace
           // is dropped entirely (the note keeps its existing namespace), and
@@ -423,7 +439,7 @@ export function createMcpServer(
         // computation -- so a denied cross-namespace read leaves
         // access_count, last_accessed, and search ranking untouched, and
         // existing-vs-missing ids cost the same.
-        const probe = store.read(id);
+        const probe = store.read(id); // gate-ok: access probe: readVisible decides before anything is returned
         if (!probe) return errorResult(`no note with id ${id}`);
         if (nsActive && !canRead(grants, ownNs, probe.namespace)) {
           // Uniform "no note": a distinct denial would let the caller probe
@@ -433,7 +449,7 @@ export function createMcpServer(
         // Authorized: the ONE gated read, with tracking (and neighbors, when asked)
         // so the returned counters include this read. A distrusted writer's note
         // reads as "no note" unless an admin opts in (then it is marked).
-        const note = store.readVisible(id, { trackAccess: true, withNeighbors: neighbors === true, includeDistrusted: include_distrusted === true });
+        const note = store.readVisible(id, { trackAccess: true, withNeighbors: neighbors === true, includeDistrusted: include_distrusted === true && (!nsActive || probe.namespace === ownNs) });
         if (!note) return errorResult(`no note with id ${id}`);
         // Round edge scores to 3 decimals for readability (stored raw in
         // SQLite), mirroring memory_consolidation_candidates.
@@ -739,7 +755,7 @@ export function createMcpServer(
           // Deletes (like updates) require the server's own namespace: a
           // read grant never confers delete access. Missing and foreign
           // notes report the same "no note" to avoid an existence oracle.
-          const note = store.read(id);
+          const note = store.read(id); // gate-ok: admin delete: namespace check only
           if (!note || note.namespace !== ownNs) {
             return errorResult(`no note with id ${id}`);
           }
@@ -792,7 +808,7 @@ export function createMcpServer(
         // mostAccessed carries note titles -- attacker-writable content
         // returned pre-prompt -- so the untrusted-data banner applies, like
         // every other tool that echoes stored note content.
-        return untrustedResult(store.accessStats(namespaces));
+        return untrustedResult(store.accessStats(namespaces, { hideDistrusted: !scopeAllows(scope, "admin") }));
       } catch (e) {
         return errorFor(e);
       }
@@ -837,10 +853,10 @@ export function createMcpServer(
           const hint = trustedHint(namespace);
           const allowed = hint ? [hint] : readable();
           const allowedSet = new Set(allowed);
-          notes = store.exportAll({ live: true }).filter((n) => allowedSet.has(n.namespace));
+          notes = store.exportAll({ live: true }).filter((n) => allowedSet.has(n.namespace)); // gate-ok: consolidation candidates (admin): filtered with filterVisible
         } else {
           notes = store
-            .exportAll({ live: true })
+            .exportAll({ live: true }) // gate-ok: consolidation candidates (admin): filtered with filterVisible
             .filter((n) => !namespace || n.namespace === namespace);
         }
         // Titles of distrusted writers' notes are not shown to the agent.
@@ -912,7 +928,7 @@ export function createMcpServer(
         // detailed validation errors stay.)
         if (nsActive) {
           const bad = ids.find((id) => {
-            const n = store.read(id);
+            const n = store.read(id); // gate-ok: admin consolidate: namespace check only
             return !n || n.namespace !== ownNs;
           });
           if (bad !== undefined) return errorResult(`no note with id ${bad}`);
@@ -1222,6 +1238,15 @@ export function createMcpServer(
       try {
         const denied = denyIfUnder("read");
         if (denied) return errorResult(denied);
+        if (include_distrusted === true && nsActive) {
+          // A pinned admin sees hidden tasks of its OWN namespace only.
+          try {
+            return untrustedResult({ task: getTask(store, id, [ownNs], { includeDistrusted: true }) });
+          } catch (e) {
+            if (!(e instanceof TaskNotFoundError)) throw e;
+          }
+          return untrustedResult({ task: getTask(store, id, readable()) });
+        }
         return untrustedResult({ task: getTask(store, id, nsActive ? readable() : undefined, { includeDistrusted: include_distrusted === true }) });
       } catch (e) {
         return errorFor(e);
@@ -1546,24 +1571,26 @@ export function createMcpServer(
         "wrote are then left out of recall, search, list, relevant, memory_since, catch_up, tasks, handoffs and the command runner " +
         "(a distrusted command task is NEVER run) unless a read passes include_distrusted:true. `undistrust` removes the entry. " +
         "`add_attester` / `remove_attester` manage the public keys whose signed export attestations an import will believe " +
-        "(a verified note keeps its original writer in `attested_writer`). `list` shows the policy, the recent trust log and this " +
+        "(a verified note keeps its original writer in `attested_writer`); `revoke_attester` / `unrevoke_attester` stop trusting a key at once. " +
+        "Signed attestations and cross-server writer ids are EXPERIMENTAL in 1.4.x and may change. `list` shows the policy, the recent trust log and this " +
         "server's identity (server_id and public key to give another server's admin). Changes are audit-logged. " +
         "The list lives in the database and cannot be set by a write token or by note content. See docs/trust.md." +
         (nsActive ? " This server is pinned to its own namespace: it can manage only that namespace's rules and cannot change the attester list." : ""),
       annotations: { destructiveHint: true },
       inputSchema: {
-        action: z.enum(["list", "distrust", "undistrust", "add_attester", "remove_attester"]).describe("What to do."),
+        action: z.enum(["list", "distrust", "undistrust", "add_attester", "remove_attester", "revoke_attester", "unrevoke_attester"]).describe("What to do."),
         ...(nsActive ? {} : { namespace: z.string().optional().describe('Namespace of the rule (distrust / undistrust); "*" = every namespace.') }),
         writer: z.string().optional().describe("Token label or writer_id to distrust / undistrust."),
         public_key: z.string().optional().describe("add_attester: the other server's 43-character base64url public key (from `onememory trust identity`)."),
         server_id: z.string().optional().describe("add_attester: the server id this key signs for. Required unless any_server is true: a key is trusted for ONE server."),
-        any_server: z.boolean().optional().describe("add_attester: trust the key for ANY server id (discouraged: the key holder can then claim to be any peer)."),
-        not_after: z.string().optional().describe("add_attester: ISO time after which exports signed by this key are no longer believed (planned rotation)."),
+        any_server: z.boolean().optional().describe("add_attester: EXPERIMENTAL escape hatch. Trust the key for ANY server id (discouraged: the key holder can then claim to be any peer)."),
+        not_after: z.string().optional().describe("add_attester: ISO time at which trust in this key ENDS (judged when an import is verified). An expiry, not a revocation: use revoke_attester for a leaked key."),
         label: z.string().optional().describe("add_attester: a note to yourself about whose key this is."),
-        key_id: z.string().optional().describe("remove_attester: the 16-hex-digit key id."),
+        key_id: z.string().optional().describe("remove_attester / revoke_attester / unrevoke_attester: the 16-hex-digit key id."),
+        reason: z.string().optional().describe("revoke_attester: why (kept in the trust log)."),
       },
     },
-    async (args: { action: string; namespace?: string; writer?: string; public_key?: string; server_id?: string; any_server?: boolean; not_after?: string; label?: string; key_id?: string }) => {
+    async (args: { action: string; namespace?: string; writer?: string; public_key?: string; server_id?: string; any_server?: boolean; not_after?: string; label?: string; key_id?: string; reason?: string }) => {
       try {
         const denied = denyIfUnder("admin");
         if (denied) return errorResult(denied);
@@ -1573,10 +1600,10 @@ export function createMcpServer(
           case "list": {
             // Read-only: reports the key only if one already exists (never creates it).
             const view = store.trustView(nsActive ? ownNs : undefined);
-            return textResult({ ...store.peekIdentity(), distrust: view.distrust, attesters: view.attesters, log: view.log });
+            return textResult({ ...store.peekIdentity(), distrust: view.distrust, attesters: view.attesters, revoked: view.revoked, log: view.log });
           }
           case "distrust":
-            return textResult({ distrust: store.distrustAdd(ns, args.writer ?? ""), rules: store.trustView(nsActive ? ownNs : undefined).distrust });
+            return textResult({ distrust: store.distrustAdd(ns, args.writer ?? ""), matched_notes: store.distrustMatchCount(ns, args.writer ?? ""), rules: store.trustView(nsActive ? ownNs : undefined).distrust });
           case "undistrust":
             return textResult({ removed: store.distrustRemove(ns, args.writer ?? ""), rules: store.trustView(nsActive ? ownNs : undefined).distrust });
           case "add_attester": {
@@ -1597,6 +1624,16 @@ export function createMcpServer(
             const g = attesterGuard();
             if (g) return errorResult(g);
             return textResult({ removed: store.attesterRemove(args.key_id ?? ""), attesters: store.attesterList() });
+          }
+          case "revoke_attester": {
+            const g = attesterGuard();
+            if (g) return errorResult(g);
+            return textResult({ revoked: store.attesterRevoke(args.key_id ?? "", args.reason ?? ""), revocations: store.revocationList() });
+          }
+          case "unrevoke_attester": {
+            const g = attesterGuard();
+            if (g) return errorResult(g);
+            return textResult({ removed: store.attesterUnrevoke(args.key_id ?? ""), revocations: store.revocationList() });
           }
           default:
             return errorResult("unknown action");

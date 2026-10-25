@@ -18,13 +18,21 @@ whole truth: who sets each, when it changes, and whether a distrust rule or `not
 | `attested_writer`, `attested_by` | the original author a **verified** signature vouched for, and the vouching server | an import whose attestation verified against a trusted key | cleared by a later content edit (the previous values move into the taint set) | yes |
 | `imported_written_by`, `imported_created_by` | what a file or payload **claimed** | the import payload (unverified) | never | adds taint at import time (copied into `merged_from_writers`); the field itself is display only |
 | `source` | what the client says it is | the client (free text) | any edit | no (a claim) |
+| `imported_unverified` | did this note arrive **without** a verified attestation? (`true` or absent) | an import whose attestation was missing or failed (1.4.2) | never | no (a display flag; the claimed names are in the taint set) |
+
+**Change-feed names.** The feed (`/changes`, `memory_changes`) reports the writer of the *note* next to the
+actor of the *change*: `writer_id` is `<server_id>/<label>` of the entry's own writer, `note_written_by` is
+the note's current `written_by` as of that entry, and `note_writer_id` is `<server_id>/<note_written_by>`.
+The filters `written_by` / `not_written_by` and `note_written_by` / `not_note_written_by` read those
+(the `not_` forms also look at the taint set). The change log also stores the note's attested pair and taint set at the time of the entry (`note_attested_writer`,
+`note_attested_by`, `note_merged_from`) so that filtering still works after the note is deleted.
 
 **Why these were not collapsed into one `touched_by` set (reviewed in 1.4.1).** The taint set *is* the
 single thing a policy needs, and the three matchers read nothing else in practice. But
 `written_by` and the attested pair have jobs of their own that a set cannot do: `written_by` is "who
 holds the content now" (the `written_by` / `note_written_by` filters, the WHO WROTE THIS banner, and
 the stamp the runner trusts for heartbeats), and the attested pair is a *verified* author that a
-signature covers byte for byte. Folding them would change the shape of every API result and the
+signature covers exactly (any change to a covered field breaks it). Folding them would change the shape of every API result and the
 signed record, and need a migration over every row and change-log entry. 1.4.1 keeps the shapes
 (additive changes only), makes the taint set complete (earlier writers and claims are in it), and
 documents the table above. A future major version can collapse the display fields once clients stop

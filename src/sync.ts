@@ -409,12 +409,14 @@ export function exportMarkdown(
   const self = store.storeId();
   const origins = store.syncOrigins();
   mkdirSync(dir, { recursive: true });
-  const everything = store.exportAll().filter((n) => !opts.namespace || n.namespace === opts.namespace);
+  const everything = store.exportAll().filter((n) => !opts.namespace || n.namespace === opts.namespace); // gate-ok: the vault export skips hidden notes itself (hiddenIds) unless --include-distrusted
   // A vault is a folder other tools and agents read, outside every read gate: notes touched by a
   // distrusted writer are left out (and their earlier, unedited files pruned) unless asked for,
   // and then each such file is marked `distrusted: true`.
   const notes = opts.includeDistrusted ? everything : store.filterVisible(everything);
-  const hiddenIds = new Set<number>(opts.includeDistrusted ? [] : everything.filter((n) => !notes.includes(n)).map((n) => n.id));
+  // A Set of the visible ids: `notes.includes(n)` per note made this quadratic in the number of hidden notes.
+  const visibleIds = new Set<number>(notes.map((n) => n.id));
+  const hiddenIds = new Set<number>(opts.includeDistrusted ? [] : everything.filter((n) => !visibleIds.has(n.id)).map((n) => n.id));
   const marked = new Set<number>(opts.includeDistrusted ? store.markDistrusted(everything).filter((n) => n.distrusted).map((n) => n.id) : []);
   const keep = new Set<string>();
   /** local id -> [merge base before this export, current content hash] */
@@ -486,7 +488,7 @@ export function exportMarkdown(
         // Old path of a renamed note: stale iff it holds what we last synced.
         const [base, hash] = exported.get(localId)!;
         stale = onDisk === base || onDisk === hash;
-      } else if (origin === self && store.read(id) === null) {
+      } else if (origin === self && store.read(id) === null) { // gate-ok: existence check only (deleted here?)
         // Our own note, deleted here: stale iff nobody edited the file.
         stale = onDisk === parsed.fm.hash;
       } else if (localId === null && origin !== self && store.syncDeleted(origin, id) !== undefined) {
@@ -589,7 +591,7 @@ export async function importMarkdown(
 
     let localId: number | null = null;
     if (hasIdentity) localId = origin === self ? originId : store.syncLookup(origin!, originId!);
-    const local = localId !== null ? store.read(localId) : null;
+    const local = localId !== null ? store.read(localId) : null; // gate-ok: import merge-base lookup: compares hashes, returns nothing to a caller
     // A file may only claim a note of this store that this store exported or
     // merged; otherwise any dropped-in file could overwrite any local note.
     if (local && origin === self && store.syncBase(local.id) === null) {

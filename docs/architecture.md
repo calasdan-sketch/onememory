@@ -75,13 +75,12 @@ immediately visible through the others:
   create/update/import.
 - **`src/changes.ts`** — the change feed service (`since` parsing, the
   per-consumer "last" marker) over `Store.changes()`.
-- **`src/trust.ts`** — the distrust policy: rule matching (SQL fragment and its JS twin), writer-id parsing.
-- **`src/attest.ts`** — the Ed25519 signing key, the canonical attestation record, sign and verify.
 - **`src/task-core.ts`** — the command-task queue rule shared by the runner and `runner_status` (no runner code,
   so the server can use it). `src/liveness.ts` builds on it (no import cycle).
-- **`src/trust.ts`, `src/attest.ts`** — the distrust rule matchers (one JS, one SQL, tested to agree), writer ids, and
+- **`src/trust.ts`, `src/attest.ts`** — the distrust rule matchers (one JS, one SQL using a single `json_each` membership test per row, tested to agree), writer ids, and
   the Ed25519 export attestations ([trust.md](./trust.md)). `Store.readVisible` / `filterVisible` are the one gate
   every by-id and set read goes through (`test/trust-gate-guard.test.ts` enforces it).
+- **`src/stream-json.ts`** — streaming reader for a JSON backup (`import --file`), so a restore holds one batch in memory.
 - **`src/sync.ts`** — Markdown export / three-way import.
 - **`src/start.ts`** — boots the API/dashboard **and** the MCP-over-HTTP
   endpoint in one process on a single store (what `npm start`, the CLI, and
