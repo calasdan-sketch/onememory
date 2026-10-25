@@ -1,0 +1,106 @@
+{
+  "id": "A26",
+  "suite": "stale",
+  "title": "Undo brings a replaced note back",
+  "what": "Replacing is never a delete: the person can undo it and the old note comes back whole.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede",
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "old",
+      "title": "{{proj}} region",
+      "body": "Region is {{v1}}."
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "new",
+      "title": "{{proj}} region now",
+      "body": "Region is now {{v2}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "alice",
+      "id": "cf",
+      "from": "pv"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} region",
+      "id": "gone"
+    },
+    {
+      "op": "supersede_undo",
+      "as": "alice",
+      "ref": "old"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} region",
+      "id": "back"
+    },
+    {
+      "op": "read",
+      "as": "alice",
+      "ref": "old",
+      "id": "r"
+    }
+  ],
+  "expect": [
+    {
+      "check": "lacks",
+      "step": "gone",
+      "ref": "old",
+      "desc": "after the replacement the old note is not in search"
+    },
+    {
+      "check": "outcome",
+      "step": "supersede_undo:old",
+      "is": "ok",
+      "desc": "the undo works"
+    },
+    {
+      "check": "has",
+      "step": "back",
+      "ref": "old",
+      "desc": "after the undo the old note is found again"
+    },
+    {
+      "check": "field",
+      "step": "r",
+      "path": "body",
+      "equals": "Region is {{v1}}.",
+      "desc": "the old text came back whole"
+    },
+    {
+      "check": "field",
+      "step": "r",
+      "path": "status",
+      "present": false,
+      "desc": "it is no longer marked as replaced"
+    }
+  ]
+}

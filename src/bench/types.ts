@@ -22,6 +22,8 @@ export interface WorldSpec {
   actors: Record<string, Required<Pick<ActorSpec, "scope" | "writer" | "server">> & { namespace?: string }>;
   /** Operator read grants: tenant -> tenants it may additionally read (OneMemory `reads_from`). */
   grants: Record<string, string[]>;
+  /** Server settings a scenario needs (for example a very short confirmation window). Applied for this scenario only. */
+  settings?: { supersede_ttl_seconds?: number };
 }
 
 /** The result of any operation, reduced to what the benchmark needs. */
@@ -66,6 +68,10 @@ export interface BenchNote {
   taint?: string[];
   /** A confidence score, if the system has one. */
   confidence?: number;
+  /** "superseded" when a confirmed replacement retired this note. */
+  status?: string;
+  /** The id of the note that replaced this one. */
+  superseded_by?: string;
   rev?: number;
 }
 
@@ -105,6 +111,8 @@ export interface UpdateInput {
   body?: string;
   tags?: string[];
   source?: string;
+  /** A new confidence claim (0 to 1), or null to clear it. */
+  confidence?: number | null;
   /** Compare-and-swap: refuse with `conflict` when the note is no longer at this revision. */
   if_rev?: number;
 }
@@ -115,6 +123,8 @@ export interface SearchOpts {
   include_distrusted?: boolean;
   /** A tenant hint; a system must ignore it when the caller may not read that tenant. */
   namespace?: string;
+  /** Also show notes a replacement retired (they must be labelled). */
+  include_superseded?: boolean;
 }
 
 /** Capabilities an adapter may declare. A scenario lists the ones it `needs`. */
@@ -130,7 +140,9 @@ export type Capability =
   | "recall" //        free-text "what is relevant to this message" lookup
   | "changes" //      change feed
   | "tenants" //      per-tenant isolation
-  | "cas"; //         compare-and-swap update
+  | "cas" //         compare-and-swap update
+  | "supersede" //   two-step replace (preview, then confirm with a one-time code) and undo
+  | "history"; //    earlier versions of a note, and restoring one
 
 export interface MemoryAdapter {
   readonly name: string;
@@ -149,7 +161,7 @@ export interface MemoryAdapter {
 
   // ---- optional operations (declare the matching capability) ----
   read?(actor: string, id: string, opts?: { include_distrusted?: boolean }): Promise<OpResult>;
-  list?(actor: string, opts?: { namespace?: string; include_archived?: boolean }): Promise<OpResult>;
+  list?(actor: string, opts?: { namespace?: string; include_archived?: boolean; include_superseded?: boolean }): Promise<OpResult>;
   recall?(actor: string, message: string): Promise<OpResult>;
   changes?(actor: string): Promise<OpResult>;
   archive?(actor: string, id: string): Promise<OpResult>;
@@ -163,6 +175,22 @@ export interface MemoryAdapter {
   /** Make `actor`'s server believe signatures made by `ofServer`. */
   trustServer?(actor: string, ofServer: string): Promise<OpResult>;
   merge?(actor: string, ids: string[]): Promise<OpResult>;
+  /** Step 1 of a replacement. Must change nothing. `data.token` is the one-time code, `text` the warning. */
+  supersedePreview?(actor: string, input: { old_ids: string[]; new_note?: ReplacementInput; new_id?: string }): Promise<OpResult>;
+  /** Step 2. Needs the code from a preview. */
+  supersedeConfirm?(actor: string, input: { token: string; new_note?: ReplacementInput; acknowledge_risk?: boolean }): Promise<OpResult>;
+  supersedeUndo?(actor: string, id: string): Promise<OpResult>;
+  /** Earlier versions of a note. `data.versions` is the list, `text` the raw payload. */
+  history?(actor: string, id: string, opts?: { include_distrusted?: boolean }): Promise<OpResult>;
+  restoreVersion?(actor: string, id: string, version: number, opts?: { if_rev?: number }): Promise<OpResult>;
+}
+
+/** The text of the note that takes the place of the old ones. */
+export interface ReplacementInput {
+  title: string;
+  body?: string;
+  tags?: string[];
+  confidence?: number;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -175,8 +203,13 @@ export type Step =
   | ({ op: "write"; as: string; ref: string; id?: string } & WriteInput)
   | ({ op: "update"; as: string; ref: string; id?: string; if_rev_of?: string } & UpdateInput)
   | { op: "delete" | "archive" | "unarchive" | "read"; as: string; ref: string; id?: string; include_distrusted?: boolean }
-  | { op: "search"; as: string; q: string; id: string; limit?: number; include_distrusted?: boolean; namespace?: string }
-  | { op: "list"; as: string; id: string; namespace?: string; include_archived?: boolean }
+  | { op: "search"; as: string; q: string; id: string; limit?: number; include_distrusted?: boolean; include_superseded?: boolean; namespace?: string }
+  | { op: "list"; as: string; id: string; namespace?: string; include_archived?: boolean; include_superseded?: boolean }
+  | { op: "supersede_preview"; as: string; id: string; old: string[]; new_note?: ReplacementInput; new_ref?: string }
+  | { op: "supersede_confirm"; as: string; id: string; from: string; ref?: string; new_note?: ReplacementInput; acknowledge_risk?: boolean; corrupt_code?: boolean }
+  | { op: "supersede_undo"; as: string; ref: string; id?: string }
+  | { op: "history"; as: string; ref: string; id: string; include_distrusted?: boolean }
+  | { op: "restore_version"; as: string; ref: string; version: number; id?: string; if_rev_of?: string }
   | { op: "recall"; as: string; q: string; id: string }
   | { op: "changes" | "sweep"; as: string; id: string }
   | { op: "distrust" | "undistrust"; as: string; writer: string; id?: string; namespace?: string }
@@ -245,6 +278,8 @@ export interface Scenario {
   what: string;
   actors: Record<string, ActorSpec>;
   grants?: Record<string, string[]>;
+  /** Server settings for this scenario only (see WorldSpec.settings). */
+  settings?: { supersede_ttl_seconds?: number };
   /** Unrelated notes written first (by the first actor with write access) so ranking is not trivially easy. */
   distractors?: number;
   steps: Step[];

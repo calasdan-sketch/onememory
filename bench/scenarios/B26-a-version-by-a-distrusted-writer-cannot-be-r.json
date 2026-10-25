@@ -1,0 +1,62 @@
+{
+  "id": "B26",
+  "suite": "contradiction",
+  "title": "A version by a distrusted writer cannot be restored",
+  "what": "Putting text back by an untrusted writer would launder it, so restore refuses.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "history",
+    "trust"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "n",
+      "title": "{{proj}} cert",
+      "body": "Cert is {{v1}}."
+    },
+    {
+      "op": "update",
+      "as": "mallory",
+      "ref": "n",
+      "body": "Cert is {{v2}}."
+    },
+    {
+      "op": "update",
+      "as": "boss",
+      "ref": "n",
+      "body": "Cert is {{v3}}."
+    },
+    {
+      "op": "distrust",
+      "as": "boss",
+      "writer": "mallory"
+    },
+    {
+      "op": "restore_version",
+      "as": "boss",
+      "ref": "n",
+      "version": 2,
+      "id": "rv"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "rv",
+      "is": "denied",
+      "desc": "a distrusted writer's version is refused"
+    }
+  ]
+}

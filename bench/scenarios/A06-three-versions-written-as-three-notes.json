@@ -2,7 +2,7 @@
   "id": "A06",
   "suite": "stale",
   "title": "Three versions written as three notes",
-  "what": "A value changes twice and each version is saved as a new note. Search should return the latest first and never show the two older ones unflagged.",
+  "what": "A value changes twice and each version is saved as a new note. Search should return the latest first and never show the two older ones unflagged. The agent replaces the two older versions with the latest (preview, then confirm).",
   "actors": {
     "alice": {
       "scope": "write"
@@ -11,7 +11,6 @@
       "scope": "admin"
     }
   },
-  "known_gap": "GAP-SUPERSEDE",
   "steps": [
     {
       "op": "write",
@@ -33,6 +32,22 @@
       "ref": "v3",
       "title": "{{proj}} release owner update again",
       "body": "The {{proj}} release owner is now {{p3}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "v1",
+        "v2"
+      ],
+      "new_ref": "v3"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "alice",
+      "id": "cf",
+      "from": "pv"
     },
     {
       "op": "search",

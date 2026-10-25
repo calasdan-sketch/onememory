@@ -1,0 +1,75 @@
+{
+  "id": "C27",
+  "suite": "isolation",
+  "title": "A replacement cannot mix tenants",
+  "what": "A note from tenant A cannot be used to replace tenant B's note.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "aAdmin": {
+      "scope": "admin",
+      "namespace": "tenantA",
+      "writer": "adminA"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    },
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    }
+  },
+  "needs": [
+    "supersede"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "b1",
+      "ref": "old",
+      "title": "{{proj}} bnote",
+      "body": "B {{canB}}."
+    },
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "new",
+      "title": "{{proj}} anote",
+      "body": "A {{canA}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "b1",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "pv",
+      "is": [
+        "not_found",
+        "denied",
+        "invalid"
+      ],
+      "desc": "the replacement is refused"
+    },
+    {
+      "check": "no_text",
+      "step": "pv",
+      "text": "{{canA}}",
+      "desc": "nothing from tenant A in the answer",
+      "metric": "leak"
+    }
+  ]
+}

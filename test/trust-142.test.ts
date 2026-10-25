@@ -701,7 +701,7 @@ describe("8: backups and upgrades", () => {
       s.close();
       downgradeTo(p, 13);
       // an older copy with fewer notes (an earlier upgrade of this database, before it was rolled back and used)
-      const old = p + ".pre-v14-backup";
+      const old = p + ".pre-v15-backup";
       copyFileSync(p, old);
       const db = new DatabaseSync(old);
       db.exec("DELETE FROM notes WHERE id > 1");
@@ -710,7 +710,7 @@ describe("8: backups and upgrades", () => {
       s2.close();
       const copies = Store.preMigrationBackups(p).map((c) => c.path.slice(dir.length + 1)).sort();
       assert.equal(copies.length, 2, copies.join(", "));
-      assert.ok(copies.some((c) => /^state\.db\.pre-v14-backup-\d{8}-\d{6}$/.test(c)), copies.join(", "));
+      assert.ok(copies.some((c) => /^state\.db\.pre-v15-backup-\d{8}-\d{6}$/.test(c)), copies.join(", "));
       assert.equal(Store.verifyBackupFile(old).ok && (Store.verifyBackupFile(old) as any).notes, 3, "the fresh copy holds the live state");
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -724,8 +724,8 @@ describe("8: backups and upgrades", () => {
       const s = new Store(p);
       as("alice", () => s.create({ title: "n", body: "b" }));
       s.close();
-      const stale = [p + ".pre-v14-backup.123abc.partial", p + ".pre-v14-backup.123abc.partial-journal"];
-      const fresh = p + ".pre-v14-backup.999fff.partial";
+      const stale = [p + ".pre-v15-backup.123abc.partial", p + ".pre-v15-backup.123abc.partial-journal"];
+      const fresh = p + ".pre-v15-backup.999fff.partial";
       for (const f of [...stale, fresh]) writeFileSync(f, "x");
       const old = new Date(Date.now() - 3600_000);
       for (const f of stale) utimesSync(f, old, old);
@@ -865,7 +865,7 @@ describe("docs and CI stay in step with the code", () => {
 
   test("docs/upgrading.md exists and is linked from the README and the CHANGELOG", () => {
     const up = read("docs", "upgrading.md");
-    for (const must of ["Upgrading from 1.3", "pre-v14-backup", "1.3.4", "roll back", "imported_unverified", "ONEMEMORY_ATTEST_MIN_VERSION", "EXPERIMENTAL"]) assert.ok(up.includes(must) || up.toLowerCase().includes(must.toLowerCase()), `upgrading.md lacks ${must}`);
+    for (const must of ["Upgrading from 1.3", "pre-v15-backup", "1.3.4", "roll back", "imported_unverified", "ONEMEMORY_ATTEST_MIN_VERSION", "EXPERIMENTAL"]) assert.ok(up.includes(must) || up.toLowerCase().includes(must.toLowerCase()), `upgrading.md lacks ${must}`);
     assert.match(read("README.md"), /docs\/upgrading\.md/);
     assert.match(read("CHANGELOG.md"), /docs\/upgrading\.md/);
   });

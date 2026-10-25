@@ -2,7 +2,7 @@
   "id": "A20",
   "suite": "stale",
   "title": "A fact written twice with different values, newest wins on tie",
-  "what": "Two notes with the very same title, the second written later with another value. A search on the title should put the later one first.",
+  "what": "Two notes with the very same title, the second written later with another value. A search on the title should put the later one first. The agent replaces the older note with the later one (preview, then confirm).",
   "actors": {
     "alice": {
       "scope": "write"
@@ -11,7 +11,6 @@
       "scope": "admin"
     }
   },
-  "known_gap": "GAP-SUPERSEDE",
   "steps": [
     {
       "op": "write",
@@ -26,6 +25,21 @@
       "ref": "new",
       "title": "{{proj}} status",
       "body": "Status of {{proj}}: {{s2}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "alice",
+      "id": "cf",
+      "from": "pv"
     },
     {
       "op": "search",

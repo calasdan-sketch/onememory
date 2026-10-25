@@ -1,0 +1,75 @@
+{
+  "id": "A23",
+  "suite": "stale",
+  "title": "A one-time code expires",
+  "what": "A code from a preview is only good for a short time. After that, confirming must be refused and nothing changes.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede"
+  ],
+  "settings": {
+    "supersede_ttl_seconds": 1
+  },
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "old",
+      "title": "{{proj}} lock owner",
+      "body": "Owner is {{v1}}."
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "new",
+      "title": "{{proj}} lock owner now",
+      "body": "Owner is now {{v2}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    },
+    {
+      "op": "wait",
+      "ms": 1600
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "alice",
+      "id": "late",
+      "from": "pv"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} lock owner",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "late",
+      "is": "invalid",
+      "desc": "an expired code is refused"
+    },
+    {
+      "check": "has",
+      "step": "s",
+      "ref": "old",
+      "desc": "the old note is untouched"
+    }
+  ]
+}

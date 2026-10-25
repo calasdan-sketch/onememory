@@ -82,6 +82,12 @@ ranks them slightly lower (their score is multiplied by 0.9), so a fresh
 note with comparable relevance wins. Agents should verify a stale note
 against current state before acting on it.
 
+**A stale note stays behind its newer twin (1.6.0).** The 0.9 factor is mild, so a 200-day-old note that matches the words better could still
+come first. Now, when a stale note has a newer, fresh note that is *about the same thing* (the two are linked as similar notes), the stale one is
+placed right behind the lowest-ranked of its fresh newer twins. It is still returned and still flagged, and `explain` says "Kept behind the newer note #N on the same topic."
+A stale note that people keep reading (a clearly active read signal) keeps the place its reads earned. Notes that are not similar to anything are
+untouched. To remove an out-of-date note from search entirely, replace it ([replacing-memories.md](./replacing-memories.md)).
+
 Thresholds (env vars, read live — no restart needed to retune):
 
 | Variable | Default | Meaning |

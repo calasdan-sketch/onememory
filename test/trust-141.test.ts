@@ -772,7 +772,7 @@ describe("I: migration backup", () => {
       s.close();
       downgradeTo(path, 12);
       // a leftover from a crashed earlier attempt, old enough to be swept
-      const stale = path + ".pre-v14-backup.99999.partial";
+      const stale = path + ".pre-v15-backup.99999.partial";
       writeFileSync(stale, "half a file");
       const old = new Date(Date.now() - 3600_000);
       (await import("node:fs")).utimesSync(stale, old, old);
@@ -786,7 +786,7 @@ describe("I: migration backup", () => {
       }
       assert.ok(!existsSync(stale), "the stale partial was removed");
       assert.deepEqual(readdirSync(dir).filter((f) => f.endsWith(".partial")), []);
-      const bak = path + ".pre-v14-backup";
+      const bak = path + ".pre-v15-backup";
       assert.ok(Store.verifyBackupFile(bak, 1).ok);
       assert.equal(Store.preMigrationBackups(path).length, 1);
       assert.equal(Store.preMigrationBackups(path)[0].path, bak);
@@ -839,8 +839,8 @@ describe("I: migration backup", () => {
       const env = { ...process.env, ONEMEMORY_DB_PATH: path, ONEMEMORY_HOME: join(dir, "home") };
       const run = (...args: string[]) => spawnSync(process.execPath, [CLI, ...args], { env, encoding: "utf8", timeout: 60000 });
       const doc = run("doctor");
-      assert.match(doc.stdout + doc.stderr, /pre-upgrade|pre-v14/i, doc.stdout + doc.stderr);
-      const bak = path + ".pre-v14-backup";
+      assert.match(doc.stdout + doc.stderr, /pre-upgrade|pre-v15/i, doc.stdout + doc.stderr);
+      const bak = path + ".pre-v15-backup";
       assert.ok(existsSync(bak));
       const enc = run("encrypt", "enable");
       assert.equal(enc.status, 0, enc.stderr + enc.stdout);

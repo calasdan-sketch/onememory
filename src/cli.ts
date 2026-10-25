@@ -107,6 +107,15 @@ function usage(): void {
       "            disable  Decrypt every body and remove the key file.",
       "            When: running OneMemory as a shared / multi-agent store.",
       "            See: docs/encryption-retention.md for the real tradeoffs.",
+      "  supersede --old <ids> (--title T --body B [--tags a,b] [--confidence 0-1] | --new-id N)",
+      "            Replace one or more notes with a newer one, SAFELY. It first shows exactly what would stop appearing in",
+      "            search and what is not lost, then asks you to type the number of notes (or yes). Nothing is ever deleted:",
+      "            the old note is kept, marked replaced, and can be brought back. From a script it only previews and prints a",
+      "            one-time code: run again with --confirm-token <code> (same --title/--body) to go ahead.",
+      "  supersede undo <id>",
+      "            Bring a replaced note back exactly as it was (recorded).",
+      "  history <id> [--json] [--include-distrusted] | history restore <id> <version> [--if-rev n] | history purge <id> [--yes]",
+      "            A note's earlier versions: list them, put one back (as a new version, nothing is overwritten), or forget them.",
       "  bench [--json] [--suite name] [--only id] [--seed n] [--dir folder] [--strict-gaps] [--verbose]",
       "            Run the provenance benchmark on a throwaway store: stale memory, contradiction recovery,",
       "            permission isolation, provenance retention. Offline, deterministic, exits 1 on a failure.",
@@ -1029,7 +1038,7 @@ async function exportCmd(): Promise<void> {
   const { flags } = parseFlags(process.argv.slice(3), {
     values: ["format", "dir", "namespace", "out"],
     // --no-attest is accepted and does nothing: attestations are opt-in (--attest) since 1.4.1.
-    bools: ["no-prune", "force", "attest", "no-attest", "include-distrusted"],
+    bools: ["no-prune", "force", "attest", "no-attest", "include-distrusted", "no-history"],
   });
   const format = str(flags.format) ?? (str(flags.dir) ? "md" : undefined);
   const { EXPORT_PAGE_SIZE } = await import("./store.js");
@@ -1078,7 +1087,7 @@ async function exportCmd(): Promise<void> {
       let first = true;
       let count = 0;
       for (;;) {
-        const page = store.exportBatch(afterId, EXPORT_PAGE_SIZE, { attest }); // gate-ok: local shell command (export): the operator owns the database file
+        const page = store.exportBatch(afterId, EXPORT_PAGE_SIZE, { attest, history: flags["no-history"] !== true }); // gate-ok: local shell command (export): the operator owns the database file
         if (page.length === 0) break;
         afterId = page[page.length - 1].id;
         for (const note of page) {
@@ -1703,6 +1712,34 @@ async function encryptCmd(): Promise<void> {
   console.log("Key file removed. Keyword search again covers full body text.");
 }
 
+/** `onememory supersede ...` and `onememory history ...` (see supersede-cli.ts). */
+async function supersedeCmd(kind: "supersede" | "history"): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const { supersedeCli, historyCli } = await import("./supersede-cli.js");
+  const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  const io = {
+    out: (t: string): void => console.log(t),
+    err: (t: string): void => console.error(t),
+    ask: (prompt: string): Promise<string> =>
+      new Promise((resolve) => {
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        rl.question(prompt, (a: string) => {
+          rl.close();
+          resolve(a);
+        });
+      }),
+    interactive,
+  };
+  const store = new Store(DB_PATH);
+  try {
+    const args = process.argv.slice(3);
+    process.exitCode = kind === "supersede" ? await supersedeCli(store, args, io) : await historyCli(store, args, io);
+  } finally {
+    store.close();
+  }
+}
+
 /** TTY yes/no prompt; anything but y/yes aborts. */
 function askYesNo(prompt: string): Promise<boolean> {
   return new Promise((resolve) => {
@@ -1789,6 +1826,12 @@ async function main(): Promise<void> {
       break;
     case "encrypt":
       await encryptCmd();
+      break;
+    case "supersede":
+      await supersedeCmd("supersede");
+      break;
+    case "history":
+      await supersedeCmd("history");
       break;
     case "bench": {
       const { benchMain } = await import("./bench/index.js");

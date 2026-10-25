@@ -66,9 +66,9 @@ for (const encrypted of [false, true]) {
         try {
           assert.equal(Store.peekSchemaVersion(path), from);
           const { out: s, logged } = quietly(() => new Store(path));
-          assert.equal(SCHEMA_VERSION, 14);
-          assert.equal(Store.peekSchemaVersion(path), 14);
-          const bak = path + ".pre-v14-backup";
+          assert.equal(SCHEMA_VERSION, 15);
+          assert.equal(Store.peekSchemaVersion(path), SCHEMA_VERSION);
+          const bak = path + ".pre-v15-backup";
           assert.ok(existsSync(bak), "backup exists");
           assert.equal(Store.peekSchemaVersion(bak), from, "the backup is still at the OLD schema");
           assert.ok(logged.some((l) => l.includes(bak)), "the upgrade says where the copy is");
@@ -118,13 +118,13 @@ for (const encrypted of [false, true]) {
           const id = a.serverId();
           assert.match(id, /^[0-9a-f-]{36}$/);
           a.close();
-          const bak = path + ".pre-v14-backup";
+          const bak = path + ".pre-v15-backup";
           writeFileSync(bak, "SENTINEL");
           const b = new Store(path);
           assert.equal(b.serverId(), id, "same id after reopen");
           b.close();
           assert.equal(readFileSync(bak, "utf8"), "SENTINEL", "the original copy is never overwritten");
-          assert.equal(Store.peekSchemaVersion(path), 14);
+          assert.equal(Store.peekSchemaVersion(path), SCHEMA_VERSION);
         } finally {
           rmSync(dir, { recursive: true, force: true });
         }
@@ -154,7 +154,7 @@ for (const encrypted of [false, true]) {
         const { dir, path } = legacy();
         try {
           quietly(() => new Store(path)).out.close();
-          const bak = path + ".pre-v14-backup";
+          const bak = path + ".pre-v15-backup";
           // what the docs say: stop everything, put the copy back as the database
           copyFileSync(bak, path);
           for (const ext of ["-wal", "-shm"]) if (existsSync(path + ext)) rmSync(path + ext);
@@ -166,7 +166,7 @@ for (const encrypted of [false, true]) {
           rmSync(bak);
           const again = quietly(() => new Store(path)).out;
           assert.equal(again.list().notes.length, 3);
-          assert.equal(Store.peekSchemaVersion(path), 14);
+          assert.equal(Store.peekSchemaVersion(path), SCHEMA_VERSION);
           again.close();
         } finally {
           rmSync(dir, { recursive: true, force: true });
@@ -182,7 +182,7 @@ describe("schema v14: other upgrade safety", () => {
     try {
       const p = join(dir, "fresh.db");
       new Store(p).close();
-      assert.ok(!existsSync(p + ".pre-v14-backup"));
+      assert.ok(!existsSync(p + ".pre-v15-backup"));
       const raw = new DatabaseSync(p);
       raw.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
       raw.close();
@@ -236,7 +236,7 @@ describe("schema v14: other upgrade safety", () => {
       assert.equal(b.code, 0, b.err);
       assert.equal(a.out, b.out, "both processes see the same server id");
       assert.equal(Store.peekSchemaVersion(path), SCHEMA_VERSION);
-      assert.ok(Store.verifyBackupFile(path + ".pre-v14-backup").ok, "exactly one valid pre-upgrade copy");
+      assert.ok(Store.verifyBackupFile(path + ".pre-v15-backup").ok, "exactly one valid pre-upgrade copy");
       assert.deepEqual(readdirSync(dir).filter((f) => f.includes(".partial")), [], "no partial file is left behind");
     } finally {
       rmSync(dir, { recursive: true, force: true });

@@ -1,0 +1,100 @@
+{
+  "id": "B23",
+  "suite": "contradiction",
+  "title": "An admin can accept the red flag, but only on purpose",
+  "what": "For a less sure replacement, even an admin must say they accept the risk. Without that, the confirm is refused.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} smtp",
+      "body": "SMTP is {{v1}}.",
+      "confidence": 0.9
+    },
+    {
+      "op": "supersede_preview",
+      "as": "boss",
+      "id": "p1",
+      "old": [
+        "n"
+      ],
+      "new_note": {
+        "title": "{{proj}} smtp now",
+        "body": "SMTP is {{v2}}.",
+        "confidence": 0.2
+      }
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "boss",
+      "id": "no",
+      "from": "p1",
+      "new_note": {
+        "title": "{{proj}} smtp now",
+        "body": "SMTP is {{v2}}.",
+        "confidence": 0.2
+      }
+    },
+    {
+      "op": "supersede_preview",
+      "as": "boss",
+      "id": "p2",
+      "old": [
+        "n"
+      ],
+      "new_note": {
+        "title": "{{proj}} smtp now",
+        "body": "SMTP is {{v2}}.",
+        "confidence": 0.2
+      }
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "boss",
+      "id": "yes",
+      "from": "p2",
+      "new_note": {
+        "title": "{{proj}} smtp now",
+        "body": "SMTP is {{v2}}.",
+        "confidence": 0.2
+      },
+      "acknowledge_risk": true,
+      "ref": "new"
+    }
+  ],
+  "expect": [
+    {
+      "check": "contains_text",
+      "step": "p1",
+      "text": "RED FLAG",
+      "desc": "the warning has a red flag"
+    },
+    {
+      "check": "outcome",
+      "step": "no",
+      "is": "invalid",
+      "desc": "without accepting the risk it is refused"
+    },
+    {
+      "check": "outcome",
+      "step": "yes",
+      "is": "ok",
+      "desc": "with the risk accepted it goes through"
+    }
+  ]
+}

@@ -1,0 +1,69 @@
+{
+  "id": "A22",
+  "suite": "stale",
+  "title": "A replacement needs a valid one-time code",
+  "what": "A made-up or damaged code must do nothing. The old note stays visible.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "old",
+      "title": "{{proj}} queue name",
+      "body": "The queue is {{v1}}."
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "new",
+      "title": "{{proj}} queue name now",
+      "body": "The queue is now {{v2}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "alice",
+      "id": "bad",
+      "from": "pv",
+      "corrupt_code": true
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} queue",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "bad",
+      "is": "invalid",
+      "desc": "a damaged code is refused"
+    },
+    {
+      "check": "has",
+      "step": "s",
+      "ref": "old",
+      "desc": "the old note is untouched"
+    }
+  ]
+}

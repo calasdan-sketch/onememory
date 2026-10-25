@@ -2,7 +2,7 @@
   "id": "B09",
   "suite": "contradiction",
   "title": "Overwrite, then distrust the overwriter: the trusted answer comes back",
-  "what": "Mallory overwrote Dana's note. The admin distrusts Mallory. The best outcome is that the old trusted value is what agents see again. OneMemory hides the (now Mallory-written) note and the original text is gone.",
+  "what": "Mallory overwrote the admin's note. The admin distrusts Mallory and restores the earlier version from the note's history; agents then see the trusted value again.",
   "actors": {
     "alice": {
       "scope": "write"
@@ -15,9 +15,9 @@
     }
   },
   "needs": [
-    "trust"
+    "trust",
+    "history"
   ],
-  "known_gap": "GAP-HISTORY",
   "steps": [
     {
       "op": "write",
@@ -38,6 +38,13 @@
       "writer": "mallory"
     },
     {
+      "op": "restore_version",
+      "as": "boss",
+      "ref": "n",
+      "version": 1,
+      "id": "rv"
+    },
+    {
       "op": "search",
       "as": "alice",
       "q": "{{proj}} oncall phone",
@@ -45,6 +52,12 @@
     }
   ],
   "expect": [
+    {
+      "check": "outcome",
+      "step": "rv",
+      "is": "ok",
+      "desc": "the admin puts the trusted original back"
+    },
     {
       "check": "contains_text",
       "step": "s",

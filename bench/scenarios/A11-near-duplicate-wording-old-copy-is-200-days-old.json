@@ -14,7 +14,6 @@
   "needs": [
     "restore"
   ],
-  "known_gap": "GAP-RECENCY",
   "steps": [
     {
       "op": "write",

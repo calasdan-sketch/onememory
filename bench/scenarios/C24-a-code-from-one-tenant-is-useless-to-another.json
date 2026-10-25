@@ -1,0 +1,82 @@
+{
+  "id": "C24",
+  "suite": "isolation",
+  "title": "A code from one tenant is useless to another",
+  "what": "A confirmation code made for tenant A must not work for tenant B.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "aAdmin": {
+      "scope": "admin",
+      "namespace": "tenantA",
+      "writer": "adminA"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    },
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    }
+  },
+  "needs": [
+    "supersede"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "old",
+      "title": "{{proj}} dbhost",
+      "body": "Host is {{canA}}."
+    },
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "new",
+      "title": "{{proj}} dbhost now",
+      "body": "Host is now {{canB}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "a1",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "b1",
+      "id": "steal",
+      "from": "pv"
+    },
+    {
+      "op": "search",
+      "as": "a1",
+      "q": "{{proj}} dbhost",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "steal",
+      "is": "invalid",
+      "desc": "the other tenant cannot use the code"
+    },
+    {
+      "check": "has",
+      "step": "s",
+      "ref": "old",
+      "desc": "nothing was replaced"
+    }
+  ]
+}

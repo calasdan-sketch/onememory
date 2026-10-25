@@ -1,0 +1,68 @@
+{
+  "id": "B27",
+  "suite": "contradiction",
+  "title": "Only an admin can read a note's history",
+  "what": "Old text can hold what someone took out on purpose, so a normal writer cannot read it or restore from it.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "history"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "n",
+      "title": "{{proj}} apikey note",
+      "body": "Rotate every {{v1}}."
+    },
+    {
+      "op": "update",
+      "as": "boss",
+      "ref": "n",
+      "body": "Rotate every {{v2}}."
+    },
+    {
+      "op": "history",
+      "as": "alice",
+      "ref": "n",
+      "id": "h"
+    },
+    {
+      "op": "restore_version",
+      "as": "alice",
+      "ref": "n",
+      "version": 1,
+      "id": "rv"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "h",
+      "is": "denied",
+      "desc": "a writer cannot read the history"
+    },
+    {
+      "check": "outcome",
+      "step": "rv",
+      "is": "denied",
+      "desc": "a writer cannot restore"
+    },
+    {
+      "check": "no_text",
+      "step": "h",
+      "text": "{{v1}}",
+      "desc": "no old text in the refusal"
+    }
+  ]
+}

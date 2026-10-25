@@ -1,0 +1,82 @@
+{
+  "id": "A29",
+  "suite": "stale",
+  "title": "A confirmed replacement writes the new note under the person who confirmed",
+  "what": "When the replacement is new text, it is written at confirm time and stamped with the confirmer, and it comes first in search.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede",
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "old",
+      "title": "{{proj}} runbook",
+      "body": "Runbook is {{v1}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_note": {
+        "title": "{{proj}} runbook now",
+        "body": "Runbook is now {{v2}}."
+      }
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "alice",
+      "id": "cf",
+      "from": "pv",
+      "ref": "new"
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} runbook",
+      "id": "s"
+    },
+    {
+      "op": "read",
+      "as": "alice",
+      "ref": "new",
+      "id": "r"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "cf",
+      "is": "ok",
+      "desc": "the confirm works"
+    },
+    {
+      "check": "fresh_answer",
+      "step": "s",
+      "desc": "the new note first, the old one not shown",
+      "current": "new",
+      "stale": [
+        "old"
+      ]
+    },
+    {
+      "check": "field",
+      "step": "r",
+      "path": "writer",
+      "equals": "alice",
+      "desc": "the new note is stamped with who confirmed"
+    }
+  ]
+}

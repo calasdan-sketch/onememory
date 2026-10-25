@@ -2,7 +2,7 @@
   "id": "A05",
   "suite": "stale",
   "title": "Newer note beats an unflagged old note",
-  "what": "Two notes about the same fact are both recent: the old value, then a newer note saying the value changed. The agent never edited the old one. Nothing says the first is out of date, so this checks whether search prefers the newer one.",
+  "what": "Two notes about the same fact are both recent: the old value, then a newer note saying the value changed. The agent never edited the old one. Nothing says the first is out of date, so this checks whether search prefers the newer one. The agent replaces the old note with the newer one (preview, then confirm), so the old value stops coming up.",
   "actors": {
     "alice": {
       "scope": "write"
@@ -11,7 +11,6 @@
       "scope": "admin"
     }
   },
-  "known_gap": "GAP-SUPERSEDE",
   "steps": [
     {
       "op": "write",
@@ -26,6 +25,21 @@
       "ref": "new",
       "title": "{{proj}} database host changed",
       "body": "The {{proj}} database host is now {{h2}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "alice",
+      "id": "cf",
+      "from": "pv"
     },
     {
       "op": "search",

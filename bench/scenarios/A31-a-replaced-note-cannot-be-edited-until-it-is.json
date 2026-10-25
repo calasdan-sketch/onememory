@@ -1,0 +1,65 @@
+{
+  "id": "A31",
+  "suite": "stale",
+  "title": "A replaced note cannot be edited until it is brought back",
+  "what": "A replaced note is frozen so nobody quietly rewrites something that is supposed to be out of sight.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "old",
+      "title": "{{proj}} shard",
+      "body": "Shard is {{v1}}."
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "new",
+      "title": "{{proj}} shard now",
+      "body": "Shard is now {{v2}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "alice",
+      "id": "cf",
+      "from": "pv"
+    },
+    {
+      "op": "update",
+      "as": "alice",
+      "ref": "old",
+      "body": "Shard is {{v3}}."
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "update:old",
+      "is": [
+        "invalid",
+        "conflict"
+      ],
+      "desc": "editing a replaced note is refused"
+    }
+  ]
+}

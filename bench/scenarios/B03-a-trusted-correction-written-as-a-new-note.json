@@ -2,7 +2,7 @@
   "id": "B03",
   "suite": "contradiction",
   "title": "A trusted correction written as a new note",
-  "what": "Alice says X, Mallory says not-X, the admin adds a third note with the right value. The admin's note should come first and the two older ones should not look equally current.",
+  "what": "Alice says X, Mallory says not-X, the admin adds a third note with the right value. The admin's note should come first and the two older ones should not look equally current. The admin replaces both disputed notes with the correction (preview, then confirm).",
   "actors": {
     "alice": {
       "scope": "write"
@@ -14,7 +14,6 @@
       "scope": "admin"
     }
   },
-  "known_gap": "GAP-SUPERSEDE",
   "steps": [
     {
       "op": "write",
@@ -36,6 +35,22 @@
       "ref": "fix",
       "title": "{{proj}} primary region correction",
       "body": "Primary region for {{proj}} is east (verified by the admin)."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "boss",
+      "id": "pv",
+      "old": [
+        "x",
+        "nx"
+      ],
+      "new_ref": "fix"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "boss",
+      "id": "cf",
+      "from": "pv"
     },
     {
       "op": "search",

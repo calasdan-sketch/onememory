@@ -33,6 +33,7 @@ export interface KnownGap {
 const STEP_OPS = new Set([
   "write", "update", "delete", "archive", "unarchive", "read", "search", "list", "recall", "changes", "sweep",
   "distrust", "undistrust", "export", "import", "trust_server", "merge", "wait",
+  "supersede_preview", "supersede_confirm", "supersede_undo", "history", "restore_version",
 ]);
 const CHECKS = new Set([
   "outcome", "top", "has", "lacks", "fresh_answer", "hit_count", "field", "no_text", "contains_text", "same_response", "recoverable",
@@ -83,13 +84,27 @@ export function validateScenario(s: Scenario, gaps: Record<string, KnownGap> = {
   const actorNames = new Set(Object.keys(s.actors));
   const refs = new Set<string>();
   const stepIds = new Set<string>();
+  const previewIds = new Set<string>();
   for (const [i, raw] of (s.steps as unknown as AnyStep[]).entries()) {
     if (!raw || typeof raw.op !== "string" || !STEP_OPS.has(raw.op)) return `step ${i + 1}: unknown op ${JSON.stringify(raw?.op)}`;
     if (raw.op !== "wait" && (typeof raw.as !== "string" || !actorNames.has(raw.as))) return `step ${i + 1} (${raw.op}): "as" must name one of the actors`;
     if ((raw.op === "write" || raw.op === "merge") && typeof raw.ref !== "string") return `step ${i + 1} (${raw.op}): ref is required`;
     if (raw.op === "write") refs.add(raw.ref as string);
     if (raw.op === "merge") refs.add(raw.ref as string);
-    if (["update", "delete", "archive", "unarchive", "read"].includes(raw.op)) {
+    if (["supersede_preview", "supersede_confirm", "history"].includes(raw.op) && typeof raw.id !== "string") return `step ${i + 1} (${raw.op}): id is required`;
+    if (raw.op === "supersede_preview") {
+      const olds = raw.old as unknown;
+      if (!Array.isArray(olds) || olds.length === 0 || olds.some((r) => typeof r !== "string" || !refs.has(r))) return `step ${i + 1} (supersede_preview): old must name earlier writes`;
+      if ((raw.new_note === undefined) === (raw.new_ref === undefined)) return `step ${i + 1} (supersede_preview): give exactly one of new_note or new_ref`;
+      if (raw.new_ref !== undefined && !refs.has(raw.new_ref as string)) return `step ${i + 1} (supersede_preview): new_ref was not created by an earlier write`;
+    }
+    if (raw.op === "supersede_confirm") {
+      if (!previewIds.has(raw.from as string)) return `step ${i + 1} (supersede_confirm): "from" must be the id of an earlier supersede_preview step`;
+      if (typeof raw.ref === "string") refs.add(raw.ref);
+    }
+    if (raw.op === "restore_version" && (typeof raw.version !== "number" || typeof raw.id !== "string")) return `step ${i + 1} (restore_version): version (a number) and id are required`;
+    if (raw.op === "supersede_preview" && typeof raw.id === "string") previewIds.add(raw.id);
+    if (["update", "delete", "archive", "unarchive", "read", "supersede_undo", "history", "restore_version"].includes(raw.op)) {
       if (typeof raw.ref !== "string" || !refs.has(raw.ref)) return `step ${i + 1} (${raw.op}): ref "${String(raw.ref)}" was not created by an earlier write`;
     }
     if (raw.op === "merge") {
@@ -97,6 +112,7 @@ export function validateScenario(s: Scenario, gaps: Record<string, KnownGap> = {
       if (!Array.isArray(rs) || rs.some((r) => typeof r !== "string" || !refs.has(r))) return `step ${i + 1} (merge): refs must name earlier writes`;
     }
     if (raw.op === "import" && !stepIds.has(raw.from as string)) return `step ${i + 1} (import): "from" must be the id of an earlier export step`;
+    if (raw.op === "restore_version" && raw.if_rev_of !== undefined && !stepIds.has(raw.if_rev_of as string)) return `step ${i + 1} (restore_version): if_rev_of must be the id of an earlier read step`;
     if (raw.op === "update" && raw.if_rev_of !== undefined && !stepIds.has(raw.if_rev_of as string)) return `step ${i + 1} (update): if_rev_of must be the id of an earlier read step`;
     const needsId = ["search", "list", "recall", "changes", "sweep", "export", "import"].includes(raw.op);
     if (needsId && typeof raw.id !== "string") return `step ${i + 1} (${raw.op}): id is required`;
@@ -119,7 +135,7 @@ export function validateScenario(s: Scenario, gaps: Record<string, KnownGap> = {
 
 function defaultStepId(step: AnyStep): string | undefined {
   if (typeof step.id === "string") return step.id;
-  if (typeof step.ref === "string" && ["write", "update", "delete", "archive", "unarchive", "read", "merge"].includes(step.op)) return `${step.op}:${step.ref}`;
+  if (typeof step.ref === "string" && ["write", "update", "delete", "archive", "unarchive", "read", "merge", "supersede_undo"].includes(step.op)) return `${step.op}:${step.ref}`;
   if (["distrust", "undistrust", "trust_server"].includes(step.op)) return `${step.op}:${String(step.writer ?? step.of)}`;
   return undefined;
 }
@@ -171,6 +187,8 @@ function neededCapabilities(s: Scenario): Capability[] {
     if ((raw.op === "export" && raw.attest) || raw.op === "trust_server") need.add("attestation");
     if (raw.op === "merge") need.add("merge");
     if (raw.op === "update" && raw.if_rev_of !== undefined) need.add("cas");
+    if (raw.op.startsWith("supersede_")) need.add("supersede");
+    if (raw.op === "history" || raw.op === "restore_version") need.add("history");
   }
   return [...need];
 }
@@ -185,7 +203,7 @@ function worldFor(s: Scenario): WorldSpec {
       ...(a.namespace ? { namespace: a.namespace } : {}),
     };
   }
-  return { actors, grants: s.grants ?? {} };
+  return { actors, grants: s.grants ?? {}, ...(s.settings ? { settings: s.settings } : {}) };
 }
 
 const asList = (r: OpResult | undefined): BenchNote[] => (r ? (r.hits ?? r.notes ?? (r.note ? [r.note] : [])) : []);
@@ -196,6 +214,10 @@ class Run {
   refs = new Map<string, string>();
   results = new Map<string, OpResult>();
   exports = new Map<string, unknown>();
+  /** One-time codes from preview steps, by step id. */
+  codes = new Map<string, string>();
+  /** The new text each preview was shown for (a confirm that names none sends the same text). */
+  previewed = new Map<string, unknown>();
   constructor(private readonly scenario: Scenario) {}
 
   idOf(ref: string): string {
@@ -252,7 +274,7 @@ async function execStep(a: MemoryAdapter, run: Run, step: AnyStep): Promise<void
     }
     case "update": {
       const patch: Record<string, unknown> = {};
-      for (const k of ["title", "body", "tags", "source"]) if (step[k] !== undefined) patch[k] = step[k];
+      for (const k of ["title", "body", "tags", "source", "confidence"]) if (step[k] !== undefined) patch[k] = step[k];
       if (typeof step.if_rev_of === "string") {
         const rev = asList(run.result(step.if_rev_of))[0]?.rev;
         if (rev !== undefined) patch.if_rev = rev;
@@ -273,11 +295,51 @@ async function execStep(a: MemoryAdapter, run: Run, step: AnyStep): Promise<void
       return;
     }
     case "search":
-      keep(await a.search(as, step.q as string, { limit: (step.limit as number | undefined) ?? 10, include_distrusted: step.include_distrusted === true, namespace: step.namespace as string | undefined }));
+      keep(await a.search(as, step.q as string, { limit: (step.limit as number | undefined) ?? 10, include_distrusted: step.include_distrusted === true, include_superseded: step.include_superseded === true, namespace: step.namespace as string | undefined }));
       return;
     case "list":
-      keep(a.list ? await a.list(as, { namespace: step.namespace as string | undefined, include_archived: step.include_archived === true }) : { outcome: "unsupported" });
+      keep(a.list ? await a.list(as, { namespace: step.namespace as string | undefined, include_archived: step.include_archived === true, include_superseded: step.include_superseded === true }) : { outcome: "unsupported" });
       return;
+    case "supersede_preview": {
+      if (!a.supersedePreview) return keep({ outcome: "unsupported" });
+      const r = await a.supersedePreview(as, {
+        old_ids: (step.old as string[]).map((x) => run.idOf(x)),
+        ...(step.new_note ? { new_note: step.new_note as never } : {}),
+        ...(typeof step.new_ref === "string" ? { new_id: run.idOf(step.new_ref) } : {}),
+      });
+      const code = r.data?.token;
+      if (r.outcome === "ok" && typeof code === "string") run.codes.set(step.id as string, code);
+      if (step.new_note) run.previewed.set(step.id as string, step.new_note);
+      keep(r);
+      return;
+    }
+    case "supersede_confirm": {
+      if (!a.supersedeConfirm) return keep({ outcome: "unsupported" });
+      let token = run.codes.get(step.from as string);
+      if (token === undefined) throw new Error(`scenario error: preview "${String(step.from)}" gave no code`);
+      if (step.corrupt_code === true) token = token.slice(0, -4) + (token.endsWith("AAAA") ? "BBBB" : "AAAA");
+      const r = await a.supersedeConfirm(as, {
+        token,
+        ...(step.new_note || run.previewed.has(step.from as string) ? { new_note: (step.new_note ?? run.previewed.get(step.from as string)) as never } : {}),
+        ...(step.acknowledge_risk === true ? { acknowledge_risk: true } : {}),
+      });
+      if (r.outcome === "ok" && r.note && typeof step.ref === "string") run.refs.set(step.ref, r.note.id);
+      keep(r);
+      return;
+    }
+    case "supersede_undo":
+      keep(a.supersedeUndo ? await a.supersedeUndo(as, run.idOf(step.ref as string)) : { outcome: "unsupported" });
+      return;
+    case "history":
+      keep(a.history ? await a.history(as, run.idOf(step.ref as string), { include_distrusted: step.include_distrusted === true }) : { outcome: "unsupported" });
+      return;
+    case "restore_version": {
+      if (!a.restoreVersion) return keep({ outcome: "unsupported" });
+      let ifRev: number | undefined;
+      if (typeof step.if_rev_of === "string") ifRev = asList(run.result(step.if_rev_of))[0]?.rev;
+      keep(await a.restoreVersion(as, run.idOf(step.ref as string), Number(step.version), ifRev !== undefined ? { if_rev: ifRev } : {}));
+      return;
+    }
     case "recall":
       keep(a.recall ? await a.recall(as, step.q as string) : { outcome: "unsupported" });
       return;

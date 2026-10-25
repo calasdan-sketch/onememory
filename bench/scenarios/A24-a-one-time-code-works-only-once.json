@@ -1,0 +1,68 @@
+{
+  "id": "A24",
+  "suite": "stale",
+  "title": "A one-time code works only once",
+  "what": "After a replacement is confirmed, the same code cannot be used again.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "old",
+      "title": "{{proj}} deploy day",
+      "body": "Deploys happen on {{v1}}."
+    },
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "new",
+      "title": "{{proj}} deploy day now",
+      "body": "Deploys happen on {{v2}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "alice",
+      "id": "one",
+      "from": "pv"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "alice",
+      "id": "two",
+      "from": "pv"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "one",
+      "is": "ok",
+      "desc": "the first confirmation works"
+    },
+    {
+      "check": "outcome",
+      "step": "two",
+      "is": "invalid",
+      "desc": "the same code a second time is refused"
+    }
+  ]
+}

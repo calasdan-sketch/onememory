@@ -1,0 +1,41 @@
+{
+  "id": "D17",
+  "suite": "provenance",
+  "title": "A confidence value is shown in search",
+  "what": "A reader choosing between notes can see how sure each writer said they were.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} lead",
+      "body": "The lead is {{tok}}.",
+      "confidence": 0.7
+    },
+    {
+      "op": "search",
+      "as": "alice",
+      "q": "{{proj}} lead",
+      "id": "s"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "s",
+      "of": "n",
+      "path": "confidence",
+      "equals": 0.7,
+      "desc": "the hit carries the confidence",
+      "metric": "field"
+    }
+  ]
+}

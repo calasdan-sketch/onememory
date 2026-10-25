@@ -316,9 +316,12 @@ describe("the engine judges honestly (toy systems)", () => {
   test("a known gap that still fails does not fail the run, unless --strict-gaps", async () => {
     const d = mkdtempSync(join(tmpdir(), "om-benchgap2-"));
     try {
-      const f = readdirSync(DIR).find((x) => x.startsWith("A05-"))!;
-      writeFileSync(join(d, f), readFileSync(join(DIR, f)));
-      writeFileSync(join(d, "known-gaps.json"), readFileSync(join(DIR, "known-gaps.json")));
+      const f = readdirSync(DIR).find((x) => x.startsWith("A01-"))!;
+      const s = JSON.parse(readFileSync(join(DIR, f), "utf8")) as Scenario;
+      s.known_gap = "GAP-X";
+      s.expect.push({ check: "outcome", step: "now", is: "denied", desc: "deliberately wrong, so this gap stays open" });
+      writeFileSync(join(d, f), JSON.stringify(s));
+      writeFileSync(join(d, "known-gaps.json"), JSON.stringify({ "GAP-X": { title: "x", summary: "y", status: "roadmap" } }));
       const out: string[] = [];
       assert.equal(await benchMain(["--dir", d], (x) => out.push(x)), 0);
       assert.match(out.join("\n"), /KNOWN GAPS/);
@@ -368,9 +371,25 @@ describe("against OneMemory", () => {
     for (const s of first.scenarios.filter((x) => x.status === "known_gap")) assert.ok(s.known_gap && gaps[s.known_gap], s.id);
   });
 
-  test("the known gaps found are the documented ones", () => {
-    const ids = new Set(first.known_gaps.map((g) => g.id));
-    for (const id of ["GAP-SUPERSEDE", "GAP-RECENCY", "GAP-HISTORY", "GAP-CONFIDENCE"]) assert.ok(ids.has(id), id);
+  test("the four gaps found in 1.5.0 are recorded as fixed in 1.6.0, and no scenario is marked as a gap any more", () => {
+    for (const id of ["GAP-SUPERSEDE", "GAP-RECENCY", "GAP-HISTORY", "GAP-CONFIDENCE"]) {
+      assert.equal(gaps[id].status, "fixed", id);
+      assert.equal(gaps[id].fixed_in, "1.6.0", id);
+    }
+    assert.deepEqual(first.known_gaps, []);
+    assert.equal(first.summary.known_gap, 0);
+    assert.ok(first.scenarios.every((s) => s.known_gap === undefined));
+  });
+
+  test("the scenarios that used to be gaps now pass, and say what they test", () => {
+    const status = new Map(first.scenarios.map((s) => [s.id, s.status]));
+    for (const id of ["A05", "A06", "A10", "A11", "A20", "B03", "B08", "B09", "D10"]) assert.equal(status.get(id), "pass", id);
+  });
+
+  test("the new replace, history, trust-guard and confidence scenarios exist and pass", () => {
+    const want = ["A21", "A22", "A23", "A24", "A25", "A26", "A27", "A28", "A29", "A30", "A31", "A32", "B21", "B22", "B23", "B24", "B25", "B26", "B27", "B28", "B29", "B30", "C22", "C23", "C24", "C25", "C26", "C27", "D15", "D16", "D17", "D18", "D19"];
+    const status = new Map(first.scenarios.map((s) => [s.id, s.status]));
+    for (const id of want) assert.equal(status.get(id), "pass", id);
   });
 
   test("two runs with the same seed give the same report (apart from the clock)", () => {
@@ -400,12 +419,12 @@ describe("against OneMemory", () => {
     assert.ok(!/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/.test(text), "no server uuid");
   });
 
-  test("provenance: fields lost are counted and the only loss is the confidence field", () => {
+  test("provenance: fields lost are counted and none is lost any more (the confidence field is kept)", () => {
     const m = first.suites.provenance.metrics;
     assert.ok((m["fields-checked"] as number) >= 30);
-    assert.equal(m["fields-lost"], 1);
+    assert.equal(m["fields-lost"], 0);
     const lost = first.scenarios.flatMap((s) => s.checks.filter((c) => c.metric === "field" && !c.pass).map(() => s.id));
-    assert.deepEqual(lost, ["D10"]);
+    assert.deepEqual(lost, []);
   });
 });
 
@@ -440,6 +459,66 @@ describe("the real scenarios catch a broken OneMemory (mutation checks)", () => 
     assert.equal(report.ok, false);
     const failed = new Set(report.scenarios.filter((s) => s.status === "fail").map((s) => s.id));
     for (const id of ["B06", "B10", "C09"]) assert.ok(failed.has(id), `${id} must fail when scopes are not enforced`);
+  });
+});
+
+describe("the replace scenarios catch a broken OneMemory (mutation checks)", () => {
+  /** OneMemory whose "preview" quietly does the replacement too: asking 'are you sure?' must never change anything. */
+  class PreviewThatActs extends OneMemoryAdapter {
+    override async supersedePreview(actor: string, input: Parameters<NonNullable<OneMemoryAdapter["supersedePreview"]>>[1]): Promise<OpResult> {
+      const p = await super.supersedePreview(actor, input);
+      if (p.outcome === "ok") await super.supersedeConfirm(actor, { token: String(p.data?.token), ...(input.new_note ? { new_note: input.new_note } : {}) });
+      return p;
+    }
+  }
+  test("a preview that acts fails the 'a preview changes nothing' scenario", async () => {
+    const { report } = await runBench({ adapter: new PreviewThatActs(), only: ["A21"] });
+    assert.equal(report.scenarios[0].status, "fail");
+  });
+
+  /** OneMemory with history switched off underneath: nothing is kept. */
+  class NoHistory extends OneMemoryAdapter {
+    override async open(world: WorldSpec): Promise<void> {
+      await super.open(world);
+      process.env.ONEMEMORY_HISTORY_VERSIONS = "0"; // after open: open() clears leftovers first
+    }
+    override async close(): Promise<void> {
+      delete process.env.ONEMEMORY_HISTORY_VERSIONS;
+      return super.close();
+    }
+  }
+  test("with history switched off, the history scenarios fail", async () => {
+    const { report } = await runBench({ adapter: new NoHistory(), only: ["B08", "B09", "B25"] });
+    const failed = new Set(report.scenarios.filter((s) => s.status === "fail").map((s) => s.id));
+    for (const id of ["B08", "B09", "B25"]) assert.ok(failed.has(id), id);
+  });
+
+  test("an adapter without the replace operations has those scenarios SKIPPED, never passed", async () => {
+    class Plain extends OneMemoryAdapter {
+      override readonly capabilities: ReadonlySet<Capability> = new Set<Capability>(["read", "list"]);
+    }
+    const { report } = await runBench({ adapter: new Plain(), only: ["A21", "B25"] });
+    assert.deepEqual(report.scenarios.map((s) => s.status), ["skipped", "skipped"]);
+  });
+});
+
+describe("scenario validation (replace steps)", () => {
+  const base = (): Scenario => sc({ steps: [{ op: "write", as: "alice", ref: "a", title: "t", body: "b" }, { op: "write", as: "alice", ref: "b", title: "u", body: "c" }], expect: [{ check: "top", step: "s", ref: "a", desc: "the note is first" }] });
+  test("a confirm must name an earlier preview, and a preview needs exactly one replacement", () => {
+    const s = base();
+    s.steps.push({ op: "supersede_confirm", as: "alice", id: "c", from: "nope" });
+    assert.match(validateScenario(s) ?? "", /earlier supersede_preview/);
+    s.steps[2] = { op: "supersede_preview", as: "alice", id: "p", old: ["a"] } as never;
+    assert.match(validateScenario(s) ?? "", /exactly one of new_note or new_ref/);
+    s.steps[2] = { op: "supersede_preview", as: "alice", id: "p", old: ["a"], new_ref: "b" };
+    s.steps[3] = { op: "supersede_confirm", as: "alice", id: "c", from: "p" };
+    s.expect = [{ check: "outcome", step: "c", is: "ok", desc: "the confirm works" }];
+    assert.equal(validateScenario(s), null);
+  });
+  test("a preview must name earlier notes", () => {
+    const s = base();
+    s.steps.push({ op: "supersede_preview", as: "alice", id: "p", old: ["ghost"], new_ref: "b" });
+    assert.match(validateScenario(s) ?? "", /old must name earlier writes/);
   });
 });
 
@@ -584,7 +663,7 @@ describe("bench() entry point", () => {
     const out: string[] = [];
     await benchMain(["--suite", "stale"], (s) => out.push(s));
     const t = out.join("\n");
-    for (const w of ["Stale memory", "stale-hit-rate@1", "current-recall@1", "KNOWN GAPS", "What this does not show", "RESULT:"]) assert.ok(t.includes(w), w);
+    for (const w of ["Stale memory", "stale-hit-rate@1", "current-recall@1", "What this does not show", "RESULT:"]) assert.ok(t.includes(w), w);
   });
 });
 
@@ -639,10 +718,10 @@ describe("the command line", () => {
 });
 
 describe("shipping and docs", () => {
-  test("the package is 1.5.0 and ships the scenarios and the new docs", () => {
+  test("the package is 1.6.0 and ships the scenarios and the new docs", () => {
     const pkg = JSON.parse(read("package.json")) as { version: string; files: string[]; scripts: Record<string, string> };
-    assert.equal(pkg.version, "1.5.0");
-    assert.equal(PACKAGE_VERSION, "1.5.0");
+    assert.equal(pkg.version, "1.6.0");
+    assert.equal(PACKAGE_VERSION, "1.6.0");
     assert.ok(pkg.files.includes("bench/scenarios/*.json"));
     assert.ok(pkg.files.includes("docs/*.md"));
     assert.match(pkg.scripts.bench, /bench/);
@@ -675,7 +754,8 @@ describe("shipping and docs", () => {
     for (const w of ["MemoryAdapter", "known_gap", "fresh_answer", "write", "update", "delete", "search", "--json", "--strict-gaps", "capabilities"]) assert.ok(doc.includes(w), w);
   });
 
-  test("the CHANGELOG has a 1.5.0 entry", () => {
+  test("the CHANGELOG has 1.6.0 and 1.5.0 entries", () => {
+    assert.match(read("CHANGELOG.md"), /^## \[1\.6\.0\]/m);
     assert.match(read("CHANGELOG.md"), /^## \[1\.5\.0\]/m);
   });
 });

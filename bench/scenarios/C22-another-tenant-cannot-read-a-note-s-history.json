@@ -1,0 +1,95 @@
+{
+  "id": "C22",
+  "suite": "isolation",
+  "title": "Another tenant cannot read a note's history",
+  "what": "History holds old text. An admin of tenant B must not see it for a note in tenant A, and must be told exactly what they are told for a missing note.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "aAdmin": {
+      "scope": "admin",
+      "namespace": "tenantA",
+      "writer": "adminA"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    },
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    }
+  },
+  "needs": [
+    "history"
+  ],
+  "grants": {},
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "n",
+      "title": "{{proj}} secret plan",
+      "body": "Plan {{canA}}."
+    },
+    {
+      "op": "update",
+      "as": "aAdmin",
+      "ref": "n",
+      "body": "Plan changed {{canB}}."
+    },
+    {
+      "op": "write",
+      "as": "b1",
+      "ref": "gone",
+      "title": "{{proj}} gone",
+      "body": "Temp."
+    },
+    {
+      "op": "delete",
+      "as": "bAdmin",
+      "ref": "gone"
+    },
+    {
+      "op": "history",
+      "as": "bAdmin",
+      "ref": "n",
+      "id": "foreign"
+    },
+    {
+      "op": "history",
+      "as": "bAdmin",
+      "ref": "gone",
+      "id": "missing"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "foreign",
+      "is": "not_found",
+      "desc": "not found"
+    },
+    {
+      "check": "no_text",
+      "step": "foreign",
+      "text": "{{canA}}",
+      "desc": "no old text leaked",
+      "metric": "leak"
+    },
+    {
+      "check": "same_response",
+      "steps": [
+        "foreign",
+        "missing"
+      ],
+      "desc": "a foreign note and a missing note look the same",
+      "metric": "leak"
+    }
+  ]
+}

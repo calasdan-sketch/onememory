@@ -32,7 +32,7 @@ Four suites, written as plain JSON files in [`bench/scenarios/`](https://github.
   *unflagged* stale hit is one the system did not mark as stale. `stale-hit-rate@1` is the share of
   queries that name an old value whose first result is stale, `@5` the share with a stale value anywhere in the top five.
   `current-recall@1` is the share of queries (with a current note) where the current note is first. These are
-  rates over a small, hand-written set (14 and 13 queries at 1.5.0): read them as a checklist, not as statistics.
+  rates over a small, hand-written set (15 and 14 queries at 1.6.0; 14 and 13 at 1.5.0): read them as a checklist, not as statistics.
 - A scenario passes only if all its checks hold. For stale-memory queries that means: current value first (when
   there is one) and no old value in the top five unless it is flagged stale.
 - `leakage-count` is the number of failed attack probes (a cross-tenant read that worked, a secret that
@@ -62,6 +62,16 @@ printed in its own section and does not fail the run (use `--strict-gaps` to fai
 scenario starts to pass, the run **fails** with "known gap now PASSES": remove the marker and mark the gap
 `fixed`. The current list is in the README's "Benchmark" section.
 
+**1.6.0 closed every gap 1.5.0 recorded** (`GAP-SUPERSEDE`, `GAP-RECENCY`, `GAP-HISTORY`, `GAP-CONFIDENCE`, all now `fixed`), so no
+shipped scenario carries a marker any more. The mechanism stays for the next gap. Two honest notes on what "closed" means here:
+
+- Five of the old gap scenarios (A05, A06, A10, A20, B03) now include the replace steps: the agent *replaces* the old note through
+  the two-step preview and confirm. OneMemory still does **not** guess that a new note replaces an old one and hide the old one by
+  itself; that is a deliberate safety choice (nothing disappears unless a person confirms). Run against the 1.5.0 scenario files,
+  1.6.0 still returns both notes for those five.
+- A11 (a 200-day-old twin) passes through the ranking fix alone, B08 through note history, D10 through the confidence field,
+  and B09 through restoring the earlier version after distrusting the overwriter.
+
 ## Scenario files
 
 One scenario per file, `bench/scenarios/<ID>-<slug>.json`. `<ID>` is the suite letter (A stale, B contradiction,
@@ -88,7 +98,7 @@ C isolation, D provenance) and a number. Add a file and it runs; no code change.
 
 **Top level.** `id`, `suite` (`stale`, `contradiction`, `isolation`, `provenance`), `title`, `what`, `actors`,
 `steps`, `expect` are required. Optional: `grants` (tenant -> tenants it may also read), `distractors` (N
-unrelated notes written first), `needs` (extra capabilities), `known_gap`, `limit` (a documented limit shown
+unrelated notes written first), `needs` (extra capabilities), `settings` (`{"supersede_ttl_seconds": 1}`: a very short confirmation window, for expiry scenarios), `known_gap`, `limit` (a documented limit shown
 in the report).
 
 **Placeholders.** `{{name}}` in any string becomes a made-up lowercase word plus two digits, the same every
@@ -107,9 +117,13 @@ instance (default `main`), which is how a note is moved between two servers.
 | `op` | Fields | What it does |
 |---|---|---|
 | `write` | `ref`, `title`, `body`, `tags`, `source`, `confidence`, `forget_after`, `namespace`, `age_days`, `expires_in_days` | Create a note. `ref` names it for later steps. `age_days` / `expires_in_days` (negative = already past) place it in time (needs `restore`). `namespace` is a claim that a tenant-confined system must ignore. `age_days` and `expires_in_days` go through the admin restore path, so the actor must be an admin (and is then the stamped writer). |
-| `update` | `ref`, `title`, `body`, `tags`, `source`, `if_rev_of` | Partial update. `if_rev_of` is the id of an earlier `read` step whose revision is sent as a compare-and-swap guard. |
+| `update` | `ref`, `title`, `body`, `tags`, `source`, `confidence`, `if_rev_of` | Partial update. `if_rev_of` is the id of an earlier `read` step whose revision is sent as a compare-and-swap guard. |
 | `delete`, `archive`, `unarchive`, `read` | `ref` (`read` also `include_distrusted`) | Act on a note. |
-| `search` | `q`, `id`, `limit`, `include_distrusted`, `namespace` | Search, best first. |
+| `search` | `q`, `id`, `limit`, `include_distrusted`, `include_superseded`, `namespace` | Search, best first. |
+| `supersede_preview` | `id`, `old` (refs), `new_note` (`{title, body, tags, confidence}`) or `new_ref` | Step 1 of a replacement. Must change nothing. Stores the one-time code under `id`. |
+| `supersede_confirm` | `id`, `from` (a preview step's id), `new_note`, `acknowledge_risk`, `ref`, `corrupt_code` | Step 2. Uses the code from `from` (the same new text unless `new_note` is given; `corrupt_code` damages the code). `ref` names the replacement note. Run it `as` another actor to test that a code works for nobody else. |
+| `supersede_undo` | `ref` | Bring a replaced note back. |
+| `history`, `restore_version` | `ref`, `id`; `version`, `if_rev_of` | A note's earlier versions; put one back as a new version. |
 | `list`, `recall`, `changes`, `sweep` | `id` | List notes, "what is relevant to this message" (`q`), the change feed, run the expiry sweep. |
 | `distrust`, `undistrust` | `writer`, `namespace` | Manage the distrust list. |
 | `export`, `import` | `export`: `id`, `attest`. `import`: `from` (an export's id), `id`, `require_attestation`, `tamper` | Move notes between servers. `tamper` changes one field of the payload in transit. |
@@ -134,7 +148,7 @@ suite's headline numbers.
 
 Note fields usable in `path`: `id`, `namespace`, `title`, `body`, `tags`, `source`, `writer`, `creator`,
 `created_at`, `updated_at`, `expires_at`, `stale`, `distrusted`, `imported_unverified`, `claimed_writer`,
-`attested_writer`, `taint`, `confidence`, `rev`. Timestamps are never printed in the report (they would make
+`attested_writer`, `taint`, `confidence`, `status`, `superseded_by`, `rev`. Timestamps are never printed in the report (they would make
 two runs differ).
 
 ## Adapting another memory system
@@ -148,6 +162,7 @@ interface MemoryAdapter {
   readonly name: string;
   readonly capabilities: ReadonlySet<Capability>;   // "read" "list" "restore" "retire" "trust" "export_import"
                                                     // "attestation" "merge" "recall" "changes" "tenants" "cas"
+                                                    // "supersede" "history"
   open(world: WorldSpec): Promise<void>;            // fresh empty store + the scenario's actors
   close(): Promise<void>;                           // delete everything; safe to call twice
 
@@ -156,7 +171,8 @@ interface MemoryAdapter {
   delete(actor, id): Promise<OpResult>;
   search(actor, query, { limit?, include_distrusted?, namespace? }): Promise<OpResult>;
   // optional: read, list, recall, changes, archive, unarchive, sweep, distrust, undistrust,
-  //           exportAll, importAll, trustServer, merge
+  //           exportAll, importAll, trustServer, merge, supersedePreview, supersedeConfirm, supersedeUndo,
+  //           history, restoreVersion
 }
 ```
 

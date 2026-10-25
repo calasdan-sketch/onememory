@@ -131,6 +131,65 @@ export function coerceNumeric(v: unknown): unknown {
 }
 
 /**
+ * A confidence claim must be a finite number from 0 to 1 (null clears it on an update). Anything else used to be dropped
+ * silently, so the writer believed a value was kept that never was.
+ */
+export function validateConfidence(v: unknown): void {
+  if (v === undefined || v === null) return;
+  if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 1) {
+    throw new ValidationError("confidence must be a number from 0 to 1 (0 = not sure at all, 1 = certain); it is only a claim");
+  }
+}
+
+/** Note-history limits (see Store.pruneHistory). Read each time, so an operator can retune without a restart. */
+export const HISTORY_DEFAULT_VERSIONS = 20;
+export const HISTORY_MAX_VERSIONS = 500;
+export const HISTORY_DEFAULT_BYTES = 2_000_000;
+export function historyLimits(): { versions: number; bytes: number } {
+  const num = (name: string, def: number, min: number, max: number): number => {
+    const raw = (process.env[name] ?? "").trim();
+    if (raw === "") return def;
+    const n = Number(raw);
+    return Number.isFinite(n) ? Math.min(Math.max(Math.floor(n), min), max) : def;
+  };
+  return {
+    // 0 turns note history off (nothing is kept from then on; what is already stored stays until purged).
+    versions: num("ONEMEMORY_HISTORY_VERSIONS", HISTORY_DEFAULT_VERSIONS, 0, HISTORY_MAX_VERSIONS),
+    bytes: num("ONEMEMORY_HISTORY_MAX_BYTES", HISTORY_DEFAULT_BYTES, 10_000, 50_000_000),
+  };
+}
+
+/** One earlier version of a note, as the history API returns it. */
+export interface HistoryEntry {
+  /** The note's revision while this text was current. */
+  version: number;
+  title: string;
+  body: string;
+  tags: string[];
+  /** The server-stamped writer of this text ("" = unknown, or the entry arrived by import: see claimed_writer). */
+  written_by: string;
+  /** Imported entries only: the writer the file CLAIMED (unverified). */
+  claimed_writer?: string;
+  /** True when the entry came in by import (its provenance is a claim). */
+  imported?: true;
+  /** Every other hand this text had passed through when it was current (the note's taint at that moment). Empty for imported entries. */
+  merged_from: string[];
+  source: string;
+  confidence?: number;
+  /** When this text stopped being the current one. */
+  saved_at: string;
+  /** Who replaced it. */
+  saved_by: string;
+  reason: string;
+  bytes: number;
+}
+
+/** AAD binding a sealed history body to its row. */
+function historyAad(hid: number): string {
+  return `history|${hid}`;
+}
+
+/**
  * A compare-and-swap update was refused because the note moved on since the caller read it
  * (`ifRev` no longer matches). A ValidationError subclass so every surface keeps its message;
  * the REST layer answers 409 so a client can tell "re-read and retry" from "bad request".
@@ -253,6 +312,11 @@ export interface NoteInput {
    * passes (see sweepExpired).
    */
   forget_after?: number;
+  /**
+   * Optional CLAIM (0 to 1) of how sure the writer is. Advisory only: it is stored with the name of the writer who claimed it,
+   * shown next to the note, and never used to rank, to override the trust policy or to decide who wins a replacement.
+   */
+  confidence?: number;
 }
 
 /**
@@ -284,6 +348,13 @@ export type ImportNote = NoteInput & {
   merged_from_writers?: string[];
   /** Detached signature of the exporting server over this note (see attest.ts). Verified, never trusted. */
   attestation?: Attestation;
+  /** Carried by an export (1.6.0): the note's earlier versions. Every entry is an unverified claim on import. */
+  history?: unknown;
+  /** Carried by an export (1.6.0): who claimed the confidence value (a claim; the importer is recorded instead). */
+  confidence_claimed_by?: string;
+  /** Carried by an export (1.6.0): this note was retired and replaced by the note with this id IN THE SAME FILE. */
+  superseded_by?: number;
+  superseded_at?: string;
 };
 
 /** What an import made of the attestations it met. */
@@ -400,7 +471,7 @@ export interface QuarantineEntry {
 export const CHANGE_LOG_RETENTION_DAYS = 90;
 
 /** Current schema version (PRAGMA user_version). See Store.migrate. */
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 
 /**
  * Notes fetched per page by exportBatch(), which both streaming export
@@ -445,6 +516,8 @@ export interface NotePatch {
   source?: string;
   /** Retention: reset/extend the TTL (days from now; 0 clears it). */
   forget_after?: number;
+  /** A claim of how sure the writer is (0 to 1); null removes it. */
+  confidence?: number | null;
 }
 
 export interface NoteRecord {
@@ -516,6 +589,22 @@ export interface NoteRecord {
    * note's writer is on the distrust list. Never stored.
    */
   distrusted?: true;
+  /**
+   * A CLAIM (0 to 1) by the writer named in `confidence_claimed_by` of how sure they were. Optional, advisory, never trusted:
+   * the server stores it and shows it, and it never changes ranking or the trust policy.
+   */
+  confidence?: number;
+  /** The writer who made the `confidence` claim (stamped by the server). */
+  confidence_claimed_by?: string;
+  /**
+   * Present only on a note that was replaced by another (1.6.0): `status` is "superseded" and `superseded_by` is the id of the
+   * replacing note. A superseded note is kept whole (nothing is deleted) and is left out of search and lists unless asked for.
+   */
+  status?: "superseded";
+  superseded_by?: number;
+  superseded_at?: string;
+  /** The writer who confirmed the replacement. */
+  superseded_by_writer?: string;
   created_at: string;
   updated_at: string;
   /** Read-importance tracking: total user-facing reads of this note. */
@@ -566,6 +655,11 @@ interface NoteRow {
   body_enc: string | null;
   expires_at: string | null;
   archived_at: string | null;
+  confidence?: number | null;
+  confidence_by?: string | null;
+  superseded_by?: number | null;
+  superseded_at?: string | null;
+  superseded_by_writer?: string | null;
 }
 
 export const DEFAULT_NAMESPACE = "default";
@@ -577,6 +671,11 @@ const PREMIGRATION_PARTIAL_RE = /\.[0-9a-f]+\.partial(-journal|-wal|-shm)?$/;
 /** AAD binding a sealed quarantine column to its column name and namespace. */
 function quarantineAad(col: string, namespace: string): string {
   return `quarantine|${col}|${namespace}`;
+}
+
+/** Who is making this write: an internal override, else the connection's server-stamped writer. */
+function writerNow(opts: { writtenBy?: string }): string {
+  return opts.writtenBy !== undefined ? cleanWriter(opts.writtenBy) : currentWriter();
 }
 
 function rowToRecord(row: NoteRow, serverId = ""): NoteRecord {
@@ -602,6 +701,15 @@ function rowToRecord(row: NoteRow, serverId = ""): NoteRecord {
     ...(Number(row.imported_unverified ?? 0) === 1 ? { imported_unverified: true as const } : {}),
     ...(attW && attBy ? { attested_writer: attW, attested_by: attBy, attested_writer_id: `${attBy}/${attW}` } : {}),
     ...(merged.length ? { merged_from_writers: merged } : {}),
+    ...(typeof row.confidence === "number" ? { confidence: row.confidence, confidence_claimed_by: row.confidence_by ?? "" } : {}),
+    ...(row.superseded_by !== null && row.superseded_by !== undefined
+      ? {
+          status: "superseded" as const,
+          superseded_by: Number(row.superseded_by),
+          ...(row.superseded_at ? { superseded_at: row.superseded_at } : {}),
+          ...(row.superseded_by_writer ? { superseded_by_writer: row.superseded_by_writer } : {}),
+        }
+      : {}),
     created_at: row.created_at,
     updated_at: row.updated_at,
     access_count: row.access_count ?? 0,
@@ -954,6 +1062,11 @@ export interface RangeOpts {
    * (false): they are left out of every read. See trust.ts and docs/trust.md.
    */
   includeDistrusted?: boolean;
+  /**
+   * Also return notes that a confirmed replacement retired (1.6.0). Default (false): they are left out of every read. They are
+   * always labelled (`status: "superseded"`, `superseded_by`) and the caller decides who may ask.
+   */
+  includeSuperseded?: boolean;
 }
 
 /**
@@ -963,10 +1076,18 @@ export interface RangeOpts {
  * forgotten note never leaks back into list/search/recall. includeArchived
  * shows everything; archivedOnly shows just the archive (restore flow).
  */
-function archivedClause(includeArchived?: boolean, archivedOnly?: boolean): string {
+function archivedClause(includeArchived?: boolean, archivedOnly?: boolean, includeSuperseded?: boolean, supersededOnly?: boolean): string {
   if (includeArchived) return "";
-  if (archivedOnly) return " AND archived_at IS NOT NULL";
+  if (supersededOnly) return " AND superseded_by IS NOT NULL";
+  // A replaced note is archived too, but it has its own view (supersededOnly) and its own way back (supersede undo).
+  if (archivedOnly) return " AND archived_at IS NOT NULL AND superseded_by IS NULL";
+  if (includeSuperseded) return " AND (archived_at IS NULL OR superseded_by IS NOT NULL)";
   return " AND archived_at IS NULL";
+}
+
+/** The "live note" condition for the search queries, which can also take replaced notes when the caller asks for them. */
+function liveSql(includeSuperseded?: boolean): string {
+  return includeSuperseded ? "(notes.archived_at IS NULL OR notes.superseded_by IS NOT NULL)" : "notes.archived_at IS NULL";
 }
 
 /**
@@ -1303,8 +1424,8 @@ export class Store {
   }
 
   /**
-   * Before the first upgrade of a non-empty file (v1..v13 -> v14), keep one
-   * copy of the pre-upgrade database next to it: `<db>.pre-v14-backup`. It is a
+   * Before the first upgrade of a non-empty file (any older version -> the current one), keep one
+   * copy of the pre-upgrade database next to it: `<db>.pre-v15-backup`. It is a
    * consistent snapshot (VACUUM INTO) still at the OLD schema version, so an
    * older onememory can open it (rollback = stop everything, put this file
    * back as the database, install the older version). Never overwrites an
@@ -1923,6 +2044,62 @@ export class Store {
       this.createDeleteTrigger();
       this.db.prepare("INSERT OR IGNORE INTO _meta (key, value) VALUES ('store_uuid', ?)").run(randomUUID());
     }
+    if (v < 15) {
+      // v15 (1.6.0): replacing a memory is never silent, never destructive, and never a one-way door.
+      //  - notes.confidence / confidence_by: an optional CLAIM (0..1) and the writer who made it.
+      //  - notes.superseded_by / superseded_at / superseded_by_writer: a note a confirmed replacement retired. The note is also
+      //    archived (archived_at), so every existing read path already leaves it out; these columns say WHY and by what.
+      //  - note_history: earlier titles and bodies of a note (bounded per note), so a bad overwrite can be undone. Bodies are
+      //    sealed like note bodies when at-rest encryption is on. Gone with the note on a hard delete.
+      //  - supersede_used: single-use marks for confirmation tokens (a token works once).
+      //  - supersede_log: who retired / restored what, and when (kept; the notes themselves are never deleted).
+      this.addColumn("notes", "confidence", "REAL");
+      this.addColumn("notes", "confidence_by", "TEXT NOT NULL DEFAULT ''");
+      this.addColumn("notes", "superseded_by", "INTEGER");
+      this.addColumn("notes", "superseded_at", "TEXT");
+      this.addColumn("notes", "superseded_by_writer", "TEXT NOT NULL DEFAULT ''");
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS note_history (
+          hid INTEGER PRIMARY KEY AUTOINCREMENT,
+          note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+          version INTEGER NOT NULL,
+          title TEXT NOT NULL,
+          body TEXT NOT NULL DEFAULT '',
+          body_enc TEXT,
+          tags TEXT NOT NULL DEFAULT '',
+          source TEXT NOT NULL DEFAULT '',
+          written_by TEXT NOT NULL DEFAULT '',
+          claimed_writer TEXT NOT NULL DEFAULT '',
+          imported INTEGER NOT NULL DEFAULT 0,
+          merged_from TEXT NOT NULL DEFAULT '',
+          confidence REAL,
+          saved_at TEXT NOT NULL,
+          saved_by TEXT NOT NULL DEFAULT '',
+          reason TEXT NOT NULL DEFAULT 'update',
+          bytes INTEGER NOT NULL DEFAULT 0,
+          UNIQUE (note_id, version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_note_history_note ON note_history(note_id, version);
+        CREATE TABLE IF NOT EXISTS supersede_used (
+          nonce TEXT PRIMARY KEY,
+          used_at TEXT NOT NULL,
+          expires_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS supersede_log (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          at TEXT NOT NULL,
+          actor TEXT NOT NULL DEFAULT '',
+          action TEXT NOT NULL,
+          namespace TEXT NOT NULL DEFAULT '',
+          old_id INTEGER NOT NULL,
+          new_id INTEGER,
+          flags TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_notes_superseded ON notes(superseded_by);
+      `);
+      // The confirmation-token key is made now (a preview must write nothing).
+      this.feedKey();
+    }
   }
 
   /** The delete log row also remembers the deleted note's writers (v14). Caller holds the write lock. */
@@ -2070,6 +2247,7 @@ export class Store {
     }
     validateSizes(input);
     validateForgetAfter(input.forget_after);
+    validateConfidence(input.confidence);
     const findings = lintFor(input, opts.lint ?? "full");
     if (applyLintPolicy(findings, opts) === "quarantine") {
       const qid = this.quarantineWrite({
@@ -2140,8 +2318,9 @@ export class Store {
         .prepare(
           `INSERT INTO notes (namespace, title, body, tags, source, written_by, created_by, imported_written_by,
                               imported_created_by, attested_writer, attested_by, merged_from_writers,
-                              created_at, updated_at, rev, body_enc, expires_at, archived_at, imported_unverified)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
+                              created_at, updated_at, rev, body_enc, expires_at, archived_at, imported_unverified,
+                              confidence, confidence_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`
         )
         .run(
           namespace,
@@ -2161,7 +2340,9 @@ export class Store {
           startRev,
           expiresAt,
           archivedAt,
-          opts.importedUnverified ? 1 : 0
+          opts.importedUnverified ? 1 : 0,
+          typeof input.confidence === "number" ? input.confidence : null,
+          typeof input.confidence === "number" ? writer : ""
         );
       id = Number(result.lastInsertRowid);
       if (encrypting) {
@@ -2661,11 +2842,22 @@ export class Store {
       keepWriter?: boolean;
       /** internal: names an unverified source (a vault file's origin_writer) says touched this text; they only ever ADD taint. */
       alsoTouchedBy?: string[];
+      /** internal (restoring a version): the taint becomes exactly this set, because the text is again exactly what an earlier version held. */
+      replaceTaint?: string[];
+      /** internal: why the old text is kept in the note's history ("update" unless a version is being restored). */
+      historyReason?: string;
     } & LintOpts = {}
   ): NoteRecord | null {
     validateForgetAfter(patch.forget_after);
+    validateConfidence(patch.confidence);
     const existing = this.read(id);
     if (!existing) return null;
+    if (existing.superseded_by !== undefined) {
+      throw new ValidationError(
+        `note ${id} was replaced by note ${existing.superseded_by} and is only kept as a record, so it cannot be edited. ` +
+          `To bring it back first, undo the replacement (supersede undo).`
+      );
+    }
 
     if (patch.title !== undefined && !patch.title.trim()) {
       throw new ValidationError("title cannot be empty");
@@ -2707,6 +2899,7 @@ export class Store {
     const body = patch.body ?? existing.body;
     const tags = patch.tags !== undefined ? tagsToStorage(patch.tags) : tagsToStorage(existing.tags);
     const source = patch.source !== undefined ? patch.source.slice(0, 200) : existing.source;
+    const confidenceSet = patch.confidence !== undefined;
     const rev = existing.rev + 1;
     // written_by = who last changed the CONTENT (title or body), server-stamped.
     // A metadata-only write (tags: task claim / lease / approve, archive, a
@@ -2802,6 +2995,18 @@ export class Store {
           mergedAfter = mergedToStorage(capTaint([...set], fresh, this.distrustRules(), namespace, this.serverId()));
         }
         if (cur && opts.alsoTouchedBy?.length) mergedAfter = mergedToStorage([...parseMerged(mergedAfter), ...opts.alsoTouchedBy]);
+        if (cur && opts.replaceTaint) mergedAfter = mergedToStorage(opts.replaceTaint.map((x) => cleanWriter(x)).filter((x) => x && x !== writer));
+      }
+      // History: the text this write replaces is kept (bounded; see pruneHistory) BEFORE it is replaced, in the same transaction,
+      // judged against the row as it is under the lock (not the copy read earlier). A bookkeeping write (keepWriter) is not kept.
+      if (!opts.keepWriter) {
+        const lockedRow = this.db.prepare("SELECT * FROM notes WHERE id = ?").get(id) as NoteRow | undefined;
+        if (lockedRow && (want === null || lockedRow.rev === want)) {
+          const lockedBody = lockedRow.body_enc ? this.rec(lockedRow).body : lockedRow.body;
+          if (lockedRow.title !== title || lockedBody !== body) {
+            this.recordHistory(lockedRow, lockedBody, writerNow(opts), opts.historyReason ?? "update", now);
+          }
+        }
       }
       const res = this.db
         .prepare(
@@ -2809,10 +3014,18 @@ export class Store {
                             body_enc = ?, expires_at = ?, written_by = ?,
                             attested_writer = CASE WHEN ? = 1 THEN '' ELSE attested_writer END,
                             attested_by = CASE WHEN ? = 1 THEN '' ELSE attested_by END,
-                            merged_from_writers = ?
+                            merged_from_writers = ?,
+                            confidence = CASE WHEN ? = 1 THEN ? ELSE confidence END,
+                            confidence_by = CASE WHEN ? = 1 THEN ? ELSE confidence_by END
            WHERE id = ? AND (? IS NULL OR rev = ?)`
         )
-        .run(namespace, title, sealed.body, tags, source, rev, now, sealed.bodyEnc, expiresAt, writer, restamp ? 1 : 0, restamp ? 1 : 0, mergedAfter, id, want, want);
+        .run(
+          namespace, title, sealed.body, tags, source, rev, now, sealed.bodyEnc, expiresAt, writer,
+          restamp ? 1 : 0, restamp ? 1 : 0, mergedAfter,
+          confidenceSet ? 1 : 0, confidenceSet && typeof patch.confidence === "number" ? patch.confidence : null,
+          confidenceSet ? 1 : 0, confidenceSet && typeof patch.confidence === "number" ? writerNow(opts) : "",
+          id, want, want
+        );
 
       if (Number(res.changes) === 0) {
         // The row either vanished or its rev moved since we read it.
@@ -2890,6 +3103,335 @@ export class Store {
     return n;
   }
 
+  // --- Note history (v15) ---------------------------------------------------
+
+  /**
+   * Keep the text of `row` (the note as it is right now, before a write replaces it). Caller holds the write lock, so the copy
+   * and the replacement are one transaction. `plain` is the decrypted body. A version that is already kept is not kept twice.
+   */
+  private recordHistory(row: NoteRow, plain: string, savedBy: string, reason: string, now: string): void {
+    const lim = historyLimits();
+    if (lim.versions === 0) return;
+    const bytes = Buffer.byteLength(row.title) + Buffer.byteLength(plain);
+    const res = this.db
+      .prepare(
+        `INSERT OR IGNORE INTO note_history (note_id, version, title, body, body_enc, tags, source, written_by, merged_from, confidence, saved_at, saved_by, reason, bytes)
+         VALUES (?, ?, ?, '', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(row.id, row.rev ?? 1, row.title, row.tags ?? "", row.source ?? "", row.written_by ?? "", row.merged_from_writers ?? "", typeof row.confidence === "number" ? row.confidence : null, now, savedBy, reason, bytes);
+    if (Number(res.changes) === 0) return;
+    const hid = Number(res.lastInsertRowid);
+    const sealed = this.sealBody(plain, historyAad(hid));
+    this.db.prepare("UPDATE note_history SET body = ?, body_enc = ? WHERE hid = ?").run(sealed.body, sealed.bodyEnc, hid);
+    this.pruneHistory(row.id, lim);
+  }
+
+  /**
+   * Keep one note's history inside its limits (versions and bytes) so a flood of edits cannot grow the file without end, and
+   * so a flood cannot push out the one version worth recovering. The rule, in order:
+   *   1. the OLDEST version is never dropped (it is the original);
+   *   2. a version is dropped first when the same writer also has a NEWER version kept (so the newest text of every writer stays);
+   *   3. otherwise the oldest remaining version goes.
+   * One writer repeating edits therefore only ever eats its own older copies.
+   */
+  private pruneHistory(noteId: number, lim = historyLimits()): void {
+    const rows = this.db
+      .prepare("SELECT hid, version, written_by, claimed_writer, bytes FROM note_history WHERE note_id = ? ORDER BY version ASC")
+      .all(noteId) as Array<{ hid: number; version: number; written_by: string; claimed_writer: string; bytes: number }>;
+    const del = this.db.prepare("DELETE FROM note_history WHERE hid = ?");
+    const who = (r: { written_by: string; claimed_writer: string }): string => r.written_by || `claim:${r.claimed_writer}`;
+    let total = rows.reduce((n, r) => n + r.bytes, 0);
+    while (rows.length > 1 && (rows.length > lim.versions || total > lim.bytes)) {
+      let victim = -1;
+      for (let i = 1; i < rows.length && victim < 0; i++) {
+        const w = who(rows[i]);
+        for (let j = i + 1; j < rows.length; j++) {
+          if (who(rows[j]) === w) {
+            victim = i;
+            break;
+          }
+        }
+      }
+      if (victim < 0) victim = 1;
+      del.run(rows[victim].hid);
+      total -= rows[victim].bytes;
+      rows.splice(victim, 1);
+    }
+  }
+
+  private historyRowToEntry(r: Record<string, unknown>): HistoryEntry {
+    let body = String(r.body ?? "");
+    if (typeof r.body_enc === "string" && r.body_enc) {
+      try {
+        body = decryptIfEncrypted(r.body_enc, this.readKey(), historyAad(Number(r.hid)));
+      } catch (e) {
+        throw new NoteUnreadableError(Number(r.note_id), `its saved version ${r.version}: ${(e as Error).message}`);
+      }
+    }
+    return {
+      version: Number(r.version),
+      title: String(r.title),
+      body,
+      tags: parseTags(String(r.tags ?? "")),
+      written_by: String(r.written_by ?? ""),
+      ...(r.claimed_writer ? { claimed_writer: String(r.claimed_writer) } : {}),
+      ...(Number(r.imported ?? 0) === 1 ? { imported: true as const } : {}),
+      merged_from: parseMerged(String(r.merged_from ?? "")),
+      source: String(r.source ?? ""),
+      ...(typeof r.confidence === "number" ? { confidence: r.confidence } : {}),
+      saved_at: String(r.saved_at),
+      saved_by: String(r.saved_by ?? ""),
+      reason: String(r.reason ?? "update"),
+      bytes: Number(r.bytes ?? 0),
+    };
+  }
+
+  /** Earlier versions of a note, newest first (the current text is the note itself). No policy: callers gate it. */
+  historyOf(noteId: number): HistoryEntry[] {
+    const rows = this.db.prepare("SELECT * FROM note_history WHERE note_id = ? ORDER BY version DESC").all(noteId) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.historyRowToEntry(r));
+  }
+
+  historyCount(noteId: number): number {
+    return Number((this.db.prepare("SELECT COUNT(*) AS c FROM note_history WHERE note_id = ?").get(noteId) as { c: number }).c);
+  }
+
+  /** One kept version, or null. */
+  historyVersion(noteId: number, version: number): HistoryEntry | null {
+    const r = this.db.prepare("SELECT * FROM note_history WHERE note_id = ? AND version = ?").get(noteId, version) as Record<string, unknown> | undefined;
+    return r ? this.historyRowToEntry(r) : null;
+  }
+
+  /** Forget every kept version of a note (the note itself is untouched). Returns how many were removed. */
+  purgeHistory(noteId: number): number {
+    this.db.exec("PRAGMA secure_delete = ON");
+    const res = this.db.prepare("DELETE FROM note_history WHERE note_id = ?").run(noteId);
+    const n = Number(res.changes ?? 0);
+    if (n > 0) audit({ op: "history-purge", id: noteId, bytes: n });
+    return n;
+  }
+
+  /**
+   * Put an earlier version's title and body back as a NEW version. Nothing is overwritten: the text being replaced is kept in
+   * the history like any other edit, and the restoring writer becomes the note's writer. Names the entry's writers as touching
+   * the text, so restoring something a distrusted writer wrote does not launder it.
+   */
+  restoreVersion(noteId: number, version: number, opts: { ifRev?: number; writtenBy?: string } = {}): NoteRecord | null {
+    const entry = this.historyVersion(noteId, version);
+    if (!entry) throw new ValidationError(`note ${noteId} has no saved version ${version}`);
+    const touched = [entry.written_by, entry.claimed_writer ?? ""].filter((x) => x);
+    // The provenance follows the text: a version this server saw being written carries the taint it had then, so putting it back
+    // takes the taint of the OVERWRITE away (that is the point of restoring) but never adds trust. An imported entry is only a
+    // claim, so it can only ever add names.
+    const provenance = entry.imported ? { alsoTouchedBy: touched } : { replaceTaint: [...entry.merged_from, ...touched] };
+    return this.update(
+      noteId,
+      { title: entry.title, body: entry.body },
+      { ...(opts.ifRev !== undefined ? { ifRev: opts.ifRev } : {}), ...(opts.writtenBy !== undefined ? { writtenBy: opts.writtenBy } : {}), ...provenance, historyReason: "restore" }
+    );
+  }
+
+  /**
+   * Import path: earlier versions an export carried. Every entry is a CLAIM (the file's writer names are kept as
+   * `claimed_writer`, never as `written_by`), size-checked, and bounded by the same limits as live history.
+   */
+  private importHistory(noteId: number, raw: unknown, savedBy: string): void {
+    if (!Array.isArray(raw) || raw.length === 0) return;
+    const lim = historyLimits();
+    if (lim.versions === 0) return;
+    const now = new Date().toISOString();
+    const ins = this.db.prepare(
+      `INSERT OR IGNORE INTO note_history (note_id, version, title, body, body_enc, tags, source, written_by, claimed_writer, imported, confidence, saved_at, saved_by, reason, bytes)
+       VALUES (?, ?, ?, '', NULL, ?, ?, '', ?, 1, ?, ?, ?, 'import', ?)`
+    );
+    let kept = 0;
+    for (const e of raw.slice(0, lim.versions)) {
+      if (!e || typeof e !== "object") continue;
+      const h = e as Record<string, unknown>;
+      if (typeof h.title !== "string" || !h.title.trim() || typeof h.body !== "string") continue;
+      const version = Number(h.version);
+      if (!Number.isInteger(version) || version < 1) continue;
+      const tagsArr = Array.isArray(h.tags) ? h.tags.filter((t): t is string => typeof t === "string") : [];
+      if (checkSizes({ title: h.title, body: h.body, tags: tagsArr })) continue;
+      // An old version from a file passes the same checker a new write would: what would be refused or held is left out.
+      try {
+        if (applyLintPolicy(lintFor({ title: h.title, body: h.body, tags: tagsArr }, "full"), { lintWarnings: [] }) === "quarantine") continue;
+      } catch {
+        continue;
+      }
+      const claimed = cleanWriter(h.claimed_writer) || cleanWriter(h.written_by);
+      const when = isoOrNull(h.saved_at) ?? now;
+      const conf = typeof h.confidence === "number" && h.confidence >= 0 && h.confidence <= 1 ? h.confidence : null;
+      const bytes = Buffer.byteLength(h.title) + Buffer.byteLength(h.body);
+      const res = ins.run(noteId, version, h.title, tagsToStorage(tagsArr), typeof h.source === "string" ? h.source.slice(0, 200) : "", claimed, conf, when, savedBy, bytes);
+      if (Number(res.changes) === 0) continue;
+      const hid = Number(res.lastInsertRowid);
+      const sealed = this.sealBody(h.body, historyAad(hid));
+      this.db.prepare("UPDATE note_history SET body = ?, body_enc = ? WHERE hid = ?").run(sealed.body, sealed.bodyEnc, hid);
+      kept++;
+    }
+    if (kept > 0) this.pruneHistory(noteId, lim);
+  }
+
+  /** Seal every still-plaintext history body (caller holds the write lock; `encrypt enable`). */
+  private sealHistory(key: Buffer): void {
+    const rows = this.db.prepare("SELECT hid, body FROM note_history WHERE body_enc IS NULL AND body <> ''").all() as Array<{ hid: number; body: string }>;
+    const upd = this.db.prepare("UPDATE note_history SET body = '', body_enc = ? WHERE hid = ?");
+    for (const r of rows) upd.run(encrypt(r.body, key, historyAad(r.hid)), r.hid);
+  }
+
+  /** Inverse of sealHistory (caller holds the write lock; `encrypt disable`). */
+  private unsealHistory(key: Buffer): void {
+    const rows = this.db.prepare("SELECT hid, body_enc FROM note_history WHERE body_enc IS NOT NULL").all() as Array<{ hid: number; body_enc: string }>;
+    const upd = this.db.prepare("UPDATE note_history SET body = ?, body_enc = NULL WHERE hid = ?");
+    for (const r of rows) upd.run(decryptIfEncrypted(r.body_enc, key, historyAad(r.hid)), r.hid);
+  }
+
+  // --- Supersede (v15) ------------------------------------------------------
+
+  /**
+   * What the write-time linter would say about this text, without storing or holding anything: "ok", "held" (it would wait
+   * for admin review) or a ValidationError (it would be refused). Lets a preview tell the truth before a token is issued.
+   */
+  lintDryRun(input: { title: string; body?: string; tags?: string[] }): { status: "ok" | "held"; findings: LintFinding[] } {
+    const findings = lintFor(input, "full");
+    const warnings: LintFinding[] = [];
+    const verdict = applyLintPolicy(findings, { lintWarnings: warnings });
+    return { status: verdict === "quarantine" ? "held" : "ok", findings };
+  }
+
+  /**
+   * Retire `oldIds` in favour of note `newId`, atomically. THE only code path that sets `superseded_by`; it does no policy
+   * (who may, whether a token was shown) -- supersede.ts does, and nothing else calls this. Re-checks every fact under the
+   * write lock, so a note that changed between the preview and now makes the whole thing fail with nothing changed.
+   */
+  supersedeCommit(input: {
+    oldIds: number[];
+    oldRevs: number[];
+    newId: number;
+    newRev?: number;
+    actor: string;
+    nonce: string;
+    expiresMs: number;
+    flags?: string;
+  }): { retired: number[] } {
+    const now = new Date().toISOString();
+    // Inside a caller's transaction (confirm creates the replacing note in the same one) a SAVEPOINT keeps this all-or-nothing.
+    const nested = this.db.isTransaction;
+    this.db.exec(nested ? "SAVEPOINT onememory_supersede" : "BEGIN IMMEDIATE");
+    try {
+      // Single use: a nonce that was already spent makes the whole call fail. Spent nonces are kept past their expiry.
+      this.db.prepare("DELETE FROM supersede_used WHERE expires_ms < ?").run(Date.now() - 86_400_000);
+      const spent = this.db.prepare("INSERT OR IGNORE INTO supersede_used (nonce, used_at, expires_ms) VALUES (?, ?, ?)").run(input.nonce, now, input.expiresMs);
+      if (Number(spent.changes) === 0) throw new ValidationError("this confirmation was already used; start again with a new preview");
+      const target = this.db.prepare("SELECT id, namespace, rev, archived_at, superseded_by FROM notes WHERE id = ?").get(input.newId) as
+        | { id: number; namespace: string; rev: number; archived_at: string | null; superseded_by: number | null }
+        | undefined;
+      if (!target || target.archived_at !== null || target.superseded_by !== null) throw new ValidationError("the replacing note is no longer a live note; nothing was changed");
+      if (input.newRev !== undefined && target.rev !== input.newRev) throw new StaleWriteError("the replacing note was edited after the preview; nothing was changed");
+      const upd = this.db.prepare(
+        `UPDATE notes SET archived_at = ?, superseded_by = ?, superseded_at = ?, superseded_by_writer = ?, rev = rev + 1
+         WHERE id = ? AND rev = ? AND archived_at IS NULL AND superseded_by IS NULL AND namespace = ?`
+      );
+      const log = this.db.prepare("INSERT INTO supersede_log (at, actor, action, namespace, old_id, new_id, flags) VALUES (?, ?, 'supersede', ?, ?, ?, ?)");
+      input.oldIds.forEach((oid, i) => {
+        if (oid === input.newId) throw new ValidationError("a note cannot replace itself");
+        const res = upd.run(now, input.newId, now, input.actor, oid, input.oldRevs[i], target.namespace);
+        if (Number(res.changes) === 0) {
+          throw new StaleWriteError(`note ${oid} changed (or was retired, moved or removed) after the preview; nothing was changed`);
+        }
+        log.run(now, input.actor, target.namespace, oid, input.newId, input.flags ?? "");
+      });
+      this.db.exec(nested ? "RELEASE onememory_supersede" : "COMMIT");
+    } catch (e) {
+      try {
+        if (nested) {
+          this.db.exec("ROLLBACK TO onememory_supersede");
+          this.db.exec("RELEASE onememory_supersede");
+        } else this.db.exec("ROLLBACK");
+      } catch {
+        /* already rolled back */
+      }
+      throw e;
+    }
+    this.edgeIndexes.clear();
+    if (!nested) this.announceChange();
+    audit({ op: "supersede", id: input.newId, namespace: "", bytes: input.oldIds.length });
+    return { retired: input.oldIds };
+  }
+
+  /** Bring a retired note back (the replacement is NOT touched). Safe: it only restores, and it is logged. */
+  supersedeUndo(id: number, actor: string): NoteRecord | null {
+    const now = new Date().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.db.prepare("SELECT namespace, superseded_by FROM notes WHERE id = ? AND superseded_by IS NOT NULL").get(id) as
+        | { namespace: string; superseded_by: number }
+        | undefined;
+      if (!row) {
+        this.db.exec("ROLLBACK");
+        return null;
+      }
+      this.db
+        .prepare("UPDATE notes SET archived_at = NULL, superseded_by = NULL, superseded_at = NULL, superseded_by_writer = '', rev = rev + 1 WHERE id = ?")
+        .run(id);
+      this.db
+        .prepare("INSERT INTO supersede_log (at, actor, action, namespace, old_id, new_id, flags) VALUES (?, ?, 'undo', ?, ?, ?, '')")
+        .run(now, actor, row.namespace, id, row.superseded_by);
+      this.db.exec("COMMIT");
+    } catch (e) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* already rolled back */
+      }
+      throw e;
+    }
+    this.edgeIndexes.clear();
+    this.announceChange();
+    audit({ op: "supersede-undo", id, namespace: "", bytes: 0 });
+    return this.read(id);
+  }
+
+  /** Recent replacements and undos in the given namespaces (audit view; no note text). */
+  supersedeLog(namespaces: string[] | undefined, limit = 50): Array<{ at: string; actor: string; action: string; namespace: string; old_id: number; new_id: number | null; flags: string }> {
+    if (namespaces && namespaces.length === 0) return [];
+    const where = namespaces ? `WHERE namespace IN (${namespaces.map(() => "?").join(",")})` : "";
+    return this.db
+      .prepare(`SELECT at, actor, action, namespace, old_id, new_id, flags FROM supersede_log ${where} ORDER BY seq DESC LIMIT ?`)
+      .all(...(namespaces ?? []), clampInt(limit, 50, 1, 500)) as unknown as Array<{ at: string; actor: string; action: string; namespace: string; old_id: number; new_id: number | null; flags: string }>;
+  }
+
+  /** Ids of this note's close neighbours in the similarity graph (same namespace by construction). */
+  neighbourIds(id: number): Set<number> {
+    const rows = this.db.prepare("SELECT neighbor_id FROM note_edges WHERE note_id = ?").all(id) as Array<{ neighbor_id: number }>;
+    return new Set(rows.map((r) => r.neighbor_id));
+  }
+
+  /** How many other notes are close neighbours of this one in the similarity graph (a rough "what points at it"). */
+  neighbourCount(id: number): number {
+    return Number((this.db.prepare("SELECT COUNT(*) AS c FROM note_edges WHERE note_id = ?").get(id) as { c: number }).c);
+  }
+
+  /** Live notes that name this note as a task parent / blocker (by the reserved task tags). Cheap tag scan, namespace-bound. */
+  taskDependents(id: number, namespace: string): number {
+    const rows = this.db
+      .prepare("SELECT COUNT(*) AS c FROM notes WHERE namespace = ? AND archived_at IS NULL AND (instr(tags, ?) > 0 OR instr(tags, ?) > 0)")
+      .get(namespace, JSON.stringify(`task.parent:${id}`), JSON.stringify(`task.blocked_by:${id}`)) as { c: number };
+    return Number(rows.c);
+  }
+
+  /** A confirmation token's spent state, for tests and the preview text. */
+  tokenSpent(nonce: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM supersede_used WHERE nonce = ?").get(nonce));
+  }
+
+  /** Notes that were retired in favour of this one (labelled in listings). */
+  supersededBy(id: number): number[] {
+    return (this.db.prepare("SELECT id FROM notes WHERE superseded_by = ? ORDER BY id").all(id) as Array<{ id: number }>).map((r) => r.id);
+  }
+
+
   /** Soft-archive one note (retention action from an API/client). */
   archive(id: number): NoteRecord | null {
     const iso = new Date().toISOString();
@@ -2908,6 +3450,10 @@ export class Store {
    */
   restore(id: number, opts: { forget_after?: number } = {}): NoteRecord | null {
     validateForgetAfter(opts.forget_after);
+    const cur = this.db.prepare("SELECT superseded_by FROM notes WHERE id = ?").get(id) as { superseded_by: number | null } | undefined;
+    if (cur && cur.superseded_by !== null) {
+      throw new ValidationError(`note ${id} was replaced by note ${cur.superseded_by}; use "supersede undo" to bring it back (a plain restore would hide that it was replaced)`);
+    }
     this.db
       .prepare("UPDATE notes SET archived_at = NULL, expires_at = ? WHERE id = ? AND archived_at IS NOT NULL")
       .run(opts.forget_after === undefined ? null : retentionDeadline(opts.forget_after), id);
@@ -2964,6 +3510,7 @@ export class Store {
         after = rows[rows.length - 1].id;
       }
       this.sealQuarantine(key);
+      this.sealHistory(key);
       this.db.exec("COMMIT");
     } catch (e) {
       try {
@@ -3077,6 +3624,7 @@ export class Store {
         after = rows[rows.length - 1].id;
       }
       this.unsealQuarantine(key);
+      this.unsealHistory(key);
       hooks.beforeCommit?.();
       this.db.exec("COMMIT");
     } catch (e) {
@@ -3218,6 +3766,10 @@ export class Store {
       includeArchived?: boolean;
       /** Only archived notes -- backs the archive view / restore flow. */
       archivedOnly?: boolean;
+      /** Also notes retired by a confirmed replacement (always labelled). */
+      includeSuperseded?: boolean;
+      /** Only the retired (superseded) notes. */
+      supersededOnly?: boolean;
       /** Only notes carrying ALL of these exact tags. */
       withTags?: string[];
       /** Only notes carrying NONE of these exact tags. */
@@ -3234,7 +3786,7 @@ export class Store {
     const range = this.rangeFor(opts, opts.namespaces ?? (opts.namespace ? [opts.namespace] : undefined));
     const tagF = tagClause(opts.withTags, opts.withoutTags, opts.withTagPrefix);
     // Archived filter: default hides archived; archivedOnly inverts it.
-    const archSql = archivedClause(opts.includeArchived, opts.archivedOnly);
+    const archSql = archivedClause(opts.includeArchived, opts.archivedOnly, opts.includeSuperseded, opts.supersededOnly);
     const extra = [...range.params, ...tagF.params];
     // SQL LIKE is only a prefilter (tags are a JSON array string); the exact
     // match is re-checked below so a tag never matches inside another value.
@@ -3332,7 +3884,7 @@ export class Store {
           .prepare(
             `SELECT notes.*, -rank AS score FROM notes_fts
              JOIN notes ON notes.id = notes_fts.rowid
-             WHERE notes_fts MATCH ? AND notes.namespace = ? AND notes.archived_at IS NULL${range.sql}
+             WHERE notes_fts MATCH ? AND notes.namespace = ? AND ${liveSql(opts.includeSuperseded)}${range.sql}
              ORDER BY rank
              LIMIT ?`
           )
@@ -3344,7 +3896,7 @@ export class Store {
           .prepare(
             `SELECT notes.*, -rank AS score FROM notes_fts
              JOIN notes ON notes.id = notes_fts.rowid
-             WHERE notes_fts MATCH ? AND notes.archived_at IS NULL${range.sql}
+             WHERE notes_fts MATCH ? AND ${liveSql(opts.includeSuperseded)}${range.sql}
              ORDER BY rank
              LIMIT ?`
           )
@@ -3392,8 +3944,10 @@ export class Store {
       skipUnreadable?: boolean;
       /** Add each note's detached attestation (signed by this server's key; see attest.ts). */
       attest?: boolean;
+      /** Add each note's kept earlier versions as `history` (a full backup wants them; not signed). */
+      history?: boolean;
     } = {}
-  ): Array<NoteRecord & { attestation?: Attestation }> {
+  ): Array<NoteRecord & { attestation?: Attestation; history?: HistoryEntry[] }> {
     const lim = clampInt(limit, 500, 1, 5_000);
     const ns = opts.namespaces;
     if (ns && ns.length === 0) return [];
@@ -3404,8 +3958,12 @@ export class Store {
     const key = opts.attest ? this.signing() : null;
     const sid = key ? this.serverId() : "";
     const exportedAt = new Date().toISOString();
-    const sealed = (n: NoteRecord): NoteRecord & { attestation?: Attestation } =>
-      key ? { ...n, attestation: signRecord(key, sid, n, exportedAt) } : n;
+    const sealed = (n: NoteRecord): NoteRecord & { attestation?: Attestation; history?: HistoryEntry[] } => {
+      const signed = key ? { ...n, attestation: signRecord(key, sid, n, exportedAt) } : n;
+      if (!opts.history) return signed;
+      const h = this.historyOf(n.id);
+      return h.length ? { ...signed, history: h } : signed;
+    };
     return rows.map((r) => {
       if (!opts.skipUnreadable) return sealed(this.rec(r));
       try {
@@ -3465,6 +4023,10 @@ export class Store {
     } = {}
   ): Promise<NoteRecord[]> {
     const created: NoteRecord[] = [];
+    // exporter id -> id here, for the notes of this file: a replaced note's link is re-pointed after the whole file is in.
+    const idMap = new Map<number, number>();
+    const retired: Array<{ exportId: number; target: number; at?: string }> = [];
+    const importer = currentWriter();
     const requireAttestation = opts.requireAttestation ?? ["1", "true", "yes"].includes((process.env.ONEMEMORY_IMPORT_REQUIRE_ATTESTATION ?? "").trim().toLowerCase());
     // Attestations: checked against the keys the admin trusts (plus this
     // server's own key for its own server id). Counted into the report.
@@ -3535,8 +4097,7 @@ export class Store {
               continue;
             }
             const carried = verdict.ok ? this.attestedProvenance(note, verdict.attester.server_id) : null;
-            created.push(
-              this.create(
+            const madeNote = this.create(
                 {
                   namespace: note.namespace,
                   title: note.title,
@@ -3544,6 +4105,8 @@ export class Store {
                   tags: note.tags,
                   source: note.source, // preserve provenance across export -> import
                   created_at: note.created_at,
+                  // A confidence value is a claim; an unusable one is dropped, it never fails the note.
+                  ...(typeof note.confidence === "number" && note.confidence >= 0 && note.confidence <= 1 ? { confidence: note.confidence } : {}),
                 },
                 {
                   // written_by / created_by are the IMPORTING caller (a payload
@@ -3566,8 +4129,13 @@ export class Store {
                   ...(note.expires_at ? { expiresAt: note.expires_at } : {}),
                   ...(note.archived_at ? { archivedAt: note.archived_at } : {}),
                 }
-              )
-            );
+              );
+            created.push(madeNote);
+            if (typeof note.id === "number") idMap.set(note.id, madeNote.id);
+            if (typeof note.superseded_by === "number" && note.archived_at) {
+              retired.push({ exportId: note.id as number, target: note.superseded_by, ...(typeof note.superseded_at === "string" ? { at: note.superseded_at } : {}) });
+            }
+            this.importHistory(madeNote.id, note.history, importer);
             if (verdict.ok) att.verified++;
             else {
               att.unverified++;
@@ -3609,6 +4177,20 @@ export class Store {
     // responsible for telling the operator to run `onememory rebuild-edges`
     // afterwards. Small/one-at-a-time imports keep inline linking so the
     // graph is never silently missing for the common case.
+    // Re-point replaced notes at the replacement NOW in this store. A link to a note that is not in this file is dropped
+    // (the note stays archived, a plain restore brings it back): an id from another store means nothing here.
+    if (retired.length > 0) {
+      const link = this.db.prepare("UPDATE notes SET superseded_by = ?, superseded_at = ?, superseded_by_writer = ? WHERE id = ? AND archived_at IS NOT NULL AND superseded_by IS NULL");
+      this.transaction(() => {
+        for (const r of retired) {
+          const mine = idMap.get(r.exportId);
+          const target = idMap.get(r.target);
+          if (mine === undefined || target === undefined || mine === target) continue;
+          link.run(target, isoOrNull(r.at) ?? new Date().toISOString(), importer, mine);
+        }
+      });
+      this.edgeIndexes.clear();
+    }
     if (!opts.deferEdges) await this.linkNotes(created);
     att.untrusted_keys = [...untrustedSeen.values()];
     return created;
@@ -3805,14 +4387,14 @@ export class Store {
             .prepare(
               `SELECT v.note_id, v.dim, v.model, v.vec FROM note_vectors v
                JOIN notes ON notes.id = v.note_id
-               WHERE notes.namespace = ? AND notes.archived_at IS NULL${range.sql}`
+               WHERE notes.namespace = ? AND ${liveSql(opts.includeSuperseded)}${range.sql}`
             )
             .all(opts.namespace, ...range.params)
         : this.db
             .prepare(
               `SELECT v.note_id, v.dim, v.model, v.vec FROM note_vectors v
                JOIN notes ON notes.id = v.note_id
-               WHERE notes.archived_at IS NULL${range.sql}`
+               WHERE ${liveSql(opts.includeSuperseded)}${range.sql}`
             )
             .all(...range.params)
     ) as unknown as VectorRow[];

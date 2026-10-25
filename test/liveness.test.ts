@@ -495,7 +495,7 @@ describe("runner status: recall hook, CLI, dashboard", () => {
       const out = JSON.parse(await runRecall({ dbPath: db }));
       assert.equal(out.hookSpecificOutput.additionalContext, "");
       assert.equal(Store.peekSchemaVersion(db), 12, "still v12: the hook did not migrate it");
-      assert.ok(!existsSync(db + ".pre-v14-backup"));
+      assert.ok(!existsSync(db + ".pre-v15-backup"));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

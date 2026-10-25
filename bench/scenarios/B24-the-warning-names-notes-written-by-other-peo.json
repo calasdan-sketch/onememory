@@ -1,0 +1,55 @@
+{
+  "id": "B24",
+  "suite": "contradiction",
+  "title": "The warning names notes written by other people",
+  "what": "If a replacement hides someone else's note, the warning says so.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "supersede"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "mallory",
+      "ref": "n",
+      "title": "{{proj}} owner",
+      "body": "Owner is {{v1}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "n"
+      ],
+      "new_note": {
+        "title": "{{proj}} owner now",
+        "body": "Owner is {{v2}}."
+      }
+    }
+  ],
+  "expect": [
+    {
+      "check": "contains_text",
+      "step": "pv",
+      "text": "other writers",
+      "desc": "the warning flags that other writers are affected"
+    },
+    {
+      "check": "contains_text",
+      "step": "pv",
+      "text": "mallory",
+      "desc": "the warning names the other writer"
+    }
+  ]
+}

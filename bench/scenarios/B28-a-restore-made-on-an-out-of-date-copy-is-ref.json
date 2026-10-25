@@ -1,0 +1,65 @@
+{
+  "id": "B28",
+  "suite": "contradiction",
+  "title": "A restore made on an out-of-date copy is refused",
+  "what": "Restoring uses the same compare-and-swap rule as editing.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "mallory": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    }
+  },
+  "needs": [
+    "history",
+    "cas",
+    "read"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "boss",
+      "ref": "n",
+      "title": "{{proj}} owner2",
+      "body": "Owner is {{v1}}."
+    },
+    {
+      "op": "update",
+      "as": "boss",
+      "ref": "n",
+      "body": "Owner is {{v2}}."
+    },
+    {
+      "op": "read",
+      "as": "boss",
+      "ref": "n",
+      "id": "seen"
+    },
+    {
+      "op": "update",
+      "as": "mallory",
+      "ref": "n",
+      "body": "Owner is {{v3}}."
+    },
+    {
+      "op": "restore_version",
+      "as": "boss",
+      "ref": "n",
+      "version": 1,
+      "if_rev_of": "seen",
+      "id": "rv"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "rv",
+      "is": "conflict",
+      "desc": "the stale restore is refused"
+    }
+  ]
+}

@@ -1,5 +1,11 @@
 # Upgrading from 1.3.x
 
+> **Moving to 1.6.0 from 1.4.x or 1.5.0?** The first start migrates the database from schema v14 to **v15** (confidence and replace columns,
+> and tables for history, one-time codes and the replace log). Nothing is rewritten: no note text is touched. A verified copy is made first at
+> `<database>.pre-v15-backup`, and the upgrade does not run if that copy cannot be made. To go back: stop everything, put that copy back as the
+> database, install the older version. What is new: [replacing-memories.md](./replacing-memories.md). The rest of this page was written for 1.3.x to
+> 1.4.x; the backup there is now named `pre-v15` as well, because the file is named after the schema it upgrades to.
+
 This page is for an existing 1.3.x install moving to 1.4.x (1.4.2 is the last 1.4.x; 1.5.0 only adds the benchmark and needs no migration). Nothing here is
 needed for a fresh install.
 
@@ -13,7 +19,7 @@ distrust list and writer labels are the stable part. See [trust.md](./trust.md).
    (new columns, three small tables, an index over note writers). No note text is touched. An older
    version cannot open a v14 database.
 2. **A backup is made first.** Before migrating, OneMemory writes a verified copy to
-   `<database>.pre-v14-backup` (it is built as `.partial`, then checked: it must hold the same number of notes
+   `<database>.pre-v15-backup` (it is built as `.partial`, then checked: it must hold the same number of notes
    as the database, have the old schema version and pass an integrity check; only then is it renamed). If a
    valid copy from an earlier attempt exists it is kept under a dated name and a fresh one is made; a copy
    that cannot be read (permissions) is never deleted, only moved aside. **The upgrade does not run when the
@@ -39,7 +45,7 @@ leftover `.partial` files.
 
 To roll back:
 
-Stop every OneMemory process (server, MCP clients, runners, the CLI). **Move** `<database>.pre-v14-backup`
+Stop every OneMemory process (server, MCP clients, runners, the CLI). **Move** `<database>.pre-v15-backup`
 over the database (a copy would leave the original; remove the `-wal` and `-shm` files next to it),
 reinstall 1.3.x and start it. Anything written after the upgrade is not in the backup. Once you are happy
 with 1.4.x, `onememory backup --prune-premigration` deletes the copies (they are plaintext even if you

@@ -2,7 +2,7 @@
   "id": "A10",
   "suite": "stale",
   "title": "Near-duplicate wording, both fresh, old one edited",
-  "what": "The same fact was saved twice in different words. The agent corrects one of them in place and forgets the other. Search should not present the forgotten duplicate as the answer.",
+  "what": "The same fact was saved twice in different words. The agent corrects one of them in place and forgets the other. Search should not present the forgotten duplicate as the answer. The agent then replaces the forgotten duplicate with the corrected note (preview, then confirm).",
   "actors": {
     "alice": {
       "scope": "write"
@@ -11,7 +11,6 @@
       "scope": "admin"
     }
   },
-  "known_gap": "GAP-SUPERSEDE",
   "steps": [
     {
       "op": "write",
@@ -32,6 +31,21 @@
       "as": "alice",
       "ref": "a",
       "body": "The {{proj}} API base URL is now {{u2}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "alice",
+      "id": "pv",
+      "old": [
+        "b"
+      ],
+      "new_ref": "a"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "alice",
+      "id": "cf",
+      "from": "pv"
     },
     {
       "op": "search",

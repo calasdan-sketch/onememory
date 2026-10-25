@@ -1,0 +1,101 @@
+{
+  "id": "C23",
+  "suite": "isolation",
+  "title": "Another tenant cannot preview replacing a note",
+  "what": "Previewing a replacement shows the old note's text. It must be refused for a note in another tenant.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "aAdmin": {
+      "scope": "admin",
+      "namespace": "tenantA",
+      "writer": "adminA"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    },
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    }
+  },
+  "needs": [
+    "supersede"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "n",
+      "title": "{{proj}} private",
+      "body": "Hidden {{canA}}."
+    },
+    {
+      "op": "write",
+      "as": "b1",
+      "ref": "mine",
+      "title": "{{proj}} mine",
+      "body": "Mine."
+    },
+    {
+      "op": "write",
+      "as": "b1",
+      "ref": "gone",
+      "title": "{{proj}} gone",
+      "body": "Temp."
+    },
+    {
+      "op": "delete",
+      "as": "bAdmin",
+      "ref": "gone"
+    },
+    {
+      "op": "supersede_preview",
+      "as": "b1",
+      "id": "foreign",
+      "old": [
+        "n"
+      ],
+      "new_ref": "mine"
+    },
+    {
+      "op": "supersede_preview",
+      "as": "b1",
+      "id": "missing",
+      "old": [
+        "gone"
+      ],
+      "new_ref": "mine"
+    }
+  ],
+  "expect": [
+    {
+      "check": "outcome",
+      "step": "foreign",
+      "is": "not_found",
+      "desc": "not found"
+    },
+    {
+      "check": "no_text",
+      "step": "foreign",
+      "text": "{{canA}}",
+      "desc": "the preview did not show the other tenant's text",
+      "metric": "leak"
+    },
+    {
+      "check": "same_response",
+      "steps": [
+        "foreign",
+        "missing"
+      ],
+      "desc": "a foreign note and a missing note look the same",
+      "metric": "leak"
+    }
+  ]
+}

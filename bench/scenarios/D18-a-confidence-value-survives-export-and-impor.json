@@ -1,0 +1,59 @@
+{
+  "id": "D18",
+  "suite": "provenance",
+  "title": "A confidence value survives export and import",
+  "what": "Moving notes to another server keeps what the writer claimed about how sure it was.",
+  "actors": {
+    "alice": {
+      "scope": "write"
+    },
+    "boss": {
+      "scope": "admin"
+    },
+    "importer": {
+      "scope": "admin",
+      "server": "fresh"
+    }
+  },
+  "needs": [
+    "export_import",
+    "list"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "alice",
+      "ref": "n",
+      "title": "{{proj}} moved guess",
+      "body": "Maybe {{tok}}.",
+      "confidence": 0.35
+    },
+    {
+      "op": "export",
+      "as": "boss",
+      "id": "dump"
+    },
+    {
+      "op": "import",
+      "as": "importer",
+      "from": "dump",
+      "id": "imp"
+    },
+    {
+      "op": "list",
+      "as": "importer",
+      "id": "l"
+    }
+  ],
+  "expect": [
+    {
+      "check": "field",
+      "step": "l",
+      "title": "{{proj}} moved guess",
+      "path": "confidence",
+      "equals": 0.35,
+      "desc": "the confidence arrived unchanged",
+      "metric": "field"
+    }
+  ]
+}

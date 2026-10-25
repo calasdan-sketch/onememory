@@ -1,0 +1,92 @@
+{
+  "id": "C26",
+  "suite": "isolation",
+  "title": "Replaced notes of another tenant stay hidden even when asked for",
+  "what": "Asking to include replaced notes must not open a door into another tenant.",
+  "actors": {
+    "a1": {
+      "scope": "write",
+      "namespace": "tenantA",
+      "writer": "agentA"
+    },
+    "aAdmin": {
+      "scope": "admin",
+      "namespace": "tenantA",
+      "writer": "adminA"
+    },
+    "b1": {
+      "scope": "write",
+      "namespace": "tenantB",
+      "writer": "agentB"
+    },
+    "bAdmin": {
+      "scope": "admin",
+      "namespace": "tenantB",
+      "writer": "adminB"
+    }
+  },
+  "needs": [
+    "supersede",
+    "list"
+  ],
+  "steps": [
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "old",
+      "title": "{{proj}} gate",
+      "body": "Gate {{canA}}."
+    },
+    {
+      "op": "write",
+      "as": "a1",
+      "ref": "new",
+      "title": "{{proj}} gate now",
+      "body": "Gate now {{canB}}."
+    },
+    {
+      "op": "supersede_preview",
+      "as": "a1",
+      "id": "pv",
+      "old": [
+        "old"
+      ],
+      "new_ref": "new"
+    },
+    {
+      "op": "supersede_confirm",
+      "as": "a1",
+      "id": "cf",
+      "from": "pv"
+    },
+    {
+      "op": "search",
+      "as": "b1",
+      "q": "{{proj}} gate",
+      "id": "s",
+      "include_superseded": true
+    },
+    {
+      "op": "list",
+      "as": "b1",
+      "id": "l",
+      "include_superseded": true
+    }
+  ],
+  "expect": [
+    {
+      "check": "no_text",
+      "step": "s",
+      "text": "{{canA}}",
+      "desc": "search shows nothing from the other tenant",
+      "metric": "leak"
+    },
+    {
+      "check": "no_text",
+      "step": "l",
+      "text": "{{canA}}",
+      "desc": "the list shows nothing from the other tenant",
+      "metric": "leak"
+    }
+  ]
+}

@@ -14,7 +14,7 @@ import { Store } from "../store.js";
 import { createApiServer } from "../api.js";
 import { createMcpServer } from "../mcp-server-core.js";
 import type { TokenEntry } from "../config.js";
-import type { BenchNote, Capability, MemoryAdapter, OpResult, Outcome, SearchOpts, UpdateInput, WorldSpec, WriteInput } from "./types.js";
+import type { BenchNote, Capability, MemoryAdapter, OpResult, Outcome, ReplacementInput, SearchOpts, UpdateInput, WorldSpec, WriteInput } from "./types.js";
 
 interface ServerHandle {
   name: string;
@@ -33,7 +33,7 @@ interface ActorHandle {
   namespace?: string;
 }
 
-const CAPS: Capability[] = ["read", "list", "restore", "retire", "trust", "export_import", "attestation", "merge", "recall", "changes", "tenants", "cas"];
+const CAPS: Capability[] = ["read", "list", "restore", "retire", "trust", "export_import", "attestation", "merge", "recall", "changes", "tenants", "cas", "supersede", "history"];
 
 function toOutcome(status: number): Outcome {
   if (status === 200 || status === 201) return "ok";
@@ -41,7 +41,7 @@ function toOutcome(status: number): Outcome {
   if (status === 401 || status === 403) return "denied";
   if (status === 404) return "not_found";
   if (status === 409) return "conflict";
-  if (status === 400 || status === 413) return "invalid";
+  if (status === 400 || status === 410 || status === 413) return "invalid"; // 410: a one-time code that expired or was already used
   return "error";
 }
 
@@ -70,6 +70,8 @@ export function normalizeNote(raw: Raw): BenchNote {
   if (str(raw.attested_writer)) n.attested_writer = str(raw.attested_writer);
   if (Array.isArray(raw.merged_from_writers)) n.taint = (raw.merged_from_writers as unknown[]).map(String);
   if (typeof raw.confidence === "number") n.confidence = raw.confidence;
+  if (raw.status === "superseded") n.status = "superseded";
+  if (raw.superseded_by !== undefined && raw.superseded_by !== null) n.superseded_by = String(raw.superseded_by);
   if (typeof raw.rev === "number") n.rev = raw.rev;
   return n;
 }
@@ -99,7 +101,12 @@ export class OneMemoryAdapter implements MemoryAdapter {
     this.grants = world.grants;
     // The per-token rate limit (120 requests / 10 s) is a protection for a public server, not something to measure.
     // The audit log goes into the throwaway folder: the benchmark's traffic must never reach the user's own audit.log.
-    this.prevEnv = { ONEMEMORY_RATE_MAX: process.env.ONEMEMORY_RATE_MAX, ONEMEMORY_AUDIT_LOG: process.env.ONEMEMORY_AUDIT_LOG };
+    this.prevEnv = {
+      ONEMEMORY_RATE_MAX: process.env.ONEMEMORY_RATE_MAX,
+      ONEMEMORY_AUDIT_LOG: process.env.ONEMEMORY_AUDIT_LOG,
+      ONEMEMORY_SUPERSEDE_TTL_SECONDS: process.env.ONEMEMORY_SUPERSEDE_TTL_SECONDS,
+    };
+    if (world.settings?.supersede_ttl_seconds !== undefined) process.env.ONEMEMORY_SUPERSEDE_TTL_SECONDS = String(world.settings.supersede_ttl_seconds);
     process.env.ONEMEMORY_RATE_MAX = "1000000";
     process.env.ONEMEMORY_AUDIT_LOG = join(this.dir, "audit.log");
     const byServer = new Map<string, TokenEntry[]>();
@@ -279,6 +286,7 @@ export class OneMemoryAdapter implements MemoryAdapter {
     if (opts.limit) p.set("limit", String(opts.limit));
     if (opts.include_distrusted) p.set("include_distrusted", "1");
     if (opts.namespace) p.set("namespace", opts.namespace);
+    if (opts.include_superseded) p.set("include_superseded", "1");
     const r = await this.http(actor, "GET", `/search?${p.toString()}`);
     if (r.status !== 200) return this.fail(r.status, r.json);
     const hits = ((r.json.results as Raw[] | undefined) ?? []).map(normalizeNote);
@@ -293,8 +301,9 @@ export class OneMemoryAdapter implements MemoryAdapter {
     return { outcome: "ok", note: normalizeNote(r.json.note as Raw), text: r.text };
   }
 
-  async list(actor: string, opts: { namespace?: string; include_archived?: boolean } = {}): Promise<OpResult> {
+  async list(actor: string, opts: { namespace?: string; include_archived?: boolean; include_superseded?: boolean } = {}): Promise<OpResult> {
     const p = new URLSearchParams({ limit: "200" });
+    if (opts.include_superseded) p.set("include_superseded", "1");
     if (opts.namespace) p.set("namespace", opts.namespace);
     if (opts.include_archived) p.set("includeArchived", "1");
     const r = await this.http(actor, "GET", `/notes?${p.toString()}`);
@@ -378,6 +387,49 @@ export class OneMemoryAdapter implements MemoryAdapter {
     if (id.status !== 200 || typeof id.json.public_key !== "string") return { outcome: "invalid", detail: "that server has no signing key yet (export with attest first)" };
     const r = await this.http(actor, "POST", "/trust/attesters", { public_key: id.json.public_key, server_id: id.json.server_id, label: `bench:${ofServer}` });
     return r.status === 200 ? { outcome: "ok" } : this.fail(r.status, r.json);
+  }
+
+  // ---- replacing a memory (1.6.0) and history -------------------------------------------------------------
+
+  async supersedePreview(actor: string, input: { old_ids: string[]; new_note?: ReplacementInput; new_id?: string }): Promise<OpResult> {
+    const body: Raw = { old_ids: input.old_ids.map(Number) };
+    if (input.new_note) body.new_note = input.new_note;
+    if (input.new_id !== undefined) body.new_id = Number(input.new_id);
+    const r = await this.http(actor, "POST", "/supersede/preview", body);
+    if (r.status !== 200) return { ...this.fail(r.status, r.json), ...(str(r.json.warning) ? { text: str(r.json.warning) } : {}) };
+    return {
+      outcome: "ok",
+      text: `${str(r.json.warning) ?? ""}\n${JSON.stringify(r.json.notes_to_retire ?? [])}`,
+      data: { token: r.json.token, count: r.json.count, requires_acknowledgement: r.json.requires_acknowledgement, expires_in_seconds: r.json.expires_in_seconds },
+    };
+  }
+
+  async supersedeConfirm(actor: string, input: { token: string; new_note?: ReplacementInput; acknowledge_risk?: boolean }): Promise<OpResult> {
+    await nextTick(this.clock);
+    const r = await this.http(actor, "POST", "/supersede/confirm", input);
+    if (r.status !== 200) return this.fail(r.status, r.json);
+    const retired = (r.json.retired as Raw[] | undefined) ?? [];
+    return { outcome: "ok", note: normalizeNote(r.json.replacement as Raw), data: { retired: retired.map((x) => String(x.id)) }, text: str(r.json.message) };
+  }
+
+  async supersedeUndo(actor: string, id: string): Promise<OpResult> {
+    const r = await this.http(actor, "POST", "/supersede/undo", { id: Number(id) });
+    if (r.status !== 200) return this.fail(r.status, r.json);
+    return { outcome: "ok", note: normalizeNote(r.json.note as Raw) };
+  }
+
+  async history(actor: string, id: string, opts: { include_distrusted?: boolean } = {}): Promise<OpResult> {
+    const r = await this.http(actor, "GET", `/notes/${encodeURIComponent(id)}/history${opts.include_distrusted ? "?include_distrusted=1" : ""}`);
+    if (r.status !== 200) return this.fail(r.status, r.json);
+    const versions = (r.json.versions as Raw[] | undefined) ?? [];
+    return { outcome: "ok", text: r.text, data: { versions: versions.length, hidden: r.json.hidden_by_trust_policy } };
+  }
+
+  async restoreVersion(actor: string, id: string, version: number, opts: { if_rev?: number } = {}): Promise<OpResult> {
+    await nextTick(this.clock);
+    const r = await this.http(actor, "POST", `/notes/${encodeURIComponent(id)}/history/restore`, { version, ...(opts.if_rev !== undefined ? { if_rev: opts.if_rev } : {}) });
+    if (r.status !== 200) return this.fail(r.status, r.json);
+    return { outcome: "ok", note: normalizeNote(r.json.note as Raw) };
   }
 
   async merge(actor: string, ids: string[]): Promise<OpResult> {
