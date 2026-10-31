@@ -2892,15 +2892,17 @@ export class Store {
    * Access-tracking aggregates for the memory_stats surface. When
    * `namespaces` is given, only those namespaces are counted (namespace
    * resolution passes the readable set; an MCP hint passes one). Omit it to
-   * count the whole store (legacy no-resolution mode).
+   * count the whole store (legacy no-resolution mode). v16: ordinary notes
+   * only (kind 'note'); captured observations and summaries are not counted,
+   * listed or judged stale here.
    */
   accessStats(namespaces?: string[], opts: { hideDistrusted?: boolean } = {}): AccessStats {
     this.flushAccess(); // aggregates read the table
     // Archived notes are forgotten: they must not show up in totals or tops.
     const where =
       namespaces && namespaces.length > 0
-        ? `WHERE archived_at IS NULL AND namespace IN (${namespaces.map(() => "?").join(",")})`
-        : "WHERE archived_at IS NULL";
+        ? `WHERE archived_at IS NULL AND kind = 'note' AND namespace IN (${namespaces.map(() => "?").join(",")})`
+        : "WHERE archived_at IS NULL AND kind = 'note'";
     const params: string[] = namespaces && namespaces.length > 0 ? [...namespaces] : [];
     // Titles are note content: a distrusted writer's notes are never listed. The counts include them unless the
     // caller (any non-admin surface) asks for `hideDistrusted`, so a reader cannot learn that hidden notes exist.
@@ -2942,8 +2944,8 @@ export class Store {
   staleCount(namespaces?: string[], opts: { hideDistrusted?: boolean } = {}): number {
     const where =
       namespaces && namespaces.length > 0
-        ? `WHERE archived_at IS NULL AND namespace IN (${namespaces.map(() => "?").join(",")})`
-        : "WHERE archived_at IS NULL";
+        ? `WHERE archived_at IS NULL AND kind = 'note' AND namespace IN (${namespaces.map(() => "?").join(",")})`
+        : "WHERE archived_at IS NULL AND kind = 'note'";
     const params: string[] = namespaces && namespaces.length > 0 ? [...namespaces] : [];
     const dis = opts.hideDistrusted ? this.distrustFragment(NOTE_COLUMNS, namespaces && namespaces.length > 0 ? namespaces : undefined) : { sql: "", params: [] as string[] };
     const rows = this.db
