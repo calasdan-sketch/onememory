@@ -933,6 +933,14 @@ interface NsEdgeIndex {
 export const EDGE_CANDIDATE_LIMIT = 256;
 
 /**
+ * applyEdgePairs stores at most this many of a write's pairs (highest score
+ * first). Reads use the top EDGE_NEIGHBOR_LIMIT, so the rest only cost disk
+ * and commit time: repetitive captured observations matched ~430 neighbors
+ * each, 100 ms writes and 111 MB at 3,000 notes.
+ */
+export const EDGE_STORE_LIMIT = 32;
+
+/**
  * Edge-index cache bounds (env-tunable, read per use): a namespace's index
  * is released after ONEMEMORY_EDGE_INDEX_IDLE_MS without use (default 10
  * min), and least-recently-used namespaces are released while more than
@@ -4941,7 +4949,11 @@ export class Store {
     const insert = this.db.prepare(
       "INSERT INTO note_edges (note_id, neighbor_id, score) VALUES (?, ?, ?)"
     );
-    for (const p of pairs) {
+    const kept =
+      pairs.length > EDGE_STORE_LIMIT
+        ? [...pairs].sort((a, b) => b.score - a.score || a.neighborId - b.neighborId).slice(0, EDGE_STORE_LIMIT)
+        : pairs;
+    for (const p of kept) {
       insert.run(id, p.neighborId, p.score);
       insert.run(p.neighborId, id, p.score);
     }
