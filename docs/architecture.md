@@ -194,5 +194,5 @@ rules, per namespace), `trust_attesters` (trusted export signers: key, pinned `s
 `not_after`) and `trust_log` (who changed the policy; newest 1000 rows kept); see [trust.md](./trust.md), v15 (1.6.0) `notes.confidence` /
 `confidence_by` / `superseded_by` / `superseded_at` / `superseded_by_writer` and tables `note_history` (earlier versions, bounded per note),
 `supersede_used` (single-use confirmation codes) and `supersede_log`; see [replacing-memories.md](./replacing-memories.md). Opening a
-v1-v14 database first writes a verified `<db>.pre-v15-backup`. There is no downgrade path: once a 1.1.0 binary
+v1-v14 database first writes a verified `<db>.pre-v16-backup`. There is no downgrade path: once a 1.1.0 binary
 has opened a database, don't go back to 1.0.x.

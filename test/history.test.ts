@@ -455,13 +455,13 @@ describe("schema v15 migration", () => {
         } finally {
           console.error = quiet;
         }
-        assert.equal(SCHEMA_VERSION, 15);
-        assert.equal(version(path), 15);
+        assert.equal(SCHEMA_VERSION, 16);
+        assert.equal(version(path), 16);
         assert.deepEqual(s.list({}).notes.map((n) => n.title).sort(), ["one", "two"]);
         assert.equal(s.list({}).notes.find((n) => n.title === "one")!.body, "first note");
         for (const c of ["confidence", "confidence_by", "superseded_by", "superseded_at", "superseded_by_writer"]) assert.ok(cols(path, "notes").includes(c), c);
         for (const t of ["note_history", "supersede_used", "supersede_log"]) assert.ok(cols(path, t).length > 0, t);
-        const bak = path + ".pre-v15-backup";
+        const bak = path + ".pre-v16-backup";
         assert.ok(existsSync(bak), "the pre-upgrade copy exists");
         assert.ok(Store.verifyBackupFile(bak).ok);
         assert.equal(version(bak), 14, "the copy is still at the old version, so an older release can open it");
@@ -484,7 +484,7 @@ describe("schema v15 migration", () => {
       console.error = () => undefined;
       try {
         new Store(path).close();
-        const bak = path + ".pre-v15-backup";
+        const bak = path + ".pre-v16-backup";
         const before = readdirSync(dir).sort();
         const s = new Store(path);
         const one = s.list({}).notes[0];
@@ -514,7 +514,7 @@ describe("schema v15 migration", () => {
         const s = new Store(path);
         assert.equal(s.list({}).notes.length, 2);
         s.close();
-        assert.equal(version(path), 15);
+        assert.equal(version(path), 16);
       } finally {
         console.error = quiet;
       }

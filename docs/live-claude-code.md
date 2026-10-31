@@ -51,9 +51,9 @@ using `CLAUDE_BRIDGE_*` settings), setup offers to **replace it with `onememory`
 - If both `claude-bridge` and `onememory` entries exist, setup stops and tells you; it does not guess which to keep.
 
 **The database is upgraded the first time it is opened** (the "schema" changes to v15). Before that, a verified safety copy is saved next to
-it as `state.db.pre-v15-backup`, and the upgrade does not run if that copy cannot be made. The upgrade is one-way: an older program cannot open
+it as `state.db.pre-v16-backup`, and the upgrade does not run if that copy cannot be made. The upgrade is one-way: an older program cannot open
 the upgraded file. So **close Claude Code, Claude Desktop and anything else that uses the old database before you run setup**. To roll
-back: stop everything, **move** the `.pre-v15-backup` file over `state.db`, **delete `state.db-wal` and `state.db-shm`** next to it (they belong to the upgraded file, and an old program would try to replay them), and run `onememory setup --undo` so the old entry returns. Notes written after the upgrade are not in the safety copy; run `onememory backup --out <folder>` first if you want them. `onememory setup --undo` prints these exact steps when it brings back an old claude-bridge entry whose database was upgraded; it never touches a database itself.
+back: stop everything, **move** the `.pre-v16-backup` file over `state.db`, **delete `state.db-wal` and `state.db-shm`** next to it (they belong to the upgraded file, and an old program would try to replay them), and run `onememory setup --undo` so the old entry returns. Notes written after the upgrade are not in the safety copy; run `onememory backup --out <folder>` first if you want them. `onememory setup --undo` prints these exact steps when it brings back an old claude-bridge entry whose database was upgraded; it never touches a database itself.
 When you are happy, `onememory backup --prune-premigration` removes the safety copy.
 
 ## 3. Check that it works in live Claude Code

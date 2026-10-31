@@ -286,8 +286,8 @@ The step-by-step version is [upgrading.md](./upgrading.md). In short:
 
 Schema v14 adds columns and three small tables; no note text is touched. The first time a database at
 v1 to v13 is opened by 1.4.x, OneMemory writes a consistent snapshot to
-`<database>.pre-v15-backup.<pid><random>.partial`, **checks it** (non-empty, the old schema version, the same
-number of notes as the database, an integrity check) and only then renames it to `<database>.pre-v15-backup`.
+`<database>.pre-v16-backup.<pid><random>.partial`, **checks it** (non-empty, the old schema version, the same
+number of notes as the database, an integrity check) and only then renames it to `<database>.pre-v16-backup`.
 A crash leaves a `.partial` file (swept at the next upgrade), never a half-written backup under the real name.
 A valid copy already there is kept when it holds the same notes, otherwise it is moved to a dated name; an
 empty or garbage one is replaced, and one that merely cannot be read is moved aside, never deleted. The upgrade
