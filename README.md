@@ -192,6 +192,26 @@ and quietly stays on keyword search when it does not (it retries once a minute).
 `onememory doctor` shows whether the hooks are wired, the last captured event and the spool size;
 `onememory setup --undo` takes the hooks out again.
 
+**At session start** you get a short "What I know about this project" block first (decisions, conventions, key
+files, the last session, open-task count), built from your stored notes with no model, capped at
+`ONEMEMORY_PROFILE_TOKENS` (300) and switched off with `ONEMEMORY_PROFILE=off`. Every memory line then says why it is
+there, in a few characters (`{files,kw 3d}`: linked to files you changed, matches your branch, three days old). A
+memory that keeps showing up without helping: `onememory never-show <id>`, the dashboard's **never show** button, or
+the tag `never-show`. It stays searchable; it is just never injected again.
+
+### What it costs you
+
+OneMemory makes **no hidden model calls**. The only model it ever talks to is the optional local summarizer
+(`ONEMEMORY_LLM_URL`, off by default, one call per session). The meter shows the rest, as aggregate numbers only (no
+prompt or note text is recorded):
+
+- tokens injected at session start, per session and in total, and the tokens of captured work they stood in for;
+- tokens the local summarizer used (0 while it is off);
+- capture events recorded and the database size on disk.
+
+See it in `onememory doctor` (the `footprint:` line), `GET /stats` and `memory_stats` (the `meter` field), and the
+dashboard's **Meter** view. Tokens are estimates at about 4 characters a token.
+
 ---
 
 ## What makes it different

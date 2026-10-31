@@ -77,3 +77,11 @@ export function assertReviewedTag(next: readonly string[] | undefined, existing:
   if (want === have) return;
   throw new ValidationError(`the tag "${REVIEWED_TAG}" is set only by an administrator accepting a note in the dashboard's Review view`);
 }
+
+/**
+ * "Never show again": a note with this tag is never injected at session start (context-inject.ts), nor in the profile.
+ * It stays searchable and readable. Deliberately NOT reserved: any writer may already edit a note's tags (and body),
+ * so reserving it would protect nothing; set it with `onememory never-show <id>`, the dashboard's "never show" button,
+ * or a normal tag edit (PUT /notes/:id, MCP state_write).
+ */
+export const NEVER_SHOW_TAG = "never-show";

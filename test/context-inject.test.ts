@@ -36,8 +36,8 @@ describe("session-start context", () => {
     const sum = s.create({ title: "Session: refactor", body: "Request: refactor the store\nOutcome: tests passing" }, { kind: "summary", sessionId: "s" });
     const text = await injectContext(s, { signals: noGit, tokens: 300 });
     assert.ok(text.length <= 300 * 4 + 400, `too long: ${text.length}`);
-    assert.ok(text.startsWith(`Latest session summary (#${sum.id}`));
-    assert.ok(text.indexOf("Recent memory (1 note):\n- [A plain note]: remember this") > 0);
+    assert.ok(text.startsWith(`What I know about this project:\nLast session: Session: refactor\n\nLatest session summary (#${sum.id}`), text.slice(0, 120));
+    assert.ok(text.indexOf("Recent memory (1 note):\n- [A plain note] {recent 0d}: remember this") > 0);
     assert.match(text, /\n#\d+ \[change\] Observation number \d+ \(\d{4}-\d\d-\d\d, ~\d+ tok\)/);
     assert.match(text, /Showing \d+ of 82 memories \(~\d+ tokens\) standing in for ~\d+ tokens of captured work\. Open any with memory_get ids=\[/);
     const big = await injectContext(s, { signals: noGit, tokens: 3000 });

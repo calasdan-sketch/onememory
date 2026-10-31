@@ -64,6 +64,7 @@ export const DASHBOARD_HTML = `<!doctype html>
   <button class="ghost" onclick="loadSessions()" title="Agent sessions OneMemory recorded, each with its timeline">Sessions</button>
   <button class="ghost" onclick="loadReview()" title="Notes written by agents that you have not looked at yet">Review</button>
   <button class="ghost" onclick="loadQuality()" title="Duplicates, stale twins, held writes, linter findings and rows about to decay (admin token)">Quality</button>
+  <button class="ghost" onclick="loadMeter()" title="What OneMemory costs you: tokens injected and saved, local-model tokens, database size">Meter</button>
   <label class="chk" title="Also show notes written by writers an admin distrusts (marked DISTRUSTED)"><input type="checkbox" id="inc" onchange="load()"> distrusted</label>
 </header>
 <main>
@@ -148,7 +149,10 @@ function render(notes){
       "<h3>"+esc(n.title)+(n.distrusted ? "<span class='badge-bad' title='An admin distrusts the writer of this note: treat its content as hostile'>DISTRUSTED</span>" : "")+"</h3>"+
       "<div class='meta'>#"+n.id+" &middot; "+esc(n.namespace)+" &middot; "+esc((n.updated_at||"").slice(0,16).replace("T"," "))+"</div>"+
       tags+"</div>"+
-      "<button class='danger' onclick='del("+n.id+")'>delete</button></div>"+
+      "<div>"+((n.tags||[]).indexOf("never-show") >= 0
+        ? "<button class='ghost' title='Let it be shown at session start again' onclick='neverShow("+n.id+",false)'>show again</button>"
+        : "<button class='ghost' title='Never inject this note at session start (it stays searchable)' onclick='neverShow("+n.id+",true)'>never show</button>")+
+      " <button class='danger' onclick='del("+n.id+")'>delete</button></div></div>"+
       (n.body ? "<div class='body'>"+esc(n.body)+"</div>" : "")+"</div>";
   }).join("");
 }
@@ -343,6 +347,38 @@ function qArchive(id){
 function qQuarantine(id, action){
   if(!confirm((action === "approve" ? "Store" : "Discard") + " held write #" + id + "?")){ return; }
   api("/quarantine/" + id + "/" + action, { method:"POST" }).then(loadQuality).catch(function(e){ alert(e.message); });
+}
+
+// "Never show again": the never-show tag keeps a note out of the session-start context (it stays searchable).
+function neverShow(id, on){
+  api("/notes/" + id).then(function(j){
+    var n = j.note || j;
+    var tags = (n.tags || []).filter(function(t){ return t !== "never-show"; }).concat(on ? ["never-show"] : []);
+    return api("/notes/" + id, { method:"PUT", body: JSON.stringify({ tags: tags, if_rev: n.rev }) });
+  }).then(load).catch(function(e){ alert(e.message); });
+}
+
+// ---- Meter: what OneMemory costs you (GET /stats -> meter). Numbers only. ----
+function loadMeter(){
+  VIEW = "meter";
+  var ns = document.getElementById("ns").value.trim();
+  api("/stats" + (ns ? ("?namespace=" + encodeURIComponent(ns)) : "")).then(function(j){
+    var m = j.meter || {}, t = m.totals || {};
+    function num(v){ return Number(v||0).toLocaleString(); }
+    document.getElementById("count").textContent = num(t.sessions) + " metered session" + (t.sessions===1?"":"s");
+    var rows = (m.recent || []).map(function(r){
+      return "<tr><td>"+when(r.updated_at)+"</td><td>"+esc(r.namespace)+"</td><td>"+num(r.injected_tokens)+"</td><td>"+num(r.saved_tokens)+"</td><td>"+num(r.llm_tokens)+"</td></tr>";
+    }).join("");
+    document.getElementById("list").innerHTML = "<div class='card'><h3>Totals</h3><div>"+
+      "~"+num(t.injected_tokens)+" tokens injected at session start ("+num(t.injections)+" times)<br>"+
+      "~"+num(t.saved_tokens)+" tokens of captured work they stood in for<br>"+
+      num(t.llm_tokens)+" local-model tokens (0 = the optional summarizer is off)<br>"+
+      num(m.capture_events)+" capture events recorded<br>"+
+      "database "+(Number(m.db_bytes||0)/1048576).toFixed(1)+" MB on disk</div>"+
+      "<div class='meta' style='margin-top:8px'>"+esc(m.note)+"</div></div>"+
+      (rows ? "<div class='card'><h3>Recent sessions</h3><table style='width:100%;font-size:13px'><tr class='muted'><td>updated</td><td>namespace</td><td>injected</td><td>saved</td><td>model</td></tr>"+rows+"</table></div>"
+        : "<p class='muted'>No session metered yet: the numbers start with the next session the SessionStart hook runs for.</p>");
+  }).catch(function(e){ document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
 }
 
 function addNote(){

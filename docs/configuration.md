@@ -90,6 +90,8 @@ All environment variables are optional. This table lists **every** `ONEMEMORY_*`
 | `ONEMEMORY_LLM_TIMEOUT_MS` | `30000` | Upper bound on the one summary call (1000 - 300000) |
 | `ONEMEMORY_LLM_ALLOW_REMOTE` | unset | `1` = allow an `ONEMEMORY_LLM_URL` that is not this machine. Session text then leaves the PC; leave unset unless you mean it |
 | `ONEMEMORY_RECALL_TOKENS` | `1500` | Token budget (about 4 characters each) of the context the session-start hook injects |
+| `ONEMEMORY_PROFILE_TOKENS` | `300` | Share of that budget (at most half) for the "What I know about this project" block at the top: decisions, conventions (notes tagged `convention`), key files, last session, open-task count, built from stored notes with no model |
+| `ONEMEMORY_PROFILE` | on | `off` = leave the project profile out of the session-start context |
 | `ONEMEMORY_HOOK_URL` | unset | Optional: when the local database cannot be opened, the capture hooks POST the event to `<url>/capture` instead of spooling it (2 s timeout). Needs `ONEMEMORY_HOOK_TOKEN` |
 | `ONEMEMORY_HOOK_TOKEN` | unset | A write-scope token for `ONEMEMORY_HOOK_URL` |
 | `ONEMEMORY_SPACES` | unset (feature off) | Optional JSON namespace config: `{"spaces":{"/home/you/work":"work"},"default_namespace":"default","reads_from":{"work":["shared"]}}` (or `<data dir>/spaces.json`; env wins). Enables server-side namespace resolution |

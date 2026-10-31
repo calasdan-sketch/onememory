@@ -29,6 +29,16 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rows. mem0 reads a JSON export (categories become tags). basic-memory reads a Markdown folder, with the permalink as the id.
   Imported rows are written by `import:<tool>` and tagged `imported:<tool>` (claude-mem's rows are model-written; there is no
   separate label for that yet). How to switch over and cleanly uninstall the old tool: [docs/switching.md](./docs/switching.md).
+- **Project profile at session start:** a "What I know about this project" block at the top of the injected context: recent decisions,
+  conventions (notes tagged `convention`), the files memory mentions most (`note_files`), the last session and the open-task count. Deterministic (no
+  model), inside the recall budget, capped by `ONEMEMORY_PROFILE_TOKENS` (default 300, at most half the budget); `ONEMEMORY_PROFILE=off` turns it off.
+- **"Why was this shown?":** every injected note and index line ends with a short tag such as `{files,kw 3d}` (linked to files you changed, matches
+  your branch / changed files / recent work, among the newest, a decision; age in days), explained once by a legend line.
+- **Never show again:** a note tagged `never-show` is left out of the session-start context, the profile and the file-context hint; it stays
+  searchable. Set it with `onememory never-show <id>` (`--undo` to reverse), the dashboard's **never show** button, or a normal tag edit.
+- **Token & footprint meter:** per session and in total, the tokens injected at session start, the captured work they stood in for, and the tokens
+  the optional local summarizer used (0 when off), plus capture events and database size. Aggregate numbers only (table `meter_sessions`, created on
+  first use). Shown by `onememory doctor`, `GET /stats` / `memory_stats` (`meter`) and the dashboard's **Meter** view.
 
 ## [1.7.2] - 2026-10-25
 

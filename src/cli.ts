@@ -43,6 +43,9 @@ function usage(): void {
       "            Off switch: ONEMEMORY_CAPTURE=off. When: installed by `onememory setup --capture`.",
       "            file-context (PreToolUse on Read) lists what memory knows about the file, once per session; it never",
       "            blocks or changes the Read.",
+      "  never-show <id> [--undo]",
+      "            Keep one note out of the session-start context for good (tags it never-show; it stays searchable).",
+      "            When: a memory keeps being shown that does not help. The dashboard has the same button.",
       "  consolidate [--dry-run] [--yes] [--threshold 0.95] [--namespace ns]",
       "            Find near-duplicate notes and merge them. Without --yes",
       "            (or with --dry-run) this only reports — nothing is merged.",
@@ -223,8 +226,11 @@ async function doctor(): Promise<void> {
     const r = s.list({ limit: 1 });
     const edges = s.edgeCount();
     distrustCount = s.distrustRules().length;
+    const { meterStats, meterLine } = await import("./meter.js");
+    const footprint = meterLine(meterStats(s));
     s.close();
     ok(`database OK at ${DB_PATH} (${r.total} notes)`);
+    ok(footprint);
     // Migration v4 adds the similarity-edge table but does not score
     // existing notes: a store upgraded from 1.0.0 has notes and no edges
     // until a one-time rebuild.
@@ -1044,6 +1050,30 @@ async function watchCmd(): Promise<void> {
       exec,
       signal: abort.signal,
     });
+  } finally {
+    store.close();
+  }
+}
+
+// `onememory never-show <id> [--undo]`: keep a note out of the session-start context for good (it stays searchable).
+async function neverShowCmd(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const { setNeverShow } = await import("./context-inject.js");
+  const args = process.argv.slice(3);
+  const id = Number(args.find((a) => !a.startsWith("-")));
+  if (!Number.isInteger(id) || id < 1) {
+    console.error("usage: onememory never-show <note id> [--undo]");
+    process.exit(1);
+  }
+  const store = new Store(DB_PATH);
+  try {
+    const n = setNeverShow(store, id, !args.includes("--undo"));
+    if (!n) {
+      console.error(`no note with id ${id}`);
+      process.exit(1);
+    }
+    console.log(args.includes("--undo") ? `#${id} can be shown at session start again` : `#${id} will not be shown at session start again (undo: onememory never-show ${id} --undo)`);
   } finally {
     store.close();
   }
@@ -2148,6 +2178,9 @@ async function main(): Promise<void> {
       break;
     case "encrypt":
       await encryptCmd();
+      break;
+    case "never-show":
+      await neverShowCmd();
       break;
     case "supersede":
       await supersedeCmd("supersede");
