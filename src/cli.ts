@@ -37,6 +37,10 @@ function usage(): void {
       "            Notes from writers on the distrust list are left out unless --include-distrusted.",
       "            When: wired into Claude Code settings.json. See:",
       "            https://github.com/calasdan-sketch/onememory/blob/main/docs/sessionstart-hook.md",
+      "  hook <session-start|user-prompt|post-tool|post-tool-failure|stop|subagent-stop|session-end> [--db <file>]",
+      "            Automatic memory: the agent's lifecycle hooks (hook JSON on stdin). Records what the agent does, redacted,",
+      "            on this machine only, and distills it into observations and a session summary. Always exits 0.",
+      "            Off switch: ONEMEMORY_CAPTURE=off. When: installed by `onememory setup --capture`.",
       "  consolidate [--dry-run] [--yes] [--threshold 0.95] [--namespace ns]",
       "            Find near-duplicate notes and merge them. Without --yes",
       "            (or with --dry-run) this only reports — nothing is merged.",
@@ -495,6 +499,24 @@ async function recall(): Promise<void> {
     })
   );
   process.exit(0);
+}
+
+// The capture hooks: `onememory hook <event>` with the agent's hook JSON on stdin. FAIL-OPEN by design (see hook.ts):
+// prints nothing or one valid hook JSON object, and exits 0 whatever happens, including a module that fails to load.
+async function hookCmd(): Promise<void> {
+  const event = process.argv[3] ?? "";
+  let out = "";
+  try {
+    const { runHook, readStdin } = await import("./hook.js");
+    const args = process.argv.slice(4);
+    const i = args.indexOf("--db");
+    out = await runHook(event, await readStdin(), i >= 0 && args[i + 1] ? { dbPath: args[i + 1] } : {});
+  } catch (e) {
+    console.error(`onememory hook: ${(e as Error).message}`);
+    out = event === "session-start" ? '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""}}' : "";
+  }
+  if (out) process.stdout.write(out + "\n", () => process.exit(0));
+  else process.exit(0);
 }
 
 // Find near-duplicate notes and merge them. Safe by default: without --yes
@@ -1891,12 +1913,13 @@ async function main(): Promise<void> {
   // (`bench` runs on a throwaway store and must never touch the real data directory.)
   // A dry run of `import --claude` or `sync` must not create anything, not even the data folder.
   const dry = process.argv.includes("--dry-run") && ((cmd === "import" && process.argv.includes("--claude")) || cmd === "sync");
-  if (!dry && !["help", "--help", "-h", "init", "bench", "setup"].includes(cmd)) (await import("./config.js")).prepareDataDir();
+  // The capture hooks (`hook`) never move or create data folders: they run on every tool call and must stay quick and quiet.
+  if (!dry && !["help", "--help", "-h", "init", "bench", "setup", "hook"].includes(cmd)) (await import("./config.js")).prepareDataDir();
   // Fixed writer marker for notes this process writes with no token behind
   // them (written_by): the long-running server's own jobs, the stdio MCP
   // server, or an `onememory ...` command run by the machine owner.
   setProcessWriter(
-    cmd === "start" || cmd === "serve" ? "server" : cmd === "mcp" || cmd === "mcp:stdio" ? "stdio" : "cli"
+    cmd === "start" || cmd === "serve" ? "server" : cmd === "mcp" || cmd === "mcp:stdio" ? "stdio" : cmd === "hook" ? "capture" : "cli"
   );
   switch (cmd) {
     case "start":
@@ -1924,6 +1947,9 @@ async function main(): Promise<void> {
       break;
     case "recall":
       await recall();
+      break;
+    case "hook":
+      await hookCmd();
       break;
     case "consolidate":
       await consolidate();

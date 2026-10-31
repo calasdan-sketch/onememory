@@ -79,6 +79,13 @@ All environment variables are optional. This table lists **every** `ONEMEMORY_*`
 | `ONEMEMORY_IMPORT_MAX_BYTES` | `268435456` (256 MB) | Request-body cap for `POST /import` (clamped to 1 MB - 2 GB). Other routes keep the 1 MB cap |
 | `ONEMEMORY_URL` | unset | Base URL (e.g. `http://localhost:8790`) used only by the runner signing helper's `--post` mode, together with `ONEMEMORY_TOKEN`. Not read by the server |
 | `ONEMEMORY_LINT` | `secrets=block,injection=quarantine` | Write-time memory linter policy: `block`, `quarantine`, `warn`, or per category (`secrets=block,injection=warn`). See [memory-linter.md](./memory-linter.md) |
+| `ONEMEMORY_CAPTURE` | on (once the hooks are installed) | `off` = the capture hooks record nothing (the session-start context still works). Also readable from `<data dir>/capture.json` as `{"capture":"off"}`; the variable wins |
+| `ONEMEMORY_CAPTURE_EXCLUDE` | unset | Comma-separated globs (`*`, `**`) on the working directory; sessions in a matching folder are not recorded (e.g. `**/secret-*,C:/clients/**`) |
+| `ONEMEMORY_CAPTURE_SKIP_TOOLS` | unset | Comma-separated tool names the capture hooks ignore (e.g. `TodoWrite,WebFetch`). OneMemory's own `mcp__onememory__*` tools are always skipped |
+| `ONEMEMORY_CAPTURE_RETENTION_DAYS` | `7` | Raw captured events are deleted after this many days (the observations distilled from them are kept like notes) |
+| `ONEMEMORY_RECALL_TOKENS` | `1500` | Token budget (about 4 characters each) of the context the session-start hook injects |
+| `ONEMEMORY_HOOK_URL` | unset | Optional: when the local database cannot be opened, the capture hooks POST the event to `<url>/capture` instead of spooling it (2 s timeout). Needs `ONEMEMORY_HOOK_TOKEN` |
+| `ONEMEMORY_HOOK_TOKEN` | unset | A write-scope token for `ONEMEMORY_HOOK_URL` |
 | `ONEMEMORY_SPACES` | unset (feature off) | Optional JSON namespace config: `{"spaces":{"/home/you/work":"work"},"default_namespace":"default","reads_from":{"work":["shared"]}}` (or `<data dir>/spaces.json`; env wins). Enables server-side namespace resolution |
 | `ONEMEMORY_SPACE` | unset | Explicit namespace override: when set, the server uses this namespace directly instead of resolving from the working directory (only meaningful with a spaces config present) |
 

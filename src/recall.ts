@@ -44,6 +44,8 @@ export interface RecallOptions {
    * highest-leverage place for a hostile note to sit).
    */
   includeDistrusted?: boolean;
+  /** The session's working directory (the hook payload's cwd); default process.cwd(). Picks the namespace. */
+  cwd?: string;
 }
 
 /**
@@ -107,12 +109,12 @@ export function buildHookOutput(additionalContext: string): string {
  *    notes pre-prompt with zero signal. The hook still exits 0 (fail-silent
  *    by design) but logs LOUDLY on stderr so the operator sees it.
  */
-type NamespaceResolution =
+export type NamespaceResolution =
   | { kind: "disabled" }
   | { kind: "resolved"; namespace: string }
   | { kind: "unresolvable" };
 
-async function resolveRecallNamespace(): Promise<NamespaceResolution> {
+export async function resolveRecallNamespace(cwd: string = process.cwd()): Promise<NamespaceResolution> {
   let source: "env" | "file" | null;
   try {
     source = namespaceConfigSource();
@@ -130,7 +132,7 @@ async function resolveRecallNamespace(): Promise<NamespaceResolution> {
   // overlap and returns null when the config is present-but-invalid
   // (loadNamespaceConfig already logged the reason loudly).
   try {
-    const resolved = resolveStartupNamespace(process.cwd());
+    const resolved = resolveStartupNamespace(cwd);
     if (!resolved || !resolved.namespace.trim()) {
       console.error(
         "onememory recall: NAMESPACE RESOLUTION FAILED — a namespace config is " +
@@ -143,7 +145,7 @@ async function resolveRecallNamespace(): Promise<NamespaceResolution> {
   } catch (e) {
     console.error(
       "onememory recall: NAMESPACE RESOLUTION FAILED — namespaces are configured " +
-        `but the working directory "${process.cwd()}" could not be resolved ` +
+        `but the working directory "${cwd}" could not be resolved ` +
         `(${(e as Error).message}). Refusing to fall back to unscoped recall; ` +
         "returning empty context."
     );
@@ -163,7 +165,7 @@ async function fetchRecentNotes(opts: RecallOptions): Promise<RecallData> {
   const { listTasks, listHandoffs, buildBoardSummary, TASK_TAG, HANDOFF_TAG } = await import("./tasks.js");
   const { runnerNotice } = await import("./liveness.js");
   const limit = clampInt(opts.limit ?? 10, 10, 1, 100);
-  const resolution = await resolveRecallNamespace();
+  const resolution = await resolveRecallNamespace(opts.cwd);
   if (resolution.kind === "unresolvable") {
     // Configured-but-unresolvable: fail closed to NOTHING, never unscoped.
     return { notes: [], board: "" };

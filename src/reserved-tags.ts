@@ -19,14 +19,21 @@
 // removing one, is rejected with a message pointing at task_put /
 // session_handoff. Internal paths (tasks.ts, the runner) call the store
 // directly and are not affected.
+//
+// v16 (automatic memory): the capture writer's tags are reserved the same way:
+// the exact tags `observation` and `summary`, and every tag starting with
+// `obs.` (obs.type:, obs.concept:). Only extract.ts writes them, so a note
+// cannot pass itself off as captured work.
 import { ValidationError } from "./store.js";
 
 export const RESERVED_TAG_PREFIX = "task.";
-const RESERVED_EXACT = new Set(["task", "handoff"]);
+/** v16: the capture writer's tag prefix (obs.type:, obs.concept:). */
+export const CAPTURE_TAG_PREFIX = "obs.";
+const RESERVED_EXACT = new Set(["task", "handoff", "observation", "summary"]);
 
 export function isReservedTag(tag: string): boolean {
   const t = tag.trim();
-  return RESERVED_EXACT.has(t) || t.startsWith(RESERVED_TAG_PREFIX);
+  return RESERVED_EXACT.has(t) || t.startsWith(RESERVED_TAG_PREFIX) || t.startsWith(CAPTURE_TAG_PREFIX);
 }
 
 function reservedSet(tags: readonly string[] | undefined): Set<string> {
@@ -47,7 +54,8 @@ export function assertPlainWriteTags(next: readonly string[] | undefined, existi
   throw new ValidationError(
     `the tag(s) ${bad.map((t) => `"${t}"`).join(", ")} are reserved for the task board: ` +
       `use task_put (POST /tasks) to create or change tasks and session_handoff (POST /handoffs) for handoffs. ` +
-      `Reserved: "task", "handoff" and anything starting with "${RESERVED_TAG_PREFIX}".`
+      `Reserved: "task", "handoff" and anything starting with "${RESERVED_TAG_PREFIX}"; ` +
+      `"observation", "summary" and anything starting with "${CAPTURE_TAG_PREFIX}" are written only by the automatic capture.`
   );
 }
 
