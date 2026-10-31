@@ -83,6 +83,10 @@ All environment variables are optional. This table lists **every** `ONEMEMORY_*`
 | `ONEMEMORY_CAPTURE_EXCLUDE` | unset | Comma-separated globs (`*`, `**`) on the working directory; sessions in a matching folder are not recorded (e.g. `**/secret-*,C:/clients/**`) |
 | `ONEMEMORY_CAPTURE_SKIP_TOOLS` | unset | Comma-separated tool names the capture hooks ignore (e.g. `TodoWrite,WebFetch`). OneMemory's own `mcp__onememory__*` tools are always skipped |
 | `ONEMEMORY_CAPTURE_RETENTION_DAYS` | `7` | Raw captured events are deleted after this many days (the observations distilled from them are kept like notes) |
+| `ONEMEMORY_LLM_URL` | unset (off) | Optional local model for session summaries: base URL of an OpenAI-compatible server (Ollama `http://127.0.0.1:11434`, LM Studio, llama.cpp). One call per session at session-end; on any failure the automatic summary stays. Needs `ONEMEMORY_LLM_MODEL`. Only loopback hosts are accepted |
+| `ONEMEMORY_LLM_MODEL` | unset | The model name sent to `ONEMEMORY_LLM_URL` (e.g. `qwen2.5:7b`) |
+| `ONEMEMORY_LLM_TIMEOUT_MS` | `30000` | Upper bound on the one summary call (1000 - 300000) |
+| `ONEMEMORY_LLM_ALLOW_REMOTE` | unset | `1` = allow an `ONEMEMORY_LLM_URL` that is not this machine. Session text then leaves the PC; leave unset unless you mean it |
 | `ONEMEMORY_RECALL_TOKENS` | `1500` | Token budget (about 4 characters each) of the context the session-start hook injects |
 | `ONEMEMORY_HOOK_URL` | unset | Optional: when the local database cannot be opened, the capture hooks POST the event to `<url>/capture` instead of spooling it (2 s timeout). Needs `ONEMEMORY_HOOK_TOKEN` |
 | `ONEMEMORY_HOOK_TOKEN` | unset | A write-scope token for `ONEMEMORY_HOOK_URL` |

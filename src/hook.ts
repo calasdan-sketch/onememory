@@ -107,7 +107,12 @@ export async function captureHook(event: HookEvent, payload: Record<string, unkn
       distillStaleSessions(store, ev.session_id);
     }
     if (event === "stop" || event === "session-end") distillSession(store, ev.session_id);
-    if (event === "session-end") store.sweepCaptureEvents();
+    if (event === "session-end") {
+      // Optional local model (llm.ts, off unless configured): one call per session; on any failure the summary above stays.
+      const { llmSummarize } = await import("./llm.js");
+      await llmSummarize(store, ev.session_id, env);
+      store.sweepCaptureEvents();
+    }
     return "stored";
   } catch (e) {
     process.stderr.write(`onememory hook ${event}: ${(e as Error).message}; keeping the event for later\n`);

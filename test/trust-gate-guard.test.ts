@@ -62,6 +62,7 @@ const EXPECTED_SITES: Record<string, string[]> = {
     "import merge-base lookup: compares hashes, returns nothing to a caller",
   ],
   "extract.ts": ["the capture writer re-reads its own summary note"],
+  "llm.ts": ["the capture writer re-reads its own summary note"],
   "progressive.ts": ["access probe: readVisible decides before anything is returned"],
   "tasks.ts": [
     "requireTaskRef: a distrusted task reads as absent",
