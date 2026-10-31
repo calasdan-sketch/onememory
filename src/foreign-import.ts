@@ -13,12 +13,13 @@
 // Same rules as `import --claude` (claude-import.ts): local only, a dry run first, anything that looks like a secret is
 // skipped and never shown, every write goes through Store.create (memory linter, quarantine), and the stable id of each item
 // is kept in `source`, so running it again adds only what is new. Everything read is untrusted: claude-mem's rows were written
-// by a model, so they are tagged `imported:claude-mem` (there is no separate "model-written" label yet).
+// by a model, so they also carry the model-written label (MODEL_WRITTEN_TAG).
 
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join, relative, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { MODEL_WRITTEN_TAG } from "./reserved-tags.js";
 import { chunkBody, looksLikeCredential, MAX_FILE_BYTES, parseFrontmatter, readHeld, writeHeld } from "./claude-import.js";
 import { lintContent } from "./lint.js";
 import { LIMITS } from "./security.js";
@@ -108,7 +109,7 @@ export function readClaudeMem(path: string): Item[] {
           group: project,
           title: title.slice(0, 200),
           body,
-          tags: ["observation", ...(type ? [`obs.type:${type}`] : []), `project:${project}`, ...jsonList(r.concepts).slice(0, 10).map((c) => `obs.concept:${c}`)],
+          tags: ["observation", MODEL_WRITTEN_TAG, ...(type ? [`obs.type:${type}`] : []), `project:${project}`, ...jsonList(r.concepts).slice(0, 10).map((c) => `obs.concept:${c}`)],
           createdAt: isoFrom(r.created_at_epoch, r.created_at),
           kind: "observation",
           obsType: /^[a-z_]{1,40}$/.test(type) ? type : "",
@@ -129,7 +130,7 @@ export function readClaudeMem(path: string): Item[] {
           group: project,
           title: `Session summary: ${firstLine(str(r.request)) || project}`.slice(0, 200),
           body,
-          tags: ["summary", "obs.type:session", `project:${project}`],
+          tags: ["summary", MODEL_WRITTEN_TAG, "obs.type:session", `project:${project}`],
           createdAt: isoFrom(r.created_at_epoch, r.created_at),
           kind: "summary",
           sessionId: r.memory_session_id ? `claude-mem:${str(r.memory_session_id)}`.slice(0, 200) : undefined,

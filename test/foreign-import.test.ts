@@ -108,6 +108,7 @@ describe("import --from claude-mem", () => {
       assert.equal(fix.source, "import:claude-mem:obs:1");
       assert.equal(fix.created_at, "2025-03-01T10:00:00.000Z");
       assert.ok(fix.tags.includes("imported:claude-mem"));
+      assert.ok(fix.tags.includes("obs.writer:model"), "claude-mem rows are model-written");
       assert.equal(s.list({ namespace: "work", filePath: "src/auth.ts", kinds: ["observation", "summary"] }).notes.length, 2);
       assert.ok(rows.some((n) => n.kind === "summary"));
     } finally {

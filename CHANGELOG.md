@@ -35,8 +35,7 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   quarantine, re-runs add only what is new via a stable id in `source`). claude-mem's SQLite database is opened read only;
   observations become `observation` rows with their type, files, project and original dates, and session summaries become `summary`
   rows. mem0 reads a JSON export (categories become tags). basic-memory reads a Markdown folder, with the permalink as the id.
-  Imported rows are written by `import:<tool>` and tagged `imported:<tool>` (claude-mem's rows are model-written; there is no
-  separate label for that yet). How to switch over and cleanly uninstall the old tool: [docs/switching.md](./docs/switching.md).
+  Imported rows are written by `import:<tool>` and tagged `imported:<tool>`; claude-mem's rows also carry the model-written label. How to switch over and cleanly uninstall the old tool: [docs/switching.md](./docs/switching.md).
 - **Project profile at session start:** a "What I know about this project" block at the top of the injected context: recent decisions,
   conventions (notes tagged `convention`), the files memory mentions most (`note_files`), the last session and the open-task count. Deterministic (no
   model), inside the recall budget, capped by `ONEMEMORY_PROFILE_TOKENS` (default 300, at most half the budget); `ONEMEMORY_PROFILE=off` turns it off.
