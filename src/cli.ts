@@ -25,7 +25,7 @@ function usage(): void {
       "            When: something isn't working, or after changing config.",
       "  init      Print the config snippet to wire onememory into your agent.",
       "            When: you want to see the config before using it, or to copy it by hand.",
-      "  setup [--dry-run] [--yes] [--only claude-code,claude-desktop,cursor] [--project] [--hook|--no-hook] [--db <file>] [--undo]",
+      "  setup [--dry-run] [--yes] [--only claude-code,claude-desktop,cursor] [--project] [--hook|--no-hook] [--capture|--no-capture] [--db <file>] [--undo]",
       "            Connect onememory to Claude Code / Claude Desktop / Cursor for you. Shows the plan and the exact lines it will",
       "            change, saves a backup of each file first, writes only after you type y. An old \"claude-bridge\" entry is offered",
       "            for migration with your data kept. --dry-run only shows; --undo puts back what it changed.",
@@ -352,7 +352,7 @@ async function doctor(): Promise<void> {
     const entries = parsed?.hooks?.SessionStart;
     const wired =
       Array.isArray(entries) &&
-      /(onememory|cli\.js)[\s\S]{0,60}\brecall\b/.test(JSON.stringify(entries));
+      /(onememory|cli\.js)[\s\S]{0,60}\b(recall|hook session-start)\b/.test(JSON.stringify(entries));
     if (wired) {
       ok("SessionStart hook wired in ~/.claude/settings.json");
     } else {
@@ -361,11 +361,35 @@ async function doctor(): Promise<void> {
           "see https://github.com/calasdan-sketch/onememory/blob/main/docs/sessionstart-hook.md"
       );
     }
+    const captureWired = /(onememory|cli\.js)[\s\S]{0,60}\bhook post-tool\b/.test(JSON.stringify(parsed?.hooks ?? {}));
+    console.log(`  [info] ${captureWired ? "automatic memory hooks wired" : "automatic memory hooks not installed (onememory setup --capture)"}`);
   } catch {
     warn(
       "~/.claude/settings.json not found or unreadable — hook not installed " +
         "(see https://github.com/calasdan-sketch/onememory/blob/main/docs/sessionstart-hook.md)"
     );
+  }
+
+  // Automatic memory: when did a hook last record something, and is anything waiting in the spool?
+  try {
+    const { Store } = await import("./store.js");
+    const { lastCaptureAt, spoolSize, captureSettings } = await import("./capture.js");
+    const { DATA_DIR } = await import("./config.js");
+    const spool = spoolSize(DATA_DIR);
+    const set = captureSettings(DATA_DIR);
+    let last: string | null = null;
+    if (!dbProblem) {
+      const s = new Store(DB_PATH);
+      try {
+        last = lastCaptureAt(s);
+      } finally {
+        s.close();
+      }
+    }
+    console.log(`  [info] capture: ${set.enabled ? "on" : "off (ONEMEMORY_CAPTURE / capture.json)"}; last event ${last ?? "never"}; spool ${spool} bytes`);
+    if (spool > 0) warn(`${spool} bytes of captured events are waiting in the spool; the next hook that can open the database stores them`);
+  } catch (e) {
+    warn("capture status unavailable: " + (e as Error).message);
   }
 
   console.log(`\n  bind ${BIND_HOST}   api :${API_PORT}   mcp :${MCP_HTTP_PORT}`);
@@ -1851,7 +1875,7 @@ async function setupCmd(): Promise<void> {
   const { runSetup, realEnv, DEFAULT_OPTIONS } = await import("./setup.js");
   const { flags } = parseFlags(process.argv.slice(3), {
     values: ["only", "db", "command"],
-    bools: ["dry-run", "yes", "undo", "hook", "no-hook", "project", "no-test-note", "no-doctor", "force-empty"],
+    bools: ["dry-run", "yes", "undo", "hook", "no-hook", "capture", "no-capture", "project", "no-test-note", "no-doctor", "force-empty"],
   });
   const command = str(flags.command) ?? "auto";
   if (!["auto", "node", "npx"].includes(command)) {
@@ -1862,6 +1886,10 @@ async function setupCmd(): Promise<void> {
     console.error("Choose one of --hook and --no-hook");
     process.exit(1);
   }
+  if (flags.capture === true && flags["no-capture"] === true) {
+    console.error("Choose one of --capture and --no-capture");
+    process.exit(1);
+  }
   const { PACKAGE_VERSION } = await import("./config.js");
   const e = realEnv(PACKAGE_VERSION, fileURLToPath(import.meta.url));
   process.exitCode = await runSetup(e, terminalIO(), {
@@ -1870,6 +1898,7 @@ async function setupCmd(): Promise<void> {
     yes: flags.yes === true,
     undo: flags.undo === true,
     hook: flags.hook === true ? "yes" : flags["no-hook"] === true ? "no" : "ask",
+    capture: flags.capture === true ? "yes" : flags["no-capture"] === true ? "no" : "ask",
     project: flags.project === true,
     noTestNote: flags["no-test-note"] === true,
     noDoctor: flags["no-doctor"] === true,

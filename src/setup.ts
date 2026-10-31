@@ -71,6 +71,8 @@ export interface SetupOptions {
   undo: boolean;
   /** "ask" (default), "yes" (--hook), "no" (--no-hook). */
   hook: "ask" | "yes" | "no";
+  /** Automatic memory hooks: "ask" (default), "yes" (--capture), "no" (--no-capture). */
+  capture?: "ask" | "yes" | "no";
   /** Restrict to these clients: claude-code, claude-desktop, cursor, project. */
   only?: string[];
   /** Also add to ./.mcp.json in the current folder. */
@@ -371,30 +373,74 @@ export function planFile(e: SetupEnv, opts: SetupOptions, target: ClientTarget, 
 }
 
 export const HOOK_MARKER = "recall --budget-ms";
-/** Our own hook: the exact recall command we write, or any command line naming onememory with recall. */
-const HOOK_DETECT = /recall --budget-ms|onememory[^\n]{0,120}\brecall\b/;
+/** Our own start-of-session hook: the recall command we write, any command line naming onememory with recall, or the capture session-start hook. */
+const HOOK_DETECT = /recall --budget-ms|onememory[^\n]{0,120}\b(?:recall|hook session-start)\b/;
+
+/**
+ * Automatic memory: the Claude Code events the capture hooks run on, the `onememory hook <event>` each runs, and whether
+ * it runs in the background (`async`: the agent does not wait for it). user-prompt is synchronous so the prompt is
+ * recorded before the tools it causes; session-start (below) is synchronous because its output is the injected context.
+ */
+export const CAPTURE_HOOKS: ReadonlyArray<{ on: string; event: string; async: boolean; matcher?: string }> = [
+  { on: "UserPromptSubmit", event: "user-prompt", async: false },
+  { on: "PostToolUse", event: "post-tool", async: true, matcher: "*" },
+  { on: "PostToolUseFailure", event: "post-tool-failure", async: true, matcher: "*" },
+  { on: "Stop", event: "stop", async: true },
+  { on: "SubagentStop", event: "subagent-stop", async: true },
+  { on: "SessionEnd", event: "session-end", async: true },
+];
+
+/** `onememory hook <event>` as a hook command (same launcher rules as buildHookCommand). */
+export function buildCaptureCommand(e: SetupEnv, opts: Pick<SetupOptions, "command">, event: string, dbPath?: string): string {
+  const useNpx = opts.command === "npx" || (opts.command === "auto" && runningFromNpxCache(e.cliPath));
+  const db = dbPath ? ` --db "${dbPath.replace(/\\/g, "/")}"` : "";
+  if (useNpx) return `npx -y onememory-mcp@${e.version} hook ${event}${db}`;
+  return `node "${e.cliPath.replace(/\\/g, "/")}" hook ${event}${db}`;
+}
 
 export function planHook(e: SetupEnv, opts: SetupOptions, dbForHook?: string): { change: FileChange | null; already: boolean; conflict?: string } {
+  return planHooks(e, opts, dbForHook, { recall: true, capture: false });
+}
+
+/**
+ * The hooks to add to ~/.claude/settings.json: the start-of-session context (`recall`, unless one of ours is already
+ * there) and, with `capture`, one entry per CAPTURE_HOOKS event (each only if that event has no onememory hook yet).
+ * With capture the start-of-session entry is `hook session-start`, which prints the same context and also does the
+ * capture housekeeping. Existing entries, ours or anyone's, are never touched; every addition has its own undo op.
+ */
+export function planHooks(e: SetupEnv, opts: SetupOptions, dbForHook: string | undefined, want: { recall: boolean; capture: boolean }): { change: FileChange | null; already: boolean; conflict?: string } {
   const file = join(claudeDir(e), "settings.json");
   const text = readTextFile(file);
   if (text === "" && !opts.forceEmpty) return { change: null, already: false, conflict: EMPTY_FILE_MSG(file) };
-  if (text && text.trim()) {
-    const doc = parseDoc(text);
-    const arr = getPath(doc, ["hooks", "SessionStart"]);
-    if (arr && HOOK_DETECT.test(text.slice(arr.start, arr.end))) return { change: null, already: true };
+  const doc = text && text.trim() ? parseDoc(text) : null;
+  const has = (on: string, re: RegExp): boolean => {
+    const arr = doc ? getPath(doc, ["hooks", on]) : null;
+    return !!arr && re.test(text!.slice(arr.start, arr.end));
+  };
+  const ops: Op[] = [];
+  const inverse: Op[] = [];
+  const lines: string[] = [];
+  if (want.recall && !has("SessionStart", HOOK_DETECT)) {
+    const command = want.capture ? buildCaptureCommand(e, opts, "session-start", dbForHook) : buildHookCommand(e, opts, dbForHook);
+    ops.push({ op: "append", path: ["hooks"], key: "SessionStart", value: { matcher: "startup|clear", hooks: [{ type: "command", command }] } });
+    inverse.unshift({ op: "unappend", path: ["hooks"], key: "SessionStart", marker: want.capture ? "hook session-start" : HOOK_MARKER });
+    lines.push("add a start-of-session hook that shows your recent notes to Claude (your existing hooks stay as they are)");
   }
-  const item = { matcher: "startup|clear", hooks: [{ type: "command", command: buildHookCommand(e, opts, dbForHook) }] };
+  if (want.capture) {
+    let added = 0;
+    for (const h of CAPTURE_HOOKS) {
+      // Ours: a command line naming onememory (the package or its cli.js) with `hook <event>`; another tool's hook is not.
+      if (has(h.on, new RegExp(`onememory[^\\n]{0,160}\\bhook ${h.event}(?![\\w-])`))) continue;
+      const hook = { type: "command", command: buildCaptureCommand(e, opts, h.event, dbForHook), ...(h.async ? { async: true } : {}) };
+      ops.push({ op: "append", path: ["hooks"], key: h.on, value: h.matcher ? { matcher: h.matcher, hooks: [hook] } : { hooks: [hook] } });
+      inverse.unshift({ op: "unappend", path: ["hooks"], key: h.on, marker: `hook ${h.event}` });
+      added++;
+    }
+    if (added) lines.push("record what Claude does in this project (files, commands, errors) into OneMemory, stored only on this machine (ONEMEMORY_CAPTURE=off turns it off)");
+  }
+  if (!ops.length) return { change: null, already: true };
   return {
-    change: {
-      client: "claude-code",
-      label: "Claude Code hook",
-      file,
-      before: text,
-      ops: [{ op: "append", path: ["hooks"], key: "SessionStart", value: item }],
-      lines: ["add a start-of-session hook that shows your recent notes to Claude (your existing hooks stay as they are)"],
-      inverse: [{ op: "unappend", path: ["hooks"], key: "SessionStart", marker: HOOK_MARKER }],
-      allowEmpty: opts.forceEmpty,
-    },
+    change: { client: "claude-code", label: "Claude Code hook", file, before: text, ops, lines, inverse, allowEmpty: opts.forceEmpty },
     already: false,
   };
 }
@@ -769,6 +815,8 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
 
   // Hook decision (Claude Code only).
   let wantHook = false;
+  let wantCapture = false;
+  let capturePlan: FileChange | null = null;
   const ccFound = found.find((t) => t.id === "claude-code");
   const hookEligible = !!ccFound?.present && (!opts.only || opts.only.includes("claude-code"));
   if (hookEligible && opts.hook !== "no") {
@@ -780,8 +828,19 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
       plan.hook = ph.change;
     }
   }
+  // Automatic memory builds on the start-of-session hook: with --no-hook it is only added when asked for by name (--capture).
+  const capture = opts.capture ?? "ask";
+  if (hookEligible && capture !== "no" && !(capture === "ask" && opts.hook === "no")) {
+    const pc = planHooks(e, opts, primaryDbIfCustom(primaryDb, DB_PATH, opts), { recall: opts.hook !== "no", capture: true });
+    if (pc.conflict) plan.conflicts.push(pc.conflict);
+    else if (pc.already) plan.already.push("Claude Code: the automatic memory hooks are already installed");
+    else if (pc.change && pc.change.lines.some((l) => l.startsWith("record what Claude does"))) {
+      if (capture === "yes") wantCapture = true;
+      capturePlan = pc.change;
+    }
+  }
 
-  if (plan.changes.length === 0 && !plan.hook) {
+  if (plan.changes.length === 0 && !plan.hook && !capturePlan) {
     for (const a of plan.already) io.out(`  (already fine) ${a}`);
     for (const w of plan.warnings) io.out(`  (careful) ${w}`);
     io.out(plan.already.length ? "\nNothing to change: OneMemory is already connected. To check it, run:  onememory doctor" : "\nNothing was changed.");
@@ -800,11 +859,12 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
   io.out("Before any file is changed, a copy is saved beside it (name ends in .onememory-backup-<time>). `onememory setup --undo` puts it back.");
   io.out("Please close Claude Code and Claude Desktop first: Claude Code rewrites ~/.claude.json while it runs.\n");
 
-  const shown = [...plan.changes, ...(plan.hook ? [plan.hook] : [])];
+  // With automatic memory offered, its plan (which includes the start-of-session hook) is the one shown.
+  const shown = [...plan.changes, ...(capturePlan ? [capturePlan] : plan.hook ? [plan.hook] : [])];
   if (shown.length) {
     io.out("The exact change" + (shown.length > 1 ? "s" : "") + ":");
     for (const c of shown) {
-      if (c === plan.hook) io.out(`  Optional, only if you agree (${c.lines[0]}):`);
+      if (c === plan.hook || c === capturePlan) io.out(`  Optional, only if you agree (${c.lines.join("; ")}):`);
       let after: string;
       try {
         after = applyOps(c.before ?? "", c.ops);
@@ -819,17 +879,17 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
 
   if (opts.dryRun) {
     io.out("Dry run: nothing was changed. No file was written, and no database was created or upgraded.");
-    if (plan.hook && !wantHook) io.out("(The hook above is only added if you say yes to it, or pass --hook.)");
+    if ((plan.hook && !wantHook) || (capturePlan && !wantCapture)) io.out("(The hooks above are only added if you say yes to them, or pass --hook / --capture.)");
     return 0;
   }
-  if (plan.changes.length === 0 && !plan.hook) return 0;
+  if (plan.changes.length === 0 && !plan.hook && !capturePlan) return 0;
 
   if (!opts.yes) {
     if (!io.interactive) {
       io.err("This is not an interactive terminal, so I cannot ask. Re-run with --yes to go ahead (a backup is still made), or --dry-run to only look.");
       return 1;
     }
-    const a = (await io.ask(plan.changes.length ? "Go ahead with the changes above? Type y to continue, anything else cancels: " : "Install the hook? Type y: ")).trim().toLowerCase();
+    const a = (await io.ask(plan.changes.length ? "Go ahead with the changes above? Type y to continue, anything else cancels: " : "Install the hooks? Type y: ")).trim().toLowerCase();
     if (a !== "y" && a !== "yes") {
       io.out("Cancelled. Nothing was changed.");
       return 0;
@@ -838,8 +898,14 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
       const h = (await io.ask("Also install the start-of-session hook (Claude sees your recent notes when a session starts)? Type y or n: ")).trim().toLowerCase();
       wantHook = h === "y" || h === "yes";
     }
-  } else if (plan.hook && opts.hook === "ask") {
-    wantHook = false; // --yes alone never adds a hook; it needs --hook
+    // Asked only after a yes to the start-of-session hook (or when it is already there): a no to that is a no to both.
+    if (capturePlan && capture === "ask" && (wantHook || !plan.hook)) {
+      const c = (await io.ask("Also record what Claude does in this project (files, commands, errors), stored only on this machine? Type y or n: ")).trim().toLowerCase();
+      wantCapture = c === "y" || c === "yes";
+    }
+  } else {
+    if (plan.hook && opts.hook === "ask") wantHook = false; // --yes alone never adds a hook; it needs --hook
+    if (capturePlan && capture === "ask") wantCapture = false; // ... or --capture
   }
 
   const dbsBefore = dbs.map((d) => ({ path: d, before: Store.peekSchemaVersion(d) }));
@@ -881,7 +947,13 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
 
   // 2. Configuration files.
   const written: WrittenChange[] = [];
-  const toWrite = [...plan.changes, ...(plan.hook && wantHook ? [plan.hook] : [])];
+  // The hook file: automatic memory (with the start-of-session hook when that was wanted too), else the hook alone.
+  const hookChange = wantCapture
+    ? planHooks(e, opts, primaryDbIfCustom(primaryDb, DB_PATH, opts), { recall: wantHook || (opts.hook !== "no" && !plan.hook), capture: true }).change
+    : wantHook
+      ? plan.hook
+      : null;
+  const toWrite = [...plan.changes, ...(hookChange ? [hookChange] : [])];
   try {
     for (const c of toWrite) {
       const w = writeChange(e, c);
