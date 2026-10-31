@@ -24,7 +24,7 @@ npx onememory-mcp setup --dry-run     # shows exactly what it would change; writ
 npx onememory-mcp setup               # does it, after you type y; backs up every file; --undo reverses it
 ```
 
-It finds Claude Code, Claude Desktop and Cursor, adds only the OneMemory entry, and can move an old `claude-bridge` entry across keeping your data.
+It finds Claude Code, Claude Desktop, Cursor, Codex CLI, Gemini CLI, Muse, VS Code and Zed, adds only the OneMemory entry, and can move an old `claude-bridge` entry across keeping your data.
 Details and troubleshooting: [docs/live-claude-code.md](./docs/live-claude-code.md). The manual steps for each app follow.
 
 ## Claude Code
@@ -65,11 +65,83 @@ Create `.cursor/mcp.json` in your project (or the global one in `~/.cursor/`):
 
 ## GitHub Copilot (VS Code)
 
-Create `.vscode/mcp.json`:
+Create `.vscode/mcp.json` in your project, or use the user one (`MCP: Open User Configuration`; `setup` writes
+`%APPDATA%\Code\User\mcp.json` on Windows, `~/Library/Application Support/Code/User/mcp.json` on macOS,
+`~/.config/Code/User/mcp.json` on Linux):
 
 ```json
 {
   "servers": {
+    "onememory": {
+      "type": "stdio",
+      "command": "onememory",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+## Codex CLI
+
+`~/.codex/config.toml` (or `$CODEX_HOME/config.toml`). `setup` adds only this table and leaves the rest of the file as it is:
+
+```toml
+[mcp_servers.onememory]
+command = "onememory"
+args = ["mcp"]
+```
+
+With `--capture`, `setup` also writes `~/.codex/hooks.json` (SessionStart, UserPromptSubmit, PostToolUse, Stop). Codex
+runs a new hook only after you trust it: type `/hooks` in Codex and approve the OneMemory ones.
+
+## Gemini CLI
+
+`~/.gemini/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "onememory": {
+      "command": "onememory",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+With `--capture`, `setup` adds hooks under `"hooks"` in the same file (SessionStart, BeforeAgent, AfterTool, AfterAgent, SessionEnd).
+
+## Muse (Meta Muse Code)
+
+`~/.config/muse/settings.json` (or `$XDG_CONFIG_HOME/muse/settings.json`). Muse will not start without
+`"schema_version": 1`; `setup` adds it when it is missing. If the file already uses `"mcpServers"`, `setup` keeps that
+spelling; otherwise it uses `"mcp_servers"` (Meta's documented key):
+
+```json
+{
+  "schema_version": 1,
+  "mcp_servers": {
+    "onememory": {
+      "transport": "stdio",
+      "command": "onememory",
+      "args": ["mcp"],
+      "mode": "optional"
+    }
+  }
+}
+```
+
+With `--capture`, `setup` adds hooks under `"hooks"` in the same file. Each OneMemory hook group holds only its command
+(Muse skips a group that has a key it does not know). Muse has not published its hook input fields, so recording there
+is best effort.
+
+## Zed
+
+`settings.json` (`%APPDATA%\Zed\settings.json` on Windows, `~/.config/zed/settings.json` elsewhere; `zed: open settings file`):
+
+```json
+{
+  "context_servers": {
     "onememory": {
       "command": "onememory",
       "args": ["mcp"]

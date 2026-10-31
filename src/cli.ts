@@ -25,7 +25,7 @@ function usage(): void {
       "            When: something isn't working, or after changing config.",
       "  init      Print the config snippet to wire onememory into your agent.",
       "            When: you want to see the config before using it, or to copy it by hand.",
-      "  setup [--dry-run] [--yes] [--only claude-code,claude-desktop,cursor] [--project] [--hook|--no-hook] [--capture|--no-capture] [--db <file>] [--undo]",
+      "  setup [--dry-run] [--yes] [--only claude-code,claude-desktop,cursor,codex,gemini,muse,vscode,zed] [--project] [--hook|--no-hook] [--capture|--no-capture] [--db <file>] [--undo]",
       "            Connect onememory to Claude Code / Claude Desktop / Cursor for you. Shows the plan and the exact lines it will",
       "            change, saves a backup of each file first, writes only after you type y. An old \"claude-bridge\" entry is offered",
       "            for migration with your data kept. --dry-run only shows; --undo puts back what it changed.",

@@ -129,7 +129,7 @@ export function normalizeHookInput(event: HookEvent, raw: unknown, now: Date = n
     } else output = resultText(r.tool_response);
   } else if (event === "user-prompt") input = str(r.prompt);
   else if (event === "session-start") input = str(r.source);
-  else input = str(r.last_assistant_message ?? r.reason);
+  else input = str(r.last_assistant_message ?? r.prompt_response ?? r.reason); // prompt_response: Gemini CLI AfterAgent
   const bytes = input.length + output.length;
   return { session_id: sid, cwd, event, tool, input: cleanField(input), output: cleanField(output), ok, bytes, at: now.toISOString() };
 }

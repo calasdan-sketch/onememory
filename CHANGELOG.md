@@ -6,6 +6,16 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `onememory setup` now also finds and connects **Codex CLI** (`~/.codex/config.toml`: only the `[mcp_servers.onememory]`
+  table is added or removed, the rest of the file stays byte for byte), **Gemini CLI** (`~/.gemini/settings.json`),
+  **Muse** (`~/.config/muse/settings.json`, keeps or adds `"schema_version": 1`), **VS Code** (user `mcp.json`, `servers`)
+  and **Zed** (`settings.json`, `context_servers`), with the same plan, diff, backup and `--undo` as before.
+- `--hook` / `--capture` also wire the hooks of Codex (`~/.codex/hooks.json`), Gemini CLI and Muse to `onememory hook <event>`.
+- `onememory hook`: reads Gemini CLI's `prompt_response` as the stop text, and takes the session id from `MUSE_SESSION_ID`
+  or `GEMINI_SESSION_ID` when stdin has none.
+
 ## [1.7.2] - 2026-10-25
 
 Windows fixes only. **No schema change** (still v15).

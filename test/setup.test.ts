@@ -123,8 +123,8 @@ describe("setup: finding the apps", () => {
   test("an unknown client name is refused with the list", async () => {
     const s = sandbox();
     const io = makeIO();
-    assert.equal(await runSetup(s.e, io, opts({ only: ["vscode"] })), 1);
-    assert.match(io.all(), /Unknown client: vscode/);
+    assert.equal(await runSetup(s.e, io, opts({ only: ["notepad"] })), 1);
+    assert.match(io.all(), /Unknown client: notepad/);
   });
 });
 
