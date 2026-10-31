@@ -32,6 +32,7 @@ test("npm pack ships no runner file", () => {
   const files = entry?.files?.map((f) => f.path);
   assert.ok(files, `unexpected npm pack --json shape: ${out.slice(0, 300)}`);
   assert.ok(files.includes("dist/src/store.js"), "sanity: the memory package itself is packed");
+  assert.ok(files.includes("skills/onememory-mem/SKILL.md"), "the automatic-memory skill ships with the package");
   const leaked = files.filter((f) => RUNNER_FILE.test(f));
   assert.deepEqual(leaked, [], `runner files in the tarball: ${leaked.join(", ")}`);
 

@@ -56,6 +56,7 @@
     "INFRA.md",
     "SECURITY.md",
     "SKILL.md",
+    "skills/*/SKILL.md",
     "LICENSE",
     "CHANGELOG.md",
     "docs/*.md",
