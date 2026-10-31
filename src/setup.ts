@@ -1,4 +1,5 @@
-// `onememory setup`: connect OneMemory to Claude Code, Claude Desktop and Cursor without hand-editing JSON.
+// `onememory setup`: connect OneMemory to Claude Code, Claude Desktop, Cursor, Codex CLI, Gemini CLI, Muse, VS Code and Zed
+// without hand-editing JSON (or TOML, for Codex).
 //
 // The promises, in the order a nervous person would ask for them:
 //   * It shows a plain-language plan and the exact lines it will change BEFORE touching anything (`--dry-run` stops there).
@@ -17,6 +18,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { randomBytes, createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { applyOps, getMember, getPath, JsonEditError, opsAreApplied, parseDoc, parseJsonc, type Op } from "./jsonc-edit.js";
+import { applyTomlOps, hasServer, tomlOpsApplied } from "./toml-table.js";
 
 // ---- environment (injectable, so tests never touch a real configuration) ---------------------------------------------
 
@@ -73,7 +75,7 @@ export interface SetupOptions {
   hook: "ask" | "yes" | "no";
   /** Automatic memory hooks: "ask" (default), "yes" (--capture), "no" (--no-capture). */
   capture?: "ask" | "yes" | "no";
-  /** Restrict to these clients: claude-code, claude-desktop, cursor, project. */
+  /** Restrict to these clients (CLIENT_IDS). */
   only?: string[];
   /** Also add to ./.mcp.json in the current folder. */
   project: boolean;
@@ -92,7 +94,7 @@ export const DEFAULT_OPTIONS: SetupOptions = { dryRun: false, yes: false, undo: 
 const EMPTY_FILE_MSG = (file: string): string =>
   `${file} exists but is completely empty (0 bytes). A program may have been cut off while saving it, and replacing it could lose settings. Look for a backup next to it, or if you are sure it is empty run setup again with --force-empty.`;
 
-export const CLIENT_IDS = ["claude-code", "claude-desktop", "cursor", "project"] as const;
+export const CLIENT_IDS = ["claude-code", "claude-desktop", "cursor", "codex", "gemini", "muse", "vscode", "zed", "project"] as const;
 export type ClientId = (typeof CLIENT_IDS)[number];
 
 // ---- detection ---------------------------------------------------------------------------------------------------------
@@ -111,18 +113,30 @@ export function claudeDir(e: SetupEnv): string {
   return c ? resolve(c) : join(e.home, ".claude");
 }
 
+const appData = (e: SetupEnv): string => e.env.APPDATA?.trim() || join(e.home, "AppData", "Roaming");
+const xdgConfig = (e: SetupEnv): string => e.env.XDG_CONFIG_HOME?.trim() || join(e.home, ".config");
+export const codexDir = (e: SetupEnv): string => (e.env.CODEX_HOME?.trim() ? resolve(e.env.CODEX_HOME.trim()) : join(e.home, ".codex"));
+
 export function detectClients(e: SetupEnv): ClientTarget[] {
   const out: ClientTarget[] = [];
   const cfgDir = e.env.CLAUDE_CONFIG_DIR?.trim();
   const ccFile = cfgDir ? join(resolve(cfgDir), ".claude.json") : join(e.home, ".claude.json");
   out.push({ id: "claude-code", label: "Claude Code", file: ccFile, exists: existsSync(ccFile), present: existsSync(ccFile) || existsSync(claudeDir(e)) });
   let desk: string;
-  if (e.platform === "win32") desk = join(e.env.APPDATA?.trim() || join(e.home, "AppData", "Roaming"), "Claude", "claude_desktop_config.json");
+  if (e.platform === "win32") desk = join(appData(e), "Claude", "claude_desktop_config.json");
   else if (e.platform === "darwin") desk = join(e.home, "Library", "Application Support", "Claude", "claude_desktop_config.json");
-  else desk = join(e.env.XDG_CONFIG_HOME?.trim() || join(e.home, ".config"), "Claude", "claude_desktop_config.json");
+  else desk = join(xdgConfig(e), "Claude", "claude_desktop_config.json");
   out.push({ id: "claude-desktop", label: "Claude Desktop", file: desk, exists: existsSync(desk), present: existsSync(desk) || existsSync(dirname(desk)) });
   const cur = join(e.home, ".cursor", "mcp.json");
   out.push({ id: "cursor", label: "Cursor", file: cur, exists: existsSync(cur), present: existsSync(cur) || existsSync(dirname(cur)) });
+  const add = (id: ClientId, label: string, file: string, dir = dirname(file)): void => void out.push({ id, label, file, exists: existsSync(file), present: existsSync(file) || existsSync(dir) });
+  add("codex", "Codex CLI", join(codexDir(e), "config.toml"));
+  add("gemini", "Gemini CLI", join(e.home, ".gemini", "settings.json"));
+  // Muse documents only ~/.config/muse (or $XDG_CONFIG_HOME/muse); on Windows it runs under WSL2, so a native Windows
+  // path is unverified and the same ~/.config path is used.
+  add("muse", "Muse", join(xdgConfig(e), "muse", "settings.json"));
+  add("vscode", "VS Code", join(e.platform === "win32" ? appData(e) : e.platform === "darwin" ? join(e.home, "Library", "Application Support") : xdgConfig(e), "Code", "User", "mcp.json"));
+  add("zed", "Zed", e.platform === "win32" ? join(appData(e), "Zed", "settings.json") : join(xdgConfig(e), "zed", "settings.json"));
   const proj = join(e.cwd, ".mcp.json");
   out.push({ id: "project", label: "This folder's .mcp.json", file: proj, exists: existsSync(proj), present: existsSync(proj) });
   return out;
@@ -240,7 +254,13 @@ export interface FileChange {
   inverse: Op[];
   /** Allow replacing an existing 0-byte file (--force-empty). */
   allowEmpty?: boolean;
+  /** Codex's config.toml: ops are TOML table edits (toml-table.ts), not JSON. */
+  format?: "toml";
 }
+
+/** applyOps / opsAreApplied for either file format. */
+const applyFor = (text: string, ops: readonly Op[], format?: "toml"): string => (format === "toml" ? applyTomlOps(text, ops) : applyOps(text, ops));
+const appliedFor = (text: string, ops: readonly Op[], format?: "toml"): boolean => (format === "toml" ? tomlOpsApplied(text, ops) : opsAreApplied(text, ops));
 
 export interface SetupPlan {
   nodeOk: boolean;
@@ -252,7 +272,6 @@ export interface SetupPlan {
   /** Entries that are already fine. */
   already: string[];
   conflicts: string[];
-  hook?: FileChange;
 }
 
 const MIN_NODE = 24;
@@ -295,7 +314,7 @@ interface FoundServer {
   end: number;
 }
 
-function findServers(text: string, includeProjects: boolean): FoundServer[] {
+function findServers(text: string, includeProjects: boolean, key = "mcpServers"): FoundServer[] {
   const doc = parseDoc(text);
   const res: FoundServer[] = [];
   const add = (path: string[]): void => {
@@ -303,7 +322,7 @@ function findServers(text: string, includeProjects: boolean): FoundServer[] {
     if (!node || node.kind !== "object") return;
     for (const m of node.members!) res.push({ path, name: m.key, start: m.value.start, end: m.value.end });
   };
-  add(["mcpServers"]);
+  add([key]);
   if (includeProjects) {
     const projects = getPath(doc, ["projects"]);
     if (projects && projects.kind === "object") for (const p of projects.members!) add(["projects", p.key, "mcpServers"]);
@@ -311,18 +330,42 @@ function findServers(text: string, includeProjects: boolean): FoundServer[] {
   return res;
 }
 
+/**
+ * The object that holds the servers in each app's file. VS Code: "servers"; Zed: "context_servers"; Muse documents
+ * "mcp_servers" (Meta's docs) but "mcpServers" is also seen and accepted as a legacy spelling, so an existing
+ * "mcpServers" is kept rather than adding a second block.
+ */
+function serversKey(id: ClientId, text: string): string {
+  if (id === "vscode") return "servers";
+  if (id === "zed") return "context_servers";
+  if (id === "muse") return text.trim() && !getPath(parseDoc(text), ["mcp_servers"]) && getPath(parseDoc(text), ["mcpServers"]) ? "mcpServers" : "mcp_servers";
+  return "mcpServers";
+}
+
+/** Codex CLI: one [mcp_servers.onememory] table in ~/.codex/config.toml (command/args/env), everything else untouched. */
+function planToml(e: SetupEnv, opts: SetupOptions, target: ClientTarget, text: string | null, shared: { dbs: Set<string> }): { change: FileChange | null; already: string[]; conflicts: string[]; warnings: string[] } {
+  if (text !== null && hasServer(text, "onememory")) return { change: null, already: [`${target.label}: "onememory" is already set up`], conflicts: [], warnings: [] };
+  const entry = buildServerEntry(e, opts, opts.db ? { ONEMEMORY_DB_PATH: opts.db } : undefined);
+  if (opts.db) shared.dbs.add(opts.db);
+  const ops: Op[] = [{ op: "set", path: ["mcp_servers"], key: "onememory", value: entry }];
+  const lines = [`add the "onememory" memory server${opts.db ? ` (database ${opts.db})` : ""}`];
+  return { change: { client: target.id, label: target.label, file: target.file, before: text, ops, lines, inverse: [{ op: "remove", path: ["mcp_servers"], key: "onememory" }], allowEmpty: opts.forceEmpty, format: "toml" }, already: [], conflicts: [], warnings: [] };
+}
+
 export function planFile(e: SetupEnv, opts: SetupOptions, target: ClientTarget, shared: { dbs: Set<string> }): { change: FileChange | null; already: string[]; conflicts: string[]; warnings: string[] } {
   const text = readTextFile(target.file);
   if (text === "" && !opts.forceEmpty) return { change: null, already: [], conflicts: [EMPTY_FILE_MSG(target.file)], warnings: [] };
+  if (target.id === "codex") return planToml(e, opts, target, text, shared);
   const base = text ?? "";
+  const key = serversKey(target.id, base);
   const already: string[] = [];
   const conflicts: string[] = [];
   const warnings: string[] = [];
   const lines: string[] = [];
   const ops: Op[] = [];
   const inverse: Op[] = [];
-  const withType = target.id === "claude-code" || target.id === "project";
-  const servers = base.trim() === "" ? [] : findServers(base, target.id === "claude-code");
+  const withType = target.id === "claude-code" || target.id === "project" || target.id === "vscode";
+  const servers = base.trim() === "" ? [] : findServers(base, target.id === "claude-code", key);
   const top = servers.filter((s) => s.path.length === 1);
   const hasOneTop = top.some((s) => classifyEntry(s.name, safeParseEntry(base, s) ?? {}) === "onememory");
   let migrated = 0;
@@ -362,9 +405,16 @@ export function planFile(e: SetupEnv, opts: SetupOptions, target: ClientTarget, 
   if (migrated === 0 && !hasOneTop && (target.id !== "project" || opts.project) && !already.length) {
     const env: Record<string, string> = {};
     if (opts.db) env.ONEMEMORY_DB_PATH = opts.db;
-    const entry = buildServerEntry(e, opts, env, withType);
-    ops.push({ op: "set", path: ["mcpServers"], key: "onememory", value: entry });
-    inverse.unshift({ op: "remove", path: ["mcpServers"], key: "onememory" });
+    let entry = buildServerEntry(e, opts, env, withType);
+    // Muse: "optional" so a server that fails to start is skipped with a warning instead of aborting the whole run.
+    if (target.id === "muse") entry = { transport: "stdio", ...entry, mode: "optional" };
+    // Muse refuses to start without "schema_version": 1, so a file we create (or one missing it) gets it.
+    if (target.id === "muse" && !(base.trim() && getPath(parseDoc(base), ["schema_version"]))) {
+      ops.push({ op: "set", path: [], key: "schema_version", value: 1 });
+      inverse.unshift({ op: "remove", path: [], key: "schema_version" });
+    }
+    ops.push({ op: "set", path: [key], key: "onememory", value: entry });
+    inverse.unshift({ op: "remove", path: [key], key: "onememory" });
     lines.push(`add the "onememory" memory server${opts.db ? ` (database ${opts.db})` : ""}`);
     if (opts.db) shared.dbs.add(opts.db);
   }
@@ -404,14 +454,84 @@ export function planHook(e: SetupEnv, opts: SetupOptions, dbForHook?: string): {
   return planHooks(e, opts, dbForHook, { recall: true, capture: false });
 }
 
+type CaptureHook = { on: string; event: string; async: boolean; matcher?: string };
+
+/** An agent with command hooks: where they live, its start-of-session event, and its events mapped to `onememory hook <event>`. */
+export interface HookHost {
+  client: ClientId;
+  label: string;
+  /** Who "does" things, in the plan's wording. */
+  agent: string;
+  file: string;
+  start: { on: string; matcher?: string };
+  events: ReadonlyArray<CaptureHook>;
+  /** Extra plan lines (notes). */
+  notes?: string[];
+}
+
+/**
+ * Every agent whose hooks setup can wire. All take the Claude Code shape ({hooks: {<Event>: [{matcher?, hooks: [{type:
+ * "command", command}]}]}}) and send session_id / cwd / prompt / tool_name / tool_input / tool_response on stdin
+ * (capture.ts reads Gemini's AfterAgent `prompt_response` too).
+ *  - Codex: ~/.codex/hooks.json; events and fields from developers.openai.com/codex/hooks (async is documented there).
+ *  - Gemini CLI: the "hooks" key of ~/.gemini/settings.json; BeforeAgent/AfterTool/AfterAgent/SessionEnd per
+ *    geminicli.com/docs/hooks. Lifecycle matchers must match exactly, so SessionStart gets none; no async field.
+ *  - Muse: the "hooks" key of its settings.json. Meta lists the same event names as Claude Code but does not publish the
+ *    stdin fields or the allowed group keys, and it skips a group with a key it does not know, so ours carry nothing but
+ *    the command (no matcher, no async) and are recognised by their command line alone. UNVERIFIED: the stdin field names.
+ */
+export function hookHosts(e: SetupEnv): HookHost[] {
+  const muse = detectClients(e).find((t) => t.id === "muse")!.file;
+  return [
+    { client: "claude-code", label: "Claude Code hook", agent: "Claude", file: join(claudeDir(e), "settings.json"), start: { on: "SessionStart", matcher: "startup|clear" }, events: CAPTURE_HOOKS },
+    {
+      client: "codex",
+      label: "Codex CLI hook",
+      agent: "Codex",
+      file: join(codexDir(e), "hooks.json"),
+      start: { on: "SessionStart", matcher: "startup|clear" },
+      events: [
+        { on: "UserPromptSubmit", event: "user-prompt", async: false },
+        { on: "PostToolUse", event: "post-tool", async: true, matcher: "*" },
+        { on: "Stop", event: "stop", async: true },
+      ],
+      notes: ["note: Codex runs a new hook only after you trust it: type /hooks in Codex and approve the OneMemory ones"],
+    },
+    {
+      client: "gemini",
+      label: "Gemini CLI hook",
+      agent: "Gemini",
+      file: join(e.home, ".gemini", "settings.json"),
+      start: { on: "SessionStart" },
+      events: [
+        { on: "BeforeAgent", event: "user-prompt", async: false },
+        { on: "AfterTool", event: "post-tool", async: false, matcher: "*" },
+        { on: "AfterAgent", event: "stop", async: false },
+        { on: "SessionEnd", event: "session-end", async: false },
+      ],
+    },
+    {
+      client: "muse",
+      label: "Muse hook",
+      agent: "Muse",
+      file: muse,
+      start: { on: "SessionStart" },
+      events: ["UserPromptSubmit:user-prompt", "PostToolUse:post-tool", "PostToolUseFailure:post-tool-failure", "Stop:stop", "SubagentStop:subagent-stop", "SessionEnd:session-end"].map((x) => {
+        const [on, event] = x.split(":");
+        return { on, event, async: false };
+      }),
+    },
+  ];
+}
+
 /**
  * The hooks to add to ~/.claude/settings.json: the start-of-session context (`recall`, unless one of ours is already
  * there) and, with `capture`, one entry per CAPTURE_HOOKS event (each only if that event has no onememory hook yet).
  * With capture the start-of-session entry is `hook session-start`, which prints the same context and also does the
  * capture housekeeping. Existing entries, ours or anyone's, are never touched; every addition has its own undo op.
  */
-export function planHooks(e: SetupEnv, opts: SetupOptions, dbForHook: string | undefined, want: { recall: boolean; capture: boolean }): { change: FileChange | null; already: boolean; conflict?: string } {
-  const file = join(claudeDir(e), "settings.json");
+export function planHooks(e: SetupEnv, opts: SetupOptions, dbForHook: string | undefined, want: { recall: boolean; capture: boolean }, host: HookHost = hookHosts(e)[0]): { change: FileChange | null; already: boolean; conflict?: string } {
+  const file = host.file;
   const text = readTextFile(file);
   if (text === "" && !opts.forceEmpty) return { change: null, already: false, conflict: EMPTY_FILE_MSG(file) };
   const doc = text && text.trim() ? parseDoc(text) : null;
@@ -422,15 +542,16 @@ export function planHooks(e: SetupEnv, opts: SetupOptions, dbForHook: string | u
   const ops: Op[] = [];
   const inverse: Op[] = [];
   const lines: string[] = [];
-  if (want.recall && !has("SessionStart", HOOK_DETECT)) {
+  if (want.recall && !has(host.start.on, HOOK_DETECT)) {
     const command = want.capture ? buildCaptureCommand(e, opts, "session-start", dbForHook) : buildHookCommand(e, opts, dbForHook);
-    ops.push({ op: "append", path: ["hooks"], key: "SessionStart", value: { matcher: "startup|clear", hooks: [{ type: "command", command }] } });
-    inverse.unshift({ op: "unappend", path: ["hooks"], key: "SessionStart", marker: want.capture ? "hook session-start" : HOOK_MARKER });
-    lines.push("add a start-of-session hook that shows your recent notes to Claude (your existing hooks stay as they are)");
+    const hooks = [{ type: "command", command }];
+    ops.push({ op: "append", path: ["hooks"], key: host.start.on, value: host.start.matcher ? { matcher: host.start.matcher, hooks } : { hooks } });
+    inverse.unshift({ op: "unappend", path: ["hooks"], key: host.start.on, marker: want.capture ? "hook session-start" : HOOK_MARKER });
+    lines.push(`add a start-of-session hook that shows your recent notes to ${host.agent} (your existing hooks stay as they are)`);
   }
   if (want.capture) {
     let added = 0;
-    for (const h of CAPTURE_HOOKS) {
+    for (const h of host.events) {
       // Ours: a command line naming onememory (the package or its cli.js) with `hook <event>`; another tool's hook is not.
       if (has(h.on, new RegExp(`onememory[^\\n]{0,160}\\bhook ${h.event}(?![\\w-])`))) continue;
       const hook = { type: "command", command: buildCaptureCommand(e, opts, h.event, dbForHook), ...(h.async ? { async: true } : {}) };
@@ -438,11 +559,12 @@ export function planHooks(e: SetupEnv, opts: SetupOptions, dbForHook: string | u
       inverse.unshift({ op: "unappend", path: ["hooks"], key: h.on, marker: `hook ${h.event}` });
       added++;
     }
-    if (added) lines.push("record what Claude does in this project (files, commands, errors) into OneMemory, stored only on this machine (ONEMEMORY_CAPTURE=off turns it off)");
+    if (added) lines.push(`record what ${host.agent} does in this project (files, commands, errors) into OneMemory, stored only on this machine (ONEMEMORY_CAPTURE=off turns it off)`);
   }
   if (!ops.length) return { change: null, already: true };
+  if (host.notes) lines.push(...host.notes);
   return {
-    change: { client: "claude-code", label: "Claude Code hook", file, before: text, ops, lines, inverse, allowEmpty: opts.forceEmpty },
+    change: { client: host.client, label: host.label, file, before: text, ops, lines, inverse, allowEmpty: opts.forceEmpty },
     already: false,
   };
 }
@@ -491,6 +613,7 @@ export interface WrittenChange {
   afterSha: string;
   inverse: Op[];
   label: string;
+  format?: "toml";
 }
 
 const sha = (s: string): string => createHash("sha256").update(s).digest("hex");
@@ -578,8 +701,8 @@ export function writeChange(e: SetupEnv, change: FileChange): WrittenChange | nu
     if (buf && buf.length === 0 && !change.allowEmpty) throw new JsonEditError(EMPTY_FILE_MSG(file));
     const current = buf ? buf.toString("utf8") : null;
     if (buf && current !== null && Buffer.from(current, "utf8").compare(buf) !== 0) throw new JsonEditError(`${file} is not valid UTF-8 text; nothing was written`);
-    if (current !== null && opsAreApplied(current, change.ops)) return null; // already in place (someone else added it in the meantime)
-    const next = applyOps(current ?? "", change.ops);
+    if (current !== null && appliedFor(current, change.ops, change.format)) return null; // already in place (someone else added it in the meantime)
+    const next = applyFor(current ?? "", change.ops, change.format);
     let backup: string | null = null;
     if (buf) {
       backup = `${real}.onememory-backup-${stamp(e.now())}`;
@@ -612,8 +735,8 @@ export function writeChange(e: SetupEnv, change: FileChange): WrittenChange | nu
     writeAtomic(real, next, mode);
     // Read back: our edit must be there (a program holding an older copy could have written it over).
     const back = readFileSync(real, "utf8");
-    const stillThere = opsAreApplied(back, change.ops);
-    if (stillThere) return { file, real, backup, createdFile: buf === null, afterSha: sha(back), inverse: change.inverse, label: change.label };
+    const stillThere = appliedFor(back, change.ops, change.format);
+    if (stillThere) return { file, real, backup, createdFile: buf === null, afterSha: sha(back), inverse: change.inverse, label: change.label, ...(change.format ? { format: change.format } : {}) };
     if (attempt === 4) throw new Error(`${file} keeps being rewritten by another program, so the change did not stay. Close Claude Code and run setup again.`);
     sleepSync(80);
   }
@@ -715,7 +838,7 @@ export async function undoLast(e: SetupEnv, io: SetupIO): Promise<number> {
         continue;
       }
       // The program changed the file since (Claude Code does). Undo only OUR change; keep theirs.
-      const reverted = applyOps(current, c.inverse);
+      const reverted = applyFor(current, c.inverse, c.format);
       if (reverted === current) io.out(`  ${c.file}: our change is not there any more, nothing to do`);
       else {
         const backup = `${c.real}.onememory-backup-${stamp(e.now())}-before-undo`;
@@ -807,7 +930,7 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
   }
 
   if (plan.changes.length === 0 && plan.conflicts.length === 0) {
-    if (plan.already.length === 0) io.out("I found no app to connect. Pass --only claude-code (or claude-desktop, cursor) to create its config, or --project for this folder.");
+    if (plan.already.length === 0) io.out("I found no app to connect. Pass --only claude-code (or claude-desktop, cursor, codex, gemini, muse, vscode, zed) to create its config, or --project for this folder.");
   }
   if (plan.conflicts.length) {
     io.err("Stopped, because:");
@@ -815,34 +938,41 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
     return 1;
   }
 
-  // Hook decision (Claude Code only).
+  // Hook decision: every installed agent with command hooks (Claude Code, Codex, Gemini CLI, Muse). One answer covers all.
   let wantHook = false;
   let wantCapture = false;
-  let capturePlan: FileChange | null = null;
-  const ccFound = found.find((t) => t.id === "claude-code");
-  const hookEligible = !!ccFound?.present && (!opts.only || opts.only.includes("claude-code"));
-  if (hookEligible && opts.hook !== "no") {
-    const ph = planHook(e, opts, primaryDbIfCustom(primaryDb, DB_PATH, opts));
-    if (ph.conflict) plan.conflicts.push(ph.conflict);
-    else if (ph.already) plan.already.push("Claude Code: the start-of-session hook is already installed");
-    else if (ph.change) {
-      if (opts.hook === "yes") wantHook = true;
-      plan.hook = ph.change;
-    }
-  }
-  // Automatic memory builds on the start-of-session hook: with --no-hook it is only added when asked for by name (--capture).
+  const hookDb = primaryDbIfCustom(primaryDb, DB_PATH, opts);
+  const hosts = hookHosts(e).filter((h) => !!found.find((t) => t.id === h.client)?.present && (!opts.only || opts.only.includes(h.client)));
+  /** Per host: the start-of-session hook alone, and the automatic memory plan (which includes it). */
+  const hookPlans = new Map<HookHost, FileChange>();
+  const capturePlans = new Map<HookHost, FileChange>();
   const capture = opts.capture ?? "ask";
-  if (hookEligible && capture !== "no" && !(capture === "ask" && opts.hook === "no")) {
-    const pc = planHooks(e, opts, primaryDbIfCustom(primaryDb, DB_PATH, opts), { recall: opts.hook !== "no", capture: true });
-    if (pc.conflict) plan.conflicts.push(pc.conflict);
-    else if (pc.already) plan.already.push("Claude Code: the automatic memory hooks are already installed");
-    else if (pc.change && pc.change.lines.some((l) => l.startsWith("record what Claude does"))) {
-      if (capture === "yes") wantCapture = true;
-      capturePlan = pc.change;
+  for (const h of hosts) {
+    const who = h.label.replace(/ hook$/, "");
+    if (opts.hook !== "no") {
+      const ph = planHooks(e, opts, hookDb, { recall: true, capture: false }, h);
+      if (ph.conflict) plan.conflicts.push(ph.conflict);
+      else if (ph.already) plan.already.push(`${who}: the start-of-session hook is already installed`);
+      else if (ph.change) {
+        if (opts.hook === "yes") wantHook = true;
+        hookPlans.set(h, ph.change);
+      }
+    }
+    // Automatic memory builds on the start-of-session hook: with --no-hook it is only added when asked for by name (--capture).
+    if (capture !== "no" && !(capture === "ask" && opts.hook === "no")) {
+      const pc = planHooks(e, opts, hookDb, { recall: opts.hook !== "no", capture: true }, h);
+      if (pc.conflict) plan.conflicts.push(pc.conflict);
+      else if (pc.already) plan.already.push(`${who}: the automatic memory hooks are already installed`);
+      else if (pc.change && pc.change.lines.some((l) => l.startsWith("record what "))) {
+        if (capture === "yes") wantCapture = true;
+        capturePlans.set(h, pc.change);
+      }
     }
   }
+  const anyHook = hookPlans.size > 0;
+  const anyCapture = capturePlans.size > 0;
 
-  if (plan.changes.length === 0 && !plan.hook && !capturePlan) {
+  if (plan.changes.length === 0 && !anyHook && !anyCapture) {
     for (const a of plan.already) io.out(`  (already fine) ${a}`);
     for (const w of plan.warnings) io.out(`  (careful) ${w}`);
     io.out(plan.already.length ? "\nNothing to change: OneMemory is already connected. To check it, run:  onememory doctor" : "\nNothing was changed.");
@@ -862,14 +992,15 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
   io.out("Please close Claude Code and Claude Desktop first: Claude Code rewrites ~/.claude.json while it runs.\n");
 
   // With automatic memory offered, its plan (which includes the start-of-session hook) is the one shown.
-  const shown = [...plan.changes, ...(capturePlan ? [capturePlan] : plan.hook ? [plan.hook] : [])];
+  const optional = hosts.flatMap((h) => capturePlans.get(h) ?? hookPlans.get(h) ?? []);
+  const shown = [...plan.changes, ...optional];
   if (shown.length) {
     io.out("The exact change" + (shown.length > 1 ? "s" : "") + ":");
     for (const c of shown) {
-      if (c === plan.hook || c === capturePlan) io.out(`  Optional, only if you agree (${c.lines.join("; ")}):`);
+      if (optional.includes(c)) io.out(`  Optional, only if you agree (${c.lines.join("; ")}):`);
       let after: string;
       try {
-        after = applyOps(c.before ?? "", c.ops);
+        after = applyFor(c.before ?? "", c.ops, c.format);
       } catch (err) {
         io.err(`I cannot make this edit safely (${(err as Error).message}). Nothing was changed.`);
         return 1;
@@ -881,10 +1012,10 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
 
   if (opts.dryRun) {
     io.out("Dry run: nothing was changed. No file was written, and no database was created or upgraded.");
-    if ((plan.hook && !wantHook) || (capturePlan && !wantCapture)) io.out("(The hooks above are only added if you say yes to them, or pass --hook / --capture.)");
+    if ((anyHook && !wantHook) || (anyCapture && !wantCapture)) io.out("(The hooks above are only added if you say yes to them, or pass --hook / --capture.)");
     return 0;
   }
-  if (plan.changes.length === 0 && !plan.hook && !capturePlan) return 0;
+  if (plan.changes.length === 0 && !anyHook && !anyCapture) return 0;
 
   if (!opts.yes) {
     if (!io.interactive) {
@@ -896,18 +1027,18 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
       io.out("Cancelled. Nothing was changed.");
       return 0;
     }
-    if (plan.hook && opts.hook === "ask") {
+    if (anyHook && opts.hook === "ask") {
       const h = (await io.ask("Also install the start-of-session hook (Claude sees your recent notes when a session starts)? Type y or n: ")).trim().toLowerCase();
       wantHook = h === "y" || h === "yes";
     }
     // Asked only after a yes to the start-of-session hook (or when it is already there): a no to that is a no to both.
-    if (capturePlan && capture === "ask" && (wantHook || !plan.hook)) {
+    if (anyCapture && capture === "ask" && (wantHook || !anyHook)) {
       const c = (await io.ask("Also record what Claude does in this project (files, commands, errors), stored only on this machine? Type y or n: ")).trim().toLowerCase();
       wantCapture = c === "y" || c === "yes";
     }
   } else {
-    if (plan.hook && opts.hook === "ask") wantHook = false; // --yes alone never adds a hook; it needs --hook
-    if (capturePlan && capture === "ask") wantCapture = false; // ... or --capture
+    if (anyHook && opts.hook === "ask") wantHook = false; // --yes alone never adds a hook; it needs --hook
+    if (anyCapture && capture === "ask") wantCapture = false; // ... or --capture
   }
 
   const dbsBefore = dbs.map((d) => ({ path: d, before: Store.peekSchemaVersion(d) }));
@@ -949,13 +1080,12 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
 
   // 2. Configuration files.
   const written: WrittenChange[] = [];
-  // The hook file: automatic memory (with the start-of-session hook when that was wanted too), else the hook alone.
-  const hookChange = wantCapture
-    ? planHooks(e, opts, primaryDbIfCustom(primaryDb, DB_PATH, opts), { recall: wantHook || (opts.hook !== "no" && !plan.hook), capture: true }).change
-    : wantHook
-      ? plan.hook
-      : null;
-  const toWrite = [...plan.changes, ...(hookChange ? [hookChange] : [])];
+  // Each hook file: automatic memory (with the start-of-session hook when that was wanted too), else the hook alone.
+  const hookChanges = hosts.flatMap((h) => {
+    const c = wantCapture ? planHooks(e, opts, hookDb, { recall: wantHook || (opts.hook !== "no" && !hookPlans.has(h)), capture: true }, h).change : wantHook ? hookPlans.get(h) : null;
+    return c ? [c] : [];
+  });
+  const toWrite = [...plan.changes, ...hookChanges];
   try {
     for (const c of toWrite) {
       const w = writeChange(e, c);
@@ -995,8 +1125,7 @@ export async function runSetup(e: SetupEnv, io: SetupIO, opts: SetupOptions): Pr
   for (const w of written) {
     try {
       const cur = readFileSync(w.real, "utf8");
-      const c = toWrite.find((x) => x.file === w.file)!;
-      if (!opsAreApplied(cur, c.ops)) missing.push(w.file);
+      if (!toWrite.filter((x) => x.file === w.file).every((c) => appliedFor(cur, c.ops, c.format))) missing.push(w.file);
     } catch {
       missing.push(w.file);
     }

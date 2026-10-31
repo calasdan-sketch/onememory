@@ -1,5 +1,5 @@
 // `onememory hook <event>`: the agent's lifecycle hooks (Claude Code: SessionStart, UserPromptSubmit, PostToolUse,
-// PostToolUseFailure, Stop, SubagentStop, SessionEnd).
+// PostToolUseFailure, Stop, SubagentStop, SessionEnd; Codex, Gemini CLI and Muse are mapped onto the same events in setup.ts hookHosts).
 //
 // FAIL-OPEN, ALWAYS: whatever happens (garbage on stdin, no database, a database from another version, a locked file, a
 // bug) the process exits 0 and prints either nothing or one valid hook JSON object on stdout. Capture is a bonus; it must
@@ -192,7 +192,11 @@ export async function runHook(eventArg: string, stdinText: string, opts: HookOpt
     process.stderr.write(`onememory hook: unknown event "${eventArg}" (one of ${HOOK_EVENTS.join(", ")}); ignored\n`);
     return "";
   }
-  const payload = parsePayload(stdinText);
+  const raw = parsePayload(stdinText);
+  // No session_id on stdin: take the agent's own variable (Muse gives MUSE_SESSION_ID, Gemini CLI GEMINI_SESSION_ID).
+  const env = opts.env ?? process.env;
+  const sid = typeof raw.session_id === "string" && raw.session_id ? raw.session_id : env.MUSE_SESSION_ID || env.GEMINI_SESSION_ID;
+  const payload = sid ? { ...raw, session_id: sid } : raw;
   try {
     await captureHook(event, payload, opts);
   } catch (e) {
