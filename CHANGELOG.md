@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims
 to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-10-31
+
+Release-only: 2.0.0 never reached npm (trusted publishing was refused). Same code as 2.0.0; releases are now staged on npm and approved by the owner.
+
 ## [2.0.0] - 2026-10-31
 
 OneMemory now remembers on its own: it records what your agent does, distills it into short typed notes, and brings the
