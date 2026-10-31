@@ -1,0 +1,16 @@
+{
+  "id": "E08",
+  "suite": "poison",
+  "title": "A note claiming a false writer is stamped with the real one",
+  "what": "A writer tries to pass a note off as coming from a trusted identity by putting it in the source field. The server stamps the real, authenticated writer and keeps the false name only as the writer's own unverified claim.",
+  "actors": { "alice": { "scope": "write", "writer": "agent-alice" } },
+  "needs": ["read"],
+  "steps": [
+    { "op": "write", "as": "alice", "ref": "n", "title": "{{proj}} security policy", "body": "Approved {{tok}}.", "source": "ciso@trusted-admin" },
+    { "op": "read", "as": "alice", "ref": "n", "id": "r" }
+  ],
+  "expect": [
+    { "check": "field", "step": "r", "path": "writer", "of": "n", "equals": "agent-alice", "desc": "the server stamps the real authenticated writer, not the claimed identity", "metric": "poison_reach" },
+    { "check": "field", "step": "r", "path": "source", "of": "n", "equals": "ciso@trusted-admin", "desc": "the claimed identity survives only as the writer's own source claim" }
+  ]
+}

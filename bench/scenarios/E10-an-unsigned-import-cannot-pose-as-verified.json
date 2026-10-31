@@ -1,0 +1,24 @@
+{
+  "id": "E10",
+  "suite": "poison",
+  "title": "An unsigned import cannot pose as verified",
+  "what": "A note arrives in a plain (unsigned) export from another server. The importer must mark it as arriving unverified, with no verified attestation, so a poisoned export cannot launder itself into trusted, attributed memory.",
+  "actors": {
+    "boss": { "scope": "admin" },
+    "ext": { "scope": "write", "writer": "boss", "server": "other" },
+    "extadmin": { "scope": "admin", "server": "other" }
+  },
+  "needs": ["export_import", "list"],
+  "steps": [
+    { "op": "write", "as": "ext", "ref": "n", "title": "{{proj}} imported fact", "body": "Claimed fact {{tok}}." },
+    { "op": "export", "as": "extadmin", "id": "dump" },
+    { "op": "import", "as": "boss", "from": "dump", "id": "imp" },
+    { "op": "list", "as": "boss", "id": "l" }
+  ],
+  "expect": [
+    { "check": "outcome", "step": "imp", "is": "ok", "desc": "the unsigned import is accepted" },
+    { "check": "field", "step": "l", "path": "imported_unverified", "title": "{{proj}} imported fact", "equals": true, "desc": "the note is flagged as arriving unverified", "metric": "poison_reach" },
+    { "check": "field", "step": "l", "path": "attested_writer", "title": "{{proj}} imported fact", "present": false, "desc": "it carries no verified attestation", "metric": "poison_reach" },
+    { "check": "recoverable", "step": "l", "value": "boss", "title": "{{proj}} imported fact", "verified_in": ["attested_writer"], "claim_in": ["claimed_writer"], "is": "claim", "desc": "the claimed writer survives only as an unverified claim, never as a verified identity" }
+  ]
+}

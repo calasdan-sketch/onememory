@@ -16,6 +16,14 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stale notes with a newer twin, quarantined writes, notes the linter flags and decay candidates, each with a fix through an existing
   safe path (supersede preview + confirm with undo, consolidate dry run, archive / restore, quarantine approve / reject). New admin
   routes `POST /quarantine/:id/approve|reject` back the dashboard buttons.
+- **Benchmark suite E, "Memory poisoning": 123 deterministic scenarios** (was 109): A 32, B 31, C 27, D 19, E 14. The new suite
+  proves injected or malicious memories do not silently reach an agent as trusted content — prompt-injection (plain, forged
+  system/tool tags, zero-width-obfuscated) is quarantined; a distrusted or low-trust writer cannot outrank or silently overwrite a
+  trusted fact; secrets are redacted on capture and blocked on write; a forged writer or namespace is stamped with the real one; an
+  unsigned import cannot pose as verified; a captured web fetch is not promoted to trusted memory; the SessionStart injection carries
+  the untrusted-data banner and leaves distrusted notes out; and mass near-duplicate flooding cannot bury the real answer. Headline
+  `poison-reach-count` must be 0. It added two bench ops (`capture`, `session_start`) to the runner. One open gap it found:
+  `GAP-POISON-MDLINK` (markdown image/link data-exfiltration payloads are not flagged).
 
 ### Changed
 - **Captured prompts and tool inputs are now encrypted at rest** when encryption is on, the same way tool outputs already were. Turning
