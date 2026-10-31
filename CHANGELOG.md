@@ -54,6 +54,24 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `--hook` / `--capture` also wire the hooks of Codex (`~/.codex/hooks.json`), Gemini CLI and Muse to `onememory hook <event>`.
 - `onememory hook`: reads Gemini CLI's `prompt_response` as the stop text, and takes the session id from `MUSE_SESSION_ID`
   or `GEMINI_SESSION_ID` when stdin has none.
+- `onememory uninstall [--dry-run] [--yes] [--purge] [--no-backup]`: replays every recorded setup in reverse (all apps,
+  MCP entries and hooks), so configs return byte for byte where nothing changed them since and files setup created are
+  deleted; entries setup did not add are listed, not touched. `--purge` then makes a final backup
+  (`~/onememory-final-backup-<time>`) and only after it worked deletes the data folder and setup's backup copies.
+- `onememory doctor` reports the data folder size (warns over 1 GB), a full capture spool, and the capture backlog
+  (events not yet distilled; warns over 10,000).
+- [docs/footprint.md](docs/footprint.md): every path OneMemory writes, when, and how to remove it.
+
+### Changed
+
+- `onememory backup` without `--out` writes to `~/onememory-backup-<time>`, not the current folder: run inside a repo,
+  the copy of your notes and key could be committed.
+
+### Fixed
+
+- Capture spool: an event that keeps failing to store is dropped after 5 drains instead of cycling forever, and a
+  `.draining` file left by a killed hook is drained later instead of staying on disk.
+- `onememory watch` stops with an error after 10 failures in a row instead of retrying every 5 s forever.
 
 ## [1.7.2] - 2026-10-25
 

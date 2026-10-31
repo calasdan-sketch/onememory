@@ -202,6 +202,18 @@ describe("watch", () => {
     s.close();
   });
 
+  test("a handler that always fails is given up on after maxFailures in a row (no endless retry)", async () => {
+    const s = new Store(":memory:");
+    runChanges(s, { since: "last", consumer: "w3" });
+    let calls = 0;
+    const loop = watchLoop(s, { consumer: "w3", waitSeconds: 1, exec: ["x"], log: () => {}, retryMs: 1, maxFailures: 3, run: async () => (calls++, 1) });
+    await sleep(100);
+    s.create({ title: "boom", source: "phone" });
+    await assert.rejects(loop, /giving up after 3 failures in a row/);
+    assert.equal(calls, 3);
+    s.close();
+  });
+
   test("a real program receives the JSON on stdin (no shell)", async () => {
     const dir = mk("om-watch-");
     try {

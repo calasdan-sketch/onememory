@@ -457,6 +457,14 @@ limits: [SECURITY.md](./SECURITY.md),
 not evidence of retrieval quality. Keyword-only `state_search` scores 0.70
 recall@1 on it. See [docs/encryption-retention.md](./docs/encryption-retention.md#the-evaluation-set).
 
+## Leaves no trace
+
+OneMemory writes to its data folder (`~/.onememory`) and, through `onememory setup`, to the one `onememory` entry in each
+app's config, with a backup beside it. Nothing lands in your projects unless you name the folder (`--project`, `--dir`,
+`--out`, `sync --git`), no `CLAUDE.md` is ever written, and every retry has a limit. `onememory uninstall` takes it out
+of every app (byte for byte where it can), `--purge` also deletes the data after a final backup. Every file, and how to
+remove it: [docs/footprint.md](./docs/footprint.md).
+
 ## Documentation
 
 | | |
@@ -477,6 +485,7 @@ recall@1 on it. See [docs/encryption-retention.md](./docs/encryption-retention.m
 | [docs/token-namespaces.md](./docs/token-namespaces.md) | per-token namespace permissions — one shared bridge, isolated agents |
 | [docs/replacing-memories.md](./docs/replacing-memories.md) | replacing a note in two steps, undo, version history and restore, confidence, the trust guard |
 | [docs/BENCHMARK.md](./docs/BENCHMARK.md) | `onememory bench`: stale memory, contradiction recovery, permission isolation, provenance retention; scenario format; adapting it to another memory system |
+| [docs/footprint.md](./docs/footprint.md) | every file OneMemory writes, where and when, how to remove it; `uninstall`; retry limits |
 | [docs/architecture.md](./docs/architecture.md) | modules, tools, REST API, schema |
 | [SKILL.md](./SKILL.md) | when and how an agent should use the memory |
 | [CHANGELOG.md](./CHANGELOG.md) | release notes |

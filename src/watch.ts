@@ -28,6 +28,8 @@ export interface WatchOpts {
   log?: (line: string) => void;
   /** Pause after a failing handler before the batch is retried. */
   retryMs?: number;
+  /** Give up (throw) after this many failures in a row, a failed wait or a failing handler (default 10): fail loudly, never loop. */
+  maxFailures?: number;
   /** Test seam: stop after this many batches. */
   maxBatches?: number;
   /** Test seam: replace the process runner. Resolves the exit code. */
@@ -70,6 +72,11 @@ async function watchLoopInner(store: Store, opts: WatchOpts): Promise<number> {
   const log = opts.log ?? ((l: string) => console.log(l));
   const run = opts.run ?? runProgram;
   let batches = 0;
+  let failures = 0;
+  const failed = async (what: string): Promise<void> => {
+    if (++failures >= (opts.maxFailures ?? 10)) throw new Error(`watch: giving up after ${failures} failures in a row (last: ${what}); fix it and start watch again`);
+    await sleep(opts.retryMs ?? 5000, opts.signal);
+  };
   while (!opts.signal?.aborted && (opts.maxBatches === undefined || batches < opts.maxBatches)) {
     let out: ChangesResponse;
     try {
@@ -80,11 +87,12 @@ async function watchLoopInner(store: Store, opts: WatchOpts): Promise<number> {
       );
     } catch (e) {
       log(`watch: ${(e as Error).message}`);
-      await sleep(opts.retryMs ?? 5000, opts.signal);
+      await failed((e as Error).message);
       continue;
     }
     if (out.changes.length === 0) {
       // Nothing for us, but the window moved: keep the marker current.
+      failures = 0;
       if (out.ack_token) ackChanges(store, { ackToken: out.ack_token, consumer: opts.consumer, namespaces: opts.namespaces, ...(opts.filter ?? {}) });
       continue;
     }
@@ -110,7 +118,8 @@ async function watchLoopInner(store: Store, opts: WatchOpts): Promise<number> {
     }
     if (ok && out.ack_token) ackChanges(store, { ackToken: out.ack_token, consumer: opts.consumer, namespaces: opts.namespaces, ...(opts.filter ?? {}) });
     batches++;
-    if (!ok) await sleep(opts.retryMs ?? 5000, opts.signal);
+    if (ok) failures = 0;
+    else await failed("the handler failed");
   }
   return batches;
 }
