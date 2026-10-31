@@ -176,7 +176,8 @@ export function normalizeForScan(text: string): string {
 // ---- Secret scanner: refuse to store high-confidence credentials ------------
 // Only known-prefix patterns are high-confidence; the entropy heuristic below
 // is reported separately (lint category "entropy", warn by default).
-const SECRET_PATTERNS: Array<[string, RegExp]> = [
+// Exported (with the shape checks below) for redact.ts: one list decides both what the linter refuses and what capture redacts.
+export const SECRET_PATTERNS: ReadonlyArray<[string, RegExp]> = [
   ["AWS access key", /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/],
   // Any PEM private key: RSA / EC / DSA / OPENSSH / PGP / ENCRYPTED / plain.
   ["private key block", /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/],
@@ -190,7 +191,7 @@ const SECRET_PATTERNS: Array<[string, RegExp]> = [
 // sk-svcacct- / sk-admin- / legacy sk-<40+ base62>. Shape (mixed case +
 // digit) is checked in code so "sk-learn-pipeline-..." slugs never match.
 const SK_KEY = /\bsk-(ant-[a-z]+\d{2}-|proj-|svcacct-|admin-)?([A-Za-z0-9_-]{20,})/g;
-function hasOpenAiAnthropicKey(text: string): boolean {
+export function hasOpenAiAnthropicKey(text: string): boolean {
   for (const m of text.matchAll(SK_KEY)) {
     const rest = m[2];
     if (!/[A-Z]/.test(rest) || !/[a-z]/.test(rest) || !/[0-9]/.test(rest)) continue;
@@ -203,7 +204,7 @@ function hasOpenAiAnthropicKey(text: string): boolean {
 // dot-split parts (linear) rather than with one unanchored regex, which
 // backtracks quadratically on "eyJ-eyJ-..." floods. The jwt.io sample
 // ("John Doe") is documentation, not a credential.
-function hasJwt(text: string): boolean {
+export function hasJwt(text: string): boolean {
   for (const m of text.matchAll(/[A-Za-z0-9_.-]{30,}/g)) {
     const parts = m[0].split(".");
     for (let i = 0; i + 2 < parts.length; i++) {
