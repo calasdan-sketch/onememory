@@ -122,6 +122,8 @@ describe("progressive disclosure tools (MCP and REST parity)", () => {
     const one = await call("session_list", { session: "sess-a" });
     assert.ok(one.rows.length >= 2 && one.summary.kind === "summary");
     assert.equal((await rest("/sessions/sess-a")).body.rows.length, one.rows.length);
+    assert.deepEqual(one.prompts.map((p: any) => p.text), ["fix the date parser"], "the session's prompts come with its timeline");
+    assert.deepEqual((await rest("/sessions/sess-a")).body.prompts, one.prompts);
     assert.equal((await rest("/sessions/nope")).status, 404);
     const ft = await rest("/files/timeline?path=src/date.ts");
     assert.deepEqual(ft.body.rows.map((r: any) => r.id), byIds(byFileRows(await call("memory_index", { file: "src/date.ts" }))));

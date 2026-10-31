@@ -61,6 +61,7 @@ export const DASHBOARD_HTML = `<!doctype html>
   <button class="ghost" onclick="toggleNew()">+ New</button>
   <button class="ghost" onclick="load()">Refresh</button>
   <button class="ghost" onclick="loadChanges()" title="What changed in the last 24 hours">Changes</button>
+  <button class="ghost" onclick="loadSessions()" title="Agent sessions OneMemory recorded, each with its timeline">Sessions</button>
   <button class="ghost" onclick="loadReview()" title="Notes written by agents that you have not looked at yet">Review</button>
   <label class="chk" title="Also show notes written by writers an admin distrusts (marked DISTRUSTED)"><input type="checkbox" id="inc" onchange="load()"> distrusted</label>
 </header>
@@ -262,6 +263,50 @@ function acceptNote(id){
     var tags = (n.tags || []).filter(function(t){ return t !== "reviewed"; }).concat(["reviewed"]);
     return api("/notes/" + id, { method:"PUT", body: JSON.stringify({ tags: tags, if_rev: n.rev }) });
   }).then(loadReview).catch(function(e){ alert(e.message); });
+}
+
+// ---- Sessions: what the capture hooks recorded, one session at a time (GET /sessions, GET /sessions/:id) ----
+// Everything shown is stored text (prompts, titles, folders, even the session id), so all of it goes through esc(); the
+// session id reaches the click handler through a data attribute, never spliced into script.
+function nsQs(sep){
+  var ns = document.getElementById("ns").value.trim();
+  var qs = (ns ? ("namespace=" + encodeURIComponent(ns)) : "") + (inc() ? ((ns ? "&" : "") + "include_distrusted=1") : "");
+  return qs ? (sep + qs) : "";
+}
+function when(s){ return esc(String(s||"").slice(0,16).replace("T"," ")); }
+function loadSessions(){
+  VIEW = "sessions";
+  api("/sessions?limit=100" + nsQs("&")).then(function(j){
+    var ss = j.sessions || [];
+    document.getElementById("count").textContent = ss.length + " session" + (ss.length===1?"":"s");
+    document.getElementById("list").innerHTML = ss.length ? ss.map(function(s){
+      return "<div class='card'><div class='cardhead'><div><h3>"+esc(s.summary || "(no summary yet)")+"</h3>"+
+        "<div class='meta'>"+when(s.started_at)+(s.ended_at ? " to "+when(s.ended_at) : " &middot; open")+" &middot; "+esc(s.namespace)+
+        " &middot; "+esc(s.cwd)+" &middot; "+Number(s.prompt_count||0)+" prompts, "+Number(s.event_count||0)+" events</div></div>"+
+        "<button class='ghost' data-sid='"+esc(s.id)+"' onclick='loadSession(this.getAttribute(&quot;data-sid&quot;))'>Timeline</button></div></div>";
+    }).join("") : "<p class='muted'>No sessions recorded yet (onememory setup --capture installs the hooks).</p>";
+  }).catch(function(e){ incRefused(e); document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
+}
+// One session: the summary on top, then prompts and observations merged oldest first.
+function loadSession(id){
+  VIEW = "session";
+  api("/sessions/" + encodeURIComponent(id) + nsQs("?")).then(function(j){
+    var items = (j.prompts || []).map(function(p){ return { at: p.at, html: "<span class='tag'>prompt</span>"+esc(p.text) }; })
+      .concat((j.rows || []).filter(function(r){ return r.kind !== "summary"; }).map(function(r){
+        return { at: r.date, html: "<span class='tag'>"+esc(r.type)+"</span>#"+Number(r.id)+" "+esc(r.title)+
+          (r.distrusted ? "<span class='badge-bad'>DISTRUSTED</span>" : "")+
+          ((r.files||[]).length ? "<div class='meta'>"+(r.files||[]).map(esc).join(", ")+"</div>" : "") };
+      }));
+    items.sort(function(a,b){ return a.at < b.at ? -1 : a.at > b.at ? 1 : 0; });
+    var s = j.session || {}, sum = j.summary;
+    document.getElementById("count").textContent = items.length + " timeline entr" + (items.length===1?"y":"ies");
+    document.getElementById("list").innerHTML = "<div class='row'><a class='linkish' onclick='loadSessions()'>&larr; all sessions</a>"+
+      "<span class='muted'>"+esc(s.id)+" &middot; "+esc(s.cwd)+"</span></div>"+
+      (sum ? "<div class='card'><h3>"+esc(sum.title)+"</h3><div class='meta'>summary #"+Number(sum.id)+" &middot; "+when(sum.updated_at)+"</div>"+
+        "<div class='body'>"+esc(sum.body)+"</div></div>" : "")+
+      (items.length ? items.map(function(it){ return "<div class='card'><div class='meta'>"+when(it.at)+"</div>"+it.html+"</div>"; }).join("")
+        : "<p class='muted'>Nothing recorded in this session yet.</p>");
+  }).catch(function(e){ incRefused(e); document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
 }
 
 function addNote(){

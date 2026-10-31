@@ -194,11 +194,26 @@ export function sessionList(store: Store, scope: ReadScope, limit?: number): { s
   };
 }
 
-export function sessionGet(store: Store, scope: ReadScope, id: string): { session: SessionRow; summary: NoteRecord | null; rows: IndexRow[] } | null {
+/** At most this many prompts (each cut to PROMPT_MAX characters) come with one session. */
+const MAX_PROMPTS = 50;
+const PROMPT_MAX = 500;
+
+/**
+ * One session: its row, summary, observations (oldest first) and the prompts typed in it. The prompts are the capture
+ * events' already-redacted text, so they are only there while the raw events are kept (ONEMEMORY_CAPTURE_RETENTION_DAYS);
+ * the summary's "Request:" line outlives them.
+ */
+export function sessionGet(store: Store, scope: ReadScope, id: string): { session: SessionRow; summary: NoteRecord | null; rows: IndexRow[]; prompts: Array<{ at: string; text: string }> } | null {
   const s = sessionRow(store, scope, id);
   if (!s) return null;
   const summary = s.summary_note_id !== null ? readable(store, scope, s.summary_note_id) : null;
-  return { session: s, summary, rows: toRows(store, find(store, { ...scope, namespaces: [s.namespace] }, { session: id, order: "created_asc" }, 200)) };
+  const prompts = (
+    store
+      .captureDb()
+      .prepare("SELECT at, input FROM capture_events WHERE session_id = ? AND event = 'user-prompt' ORDER BY seq LIMIT ?")
+      .all(id, MAX_PROMPTS) as Array<{ at: string; input: string }>
+  ).map((p) => ({ at: p.at, text: p.input.length > PROMPT_MAX ? p.input.slice(0, PROMPT_MAX - 1) + "…" : p.input }));
+  return { session: s, summary, rows: toRows(store, find(store, { ...scope, namespaces: [s.namespace] }, { session: id, order: "created_asc" }, 200)), prompts };
 }
 
 export function fileTimeline(store: Store, scope: ReadScope, path: string, limit?: number): { path: string; rows: IndexRow[] } {
