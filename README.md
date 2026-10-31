@@ -135,6 +135,39 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 
 ---
 
+## Automatic memory
+
+OneMemory can also remember what Claude Code *does*, without anyone writing a note:
+
+```bash
+onememory setup --capture        # or answer y to "Also record what Claude does in this project ...?"
+```
+
+- **What is recorded:** prompts, tool calls, file edits, commands and their errors, through Claude Code's hooks
+  (`onememory hook <event>`). Only on this machine, in the same SQLite file; raw events are deleted after 7 days
+  (`ONEMEMORY_CAPTURE_RETENTION_DAYS`).
+- **What is kept:** a free, deterministic distiller (no model call) turns each session into a few **observations**
+  (a commit typed by its `fix:` / `feat:` / `refactor:` prefix, a test that failed and then passed, a decision you
+  stated, a secret that was kept out) and one **session summary** (request, files, commands, outcome, next step).
+  They are ordinary notes with a `kind`, so lint, quarantine, history, search and the trust policy apply to them,
+  and they never show up in `state_list` / `state_search` unless asked for.
+- **Private by default:** `<private>...</private>` blocks are dropped and secrets are replaced with
+  `[REDACTED:<type>]` *before* anything is stored. `ONEMEMORY_CAPTURE=off` stops it; `ONEMEMORY_CAPTURE_EXCLUDE`
+  skips folders; `ONEMEMORY_CAPTURE_SKIP_TOOLS` skips tools.
+- **Never in the way:** every hook exits 0 and never migrates the database. If the database is busy or from another
+  version, the (already redacted) event waits in a spool file and is stored by a later hook.
+- **Back at the next session:** the start-of-session context is ranked by what you are working on (git branch, changed
+  files, recent work), packed into `ONEMEMORY_RECALL_TOKENS` (1500), and ends with what it stands in for.
+- **Looking things up:** `memory_index` (compact rows) → `memory_timeline` (what happened around one) →
+  `memory_get` (full text, cite as `om:#id`), plus `session_list`. REST: `GET /index`, `GET /timeline`, `POST /get`,
+  `GET /sessions`, `GET /files/timeline?path=`. The [onememory-mem skill](./skills/onememory-mem/SKILL.md) teaches
+  an agent this order.
+
+`onememory doctor` shows whether the hooks are wired, the last captured event and the spool size;
+`onememory setup --undo` takes the hooks out again.
+
+---
+
 ## What makes it different
 
 - **Small footprint.** One Node process, one SQLite file, **2 direct runtime
