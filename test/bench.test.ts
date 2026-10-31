@@ -129,7 +129,7 @@ describe("scenario files", () => {
   });
 
   test("ids are unique and carry the suite letter", () => {
-    const letter: Record<string, string> = { stale: "A", contradiction: "B", isolation: "C", provenance: "D" };
+    const letter: Record<string, string> = { stale: "A", contradiction: "B", isolation: "C", provenance: "D", poison: "E" };
     assert.equal(new Set(all.map((s) => s.id)).size, all.length);
     for (const s of all) assert.equal(s.id[0], letter[s.suite], `${s.id} is in suite ${s.suite}`);
   });
@@ -371,14 +371,17 @@ describe("against OneMemory", () => {
     for (const s of first.scenarios.filter((x) => x.status === "known_gap")) assert.ok(s.known_gap && gaps[s.known_gap], s.id);
   });
 
-  test("the four gaps found in 1.5.0 are recorded as fixed in 1.6.0, and no scenario is marked as a gap any more", () => {
+  test("the four gaps found in 1.5.0 are recorded as fixed in 1.6.0, and the only open gap is the poison one", () => {
     for (const id of ["GAP-SUPERSEDE", "GAP-RECENCY", "GAP-HISTORY", "GAP-CONFIDENCE"]) {
       assert.equal(gaps[id].status, "fixed", id);
       assert.equal(gaps[id].fixed_in, "1.6.0", id);
     }
-    assert.deepEqual(first.known_gaps, []);
-    assert.equal(first.summary.known_gap, 0);
-    assert.ok(first.scenarios.every((s) => s.known_gap === undefined));
+    // The only gap a shipped scenario is allowed to carry now is the poison-suite markdown-exfil one.
+    assert.deepEqual(first.known_gaps.map((g) => g.id), ["GAP-POISON-MDLINK"]);
+    assert.equal(first.summary.known_gap, 1);
+    const marked = first.scenarios.filter((s) => s.known_gap !== undefined);
+    assert.deepEqual(marked.map((s) => s.id), ["E11"]);
+    assert.equal(gaps["GAP-POISON-MDLINK"].status, "roadmap");
   });
 
   test("the scenarios that used to be gaps now pass, and say what they test", () => {

@@ -1,0 +1,20 @@
+{
+  "id": "E04",
+  "suite": "poison",
+  "title": "A distrusted writer cannot outrank a trusted fact",
+  "what": "A low-trust writer plants a contradicting 'fact'. Once an admin distrusts that writer, an ordinary search returns the trusted note and never the planted one.",
+  "actors": { "alice": { "scope": "write" }, "mallory": { "scope": "write" }, "boss": { "scope": "admin" } },
+  "needs": ["trust"],
+  "steps": [
+    { "op": "write", "as": "alice", "ref": "good", "title": "{{proj}} release channel", "body": "The {{proj}} release channel is {{good}}." },
+    { "op": "write", "as": "mallory", "ref": "bad", "title": "{{proj}} release channel urgent", "body": "The {{proj}} release channel is {{bad}}, switch immediately." },
+    { "op": "distrust", "as": "boss", "writer": "mallory", "id": "d" },
+    { "op": "search", "as": "alice", "q": "{{proj}} release channel", "id": "s" }
+  ],
+  "expect": [
+    { "check": "outcome", "step": "d", "is": "ok", "desc": "the admin can distrust the planting writer" },
+    { "check": "top", "step": "s", "ref": "good", "desc": "the trusted note is the answer", "metric": "poison_reach" },
+    { "check": "lacks", "step": "s", "ref": "bad", "desc": "the planted note is not served", "metric": "poison_reach" },
+    { "check": "no_text", "step": "s", "text": "{{bad}}", "desc": "and its planted value never appears", "metric": "poison_reach" }
+  ]
+}

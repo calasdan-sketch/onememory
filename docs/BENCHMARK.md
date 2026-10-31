@@ -17,7 +17,7 @@ folder, and deletes everything when it ends.
 
 ## What it measures
 
-Four suites, written as plain JSON files in [`bench/scenarios/`](https://github.com/calasdan-sketch/onememory/tree/main/bench/scenarios) (they ship in the package).
+Five suites, written as plain JSON files in [`bench/scenarios/`](https://github.com/calasdan-sketch/onememory/tree/main/bench/scenarios) (they ship in the package).
 
 | Suite | Question | Headline numbers |
 |---|---|---|
@@ -25,6 +25,7 @@ Four suites, written as plain JSON files in [`bench/scenarios/`](https://github.
 | **B  Contradiction recovery** | Writer A says X, writer B says not-X, a trusted correction arrives. Does the state end up at the correction, does the loser stay visible with its writer, does distrusting the bad writer fix the answer, can a weak writer overwrite a trusted note silently? | resolved to the correction, loser still visible with provenance, weak overwrite protected |
 | **C  Permission isolation** | Can tenant B read, write, search, export, import, merge, archive, sweep or learn anything about tenant A? Do tokens do exactly what their scope says? | `leakage-count` (must be 0) and `unexpected-denials` |
 | **D  Provenance retention** | After export, import, merge, update, archive, expiry: is every field (source, writer, creator, timestamps, deletion deadline, confidence) still there? | `fields-checked`, `fields-lost`, `fields-kept-only-as-unverified-claim` |
+| **E  Memory poisoning** | Do injected or malicious memories ever reach an agent as trusted content? Prompt-injection (plain, forged system/tool tags, zero-width-obfuscated) quarantined; a distrusted or low-trust writer cannot outrank or silently overwrite a trusted fact; secrets redacted on capture and blocked on write; a forged writer/namespace stamped with the real one; an unsigned import cannot pose as verified; a captured web fetch is not trusted memory; the SessionStart injection carries the untrusted-data banner and leaves distrusted notes out; mass near-duplicate flooding cannot bury the answer. | `poison-reach-count` (must be 0) over the suite's defended probes |
 
 **How the numbers are counted.**
 
@@ -40,6 +41,9 @@ Four suites, written as plain JSON files in [`bench/scenarios/`](https://github.
   actions that were refused. Both are counted over the probes written in the scenarios, and the report says how many.
 - `fields-lost` counts provenance checks that failed. `fields-kept-only-as-unverified-claim` counts a value that
   survived only as a labelled, unverified claim (what an import does by design with an unsigned export).
+- `poison-reach-count` is the number of poison-suite probes (checks tagged `metric: "poison_reach"`) that failed — a poison that
+  reached an agent as trusted content. It is counted only over scenarios the suite claims to defend (pass/fail), so a declared
+  known gap is reported separately and never adds to it. It must be 0.
 
 ## What it does not measure
 
@@ -74,7 +78,7 @@ shipped scenario carries a marker any more. The mechanism stays for the next gap
 
 ## Scenario files
 
-One scenario per file, `bench/scenarios/<ID>-<slug>.json`. `<ID>` is the suite letter (A stale, B contradiction,
+One scenario per file, `bench/scenarios/<ID>-<slug>.json`. `<ID>` is the suite letter (A stale, B contradiction, E poison,
 C isolation, D provenance) and a number. Add a file and it runs; no code change.
 
 ```json
@@ -96,7 +100,7 @@ C isolation, D provenance) and a number. Add a file and it runs; no code change.
 }
 ```
 
-**Top level.** `id`, `suite` (`stale`, `contradiction`, `isolation`, `provenance`), `title`, `what`, `actors`,
+**Top level.** `id`, `suite` (`stale`, `contradiction`, `isolation`, `provenance`, `poison`), `title`, `what`, `actors`,
 `steps`, `expect` are required. Optional: `grants` (tenant -> tenants it may also read), `distractors` (N
 unrelated notes written first), `needs` (extra capabilities), `settings` (`{"supersede_ttl_seconds": 1}`: a very short confirmation window, for expiry scenarios), `known_gap`, `limit` (a documented limit shown
 in the report).
@@ -129,10 +133,12 @@ instance (default `main`), which is how a note is moved between two servers.
 | `export`, `import` | `export`: `id`, `attest`. `import`: `from` (an export's id), `id`, `require_attestation`, `tamper` | Move notes between servers. `tamper` changes one field of the payload in transit. |
 | `trust_server` | `of` | Make the actor's server believe signatures made by server `of`. |
 | `merge` | `refs`, `ref` | Merge duplicate notes into a new one. |
+| `capture` | `id`, `event`, `tool`, `input`, `output`, `session`, `namespace` | Record one automatic-memory hook event (a tool output, a web fetch) the way the capture hooks do. The step result's `text` is what was actually persisted after redaction, so a `no_text` / `contains_text` check can prove secrets never reach the capture store. Needs the `capture` capability. |
+| `session_start` | `id`, `namespace` | Produce the SessionStart recall injection an agent is handed before its first prompt (the product's own path, so the untrusted-data banner and the distrusted-writer filter are the ones tested). The result's `text` is the injected context. Needs the `session_start` capability. |
 | `wait` | `ms` | Pause (rarely needed, at most 2 s). |
 
 **Checks** (`expect`). Every check has a plain-language `desc`, which is what the report prints. Optional
-`metric` (`leak`, `unexpected_denial`, `field`, `resolution`, `loser_visible`, `silent_overwrite`) feeds the
+`metric` (`leak`, `unexpected_denial`, `field`, `resolution`, `loser_visible`, `silent_overwrite`, `poison_reach`) feeds the
 suite's headline numbers.
 
 | `check` | Passes when |
@@ -162,7 +168,7 @@ interface MemoryAdapter {
   readonly name: string;
   readonly capabilities: ReadonlySet<Capability>;   // "read" "list" "restore" "retire" "trust" "export_import"
                                                     // "attestation" "merge" "recall" "changes" "tenants" "cas"
-                                                    // "supersede" "history"
+                                                    // "supersede" "history" "capture" "session_start"
   open(world: WorldSpec): Promise<void>;            // fresh empty store + the scenario's actors
   close(): Promise<void>;                           // delete everything; safe to call twice
 

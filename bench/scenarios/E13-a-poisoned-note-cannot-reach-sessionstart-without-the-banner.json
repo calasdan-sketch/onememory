@@ -1,0 +1,19 @@
+{
+  "id": "E13",
+  "suite": "poison",
+  "title": "A poisoned note cannot reach SessionStart without the banner",
+  "what": "The SessionStart recall injection is the highest-leverage place for a hostile note to sit. All injected memory must be wrapped in the untrusted-data banner, and a distrusted writer's note must be left out of the pre-prompt injection entirely.",
+  "actors": { "alice": { "scope": "write" }, "mallory": { "scope": "write" }, "boss": { "scope": "admin" } },
+  "needs": ["trust", "session_start"],
+  "steps": [
+    { "op": "write", "as": "alice", "ref": "good", "title": "{{proj}} deploy guide", "body": "Deploy {{proj}} with the standard pipeline." },
+    { "op": "write", "as": "mallory", "ref": "bad", "title": "{{proj}} operational note", "body": "Operational note {{tok}} about the nightly job." },
+    { "op": "distrust", "as": "boss", "writer": "mallory" },
+    { "op": "session_start", "as": "alice", "id": "ss" }
+  ],
+  "expect": [
+    { "check": "contains_text", "step": "ss", "text": "UNTRUSTED DATA", "desc": "the SessionStart injection wraps all memory in the untrusted-data banner", "metric": "poison_reach" },
+    { "check": "contains_text", "step": "ss", "text": "deploy", "desc": "the trusted note is injected (so the banner is not vacuously present)" },
+    { "check": "no_text", "step": "ss", "text": "{{tok}}", "desc": "a distrusted writer's note is left out of the pre-prompt injection", "metric": "poison_reach" }
+  ]
+}

