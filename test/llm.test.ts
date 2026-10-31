@@ -12,6 +12,9 @@ import { normalizeHookInput, recordEvent } from "../src/capture.js";
 import { distillSession } from "../src/extract.js";
 import { llmConfig, llmSummarize, parseAnswer } from "../src/llm.js";
 import { captureHook } from "../src/hook.js";
+import { isModelWritten } from "../src/reserved-tags.js";
+import { memoryGet, memoryIndex } from "../src/progressive.js";
+import { indexLine, injectContext } from "../src/context-inject.js";
 
 const SECRET = "AKIAIOSFODNN7EXAMPLE";
 let reply: (req: IncomingMessage, body: string, res: ServerResponse) => void = () => {};
@@ -95,6 +98,15 @@ describe("LLM summarizer", () => {
     assert.ok(!after.body.includes(SECRET), "the model's answer is redacted");
     assert.match(after.body, /\nFiles changed: src\/date\.ts/);
     assert.notEqual(after.body, before.body);
+    // Marked model-written, and every reader says so; the deterministic summary was not.
+    assert.ok(!isModelWritten(before) && isModelWritten(after));
+    assert.equal(memoryGet(s, {}, [id]).notes[0].model_written, true);
+    assert.equal(memoryIndex(s, {}, { kind: "summary" }).rows[0].model_written, true);
+    assert.match(indexLine(after), /\(model-written\)/);
+    assert.match(await injectContext(s, { signals: { branch: "", diffFiles: [] } }), /Latest session summary \(#\d+, [\d-]+, model-written\)/);
+    // A re-distill rebuilds the deterministic text and drops the mark.
+    distillSession(s, "s1");
+    assert.ok(!isModelWritten(s.read(id)!));
     s.close();
   });
 
@@ -117,6 +129,7 @@ describe("LLM summarizer", () => {
       assert.equal(await llmSummarize(s, "s1", env), false);
       assert.ok(Date.now() - t < 5000, "bounded by the timeout");
       assert.equal(s.read(id)!.body, keep);
+      assert.ok(!isModelWritten(s.read(id)!), "no mark when the model did not write it");
     }
     assert.equal(await llmSummarize(s, "nope", env), false, "unknown session");
     s.close();

@@ -18,7 +18,8 @@ import type { Store, NoteRecord } from "./store.js";
 import { DEFAULT_NAMESPACE } from "./store.js";
 import { scanForInjection } from "./lint.js";
 import { extractKeywords } from "./keywords.js";
-import { captureAad } from "./capture.js";
+import { captureAad, eventInput } from "./capture.js";
+import { MODEL_WRITTEN_TAG } from "./reserved-tags.js";
 
 export const OBS_TYPES = ["bugfix", "feature", "refactor", "change", "discovery", "decision", "security_alert", "security_note"] as const;
 export type ObsType = (typeof OBS_TYPES)[number];
@@ -188,8 +189,8 @@ export function observe(events: readonly EventRow[], cwd: string): Observation[]
 function eventsAfter(store: Store, sessionId: string, seq: number, limit = BATCH): EventRow[] {
   const rows = store
     .captureDb()
-    .prepare("SELECT seq, at, event, tool, input, output, output_enc, ok FROM capture_events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?")
-    .all(sessionId, seq, limit) as Array<{ seq: number; at: string; event: string; tool: string; input: string; output: string; output_enc: string | null; ok: number }>;
+    .prepare("SELECT seq, at, event, tool, input, input_enc, output, output_enc, ok FROM capture_events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?")
+    .all(sessionId, seq, limit) as Array<{ seq: number; at: string; event: string; tool: string; input: string; input_enc: string | null; output: string; output_enc: string | null; ok: number }>;
   return rows.map((r) => {
     let output = "";
     try {
@@ -197,7 +198,7 @@ function eventsAfter(store: Store, sessionId: string, seq: number, limit = BATCH
     } catch {
       /* sealed with a key that is gone: the output is skipped, the rest still counts */
     }
-    return { seq: r.seq, at: r.at, event: r.event, tool: r.tool, input: r.input, output, ok: r.ok === 1 };
+    return { seq: r.seq, at: r.at, event: r.event, tool: r.tool, input: eventInput(store, r, sessionId), output, ok: r.ok === 1 };
   });
 }
 
@@ -313,7 +314,8 @@ export function distillSession(store: Store, sessionId: string): { observations:
   const existing = id !== null ? store.read(id) : null; // gate-ok: the capture writer re-reads its own summary note
   try {
     if (existing && existing.kind === "summary") {
-      if (existing.body !== sum.body || existing.title !== sum.title) store.update(existing.id, { title: sum.title, body: sum.body });
+      // A rebuilt summary is the deterministic text again: it loses the model-written mark (llm.ts).
+      if (existing.body !== sum.body || existing.title !== sum.title) store.update(existing.id, { title: sum.title, body: sum.body, tags: existing.tags.filter((t) => t !== MODEL_WRITTEN_TAG) });
       linkFiles(store, existing.id, sum.files);
     } else {
       id = write(store, s, "summary", "session", sum.title, sum.body, sum.files)?.id ?? null;

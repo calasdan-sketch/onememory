@@ -31,6 +31,10 @@ export const RESERVED_TAG_PREFIX = "task.";
 export const CAPTURE_TAG_PREFIX = "obs.";
 const RESERVED_EXACT = new Set(["task", "handoff", "observation", "summary"]);
 
+/** v16: set by llm.ts on a session summary the local model rewrote (reserved by the obs. prefix, so no note can fake it). */
+export const MODEL_WRITTEN_TAG = "obs.writer:model";
+export const isModelWritten = (n: { tags: readonly string[] }): boolean => n.tags.includes(MODEL_WRITTEN_TAG);
+
 export function isReservedTag(tag: string): boolean {
   const t = tag.trim();
   return RESERVED_EXACT.has(t) || t.startsWith(RESERVED_TAG_PREFIX) || t.startsWith(CAPTURE_TAG_PREFIX);

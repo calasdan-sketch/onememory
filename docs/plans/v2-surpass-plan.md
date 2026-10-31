@@ -16,7 +16,8 @@ Phase 2 status: done.
 - src/llm.ts: OpenAI-compatible chat call at session-end only; loopback only unless ONEMEMORY_LLM_ALLOW_REMOTE=1; redirects refused; written via Store.update (lint/quarantine); facts lines (files, commands, errors, outcome) kept under the model's text.
 - ONEMEMORY_EMBEDDINGS=auto in src/embeddings.ts: silent, 60 s back-off after a failure, 5 s default timeout.
 - Phase 1 known gaps closed: export/import and vault sync carry kind/session_id/obs_type/files (and recreate the session row); accessStats/staleCount/consolidation ignore captured rows; encrypt enable/disable reseal capture_events outputs.
-- Still open: capture_events.input (prompts, tool inputs) is redacted but stored in plaintext even with encryption on (only outputs are sealed, as designed in Phase 1); the LLM summary is not marked as model-written.
+- Closed: capture_events.input is now sealed into input_enc like the output (own AAD, so the two envelopes cannot be swapped; `encrypt enable/disable` reseal both; first-v16 databases get the column on open). An LLM-rewritten summary carries the reserved tag `obs.writer:model`, shown as "(model-written)" by memory_get / memory_index (`model_written: true`) and the SessionStart injection; a re-distill drops it.
+- Still open: titles of capture-written notes (like every note title) stay plaintext with encryption on, so a prompt quoted in a summary title is readable at rest; the JSONL spool holds redacted events in plaintext until drained.
 
 Phase 3: transcript watcher for hookless hosts, Cursor/Codex/Gemini installers, bench/vs-claude-mem.
 

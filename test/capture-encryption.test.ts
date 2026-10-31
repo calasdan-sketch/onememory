@@ -6,8 +6,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../src/store.js";
 import { ensureKey } from "../src/crypto.js";
-import { normalizeHookInput, recordEvent } from "../src/capture.js";
+import { DatabaseSync } from "node:sqlite";
+import { normalizeHookInput, recordEvent, eventInput, captureAad } from "../src/capture.js";
 import { distillSession } from "../src/extract.js";
+import { sessionGet } from "../src/progressive.js";
 
 const MARK = "zebra-quokka-output";
 
@@ -55,6 +57,66 @@ describe("encryption toggle and captured data", () => {
       assert.ok(outputs(s).every((r) => r.output_enc === null && r.output !== ""), "every output open again");
       assert.ok(outputs(s).some((r) => r.output.includes(MARK)));
       assert.deepEqual(captured(s).map((n) => [n.id, n.body]), before);
+      s.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  });
+
+  test("inputs (prompts, tool inputs) are sealed like outputs, readable by the distiller and session_get, resealed by enable/disable", () => {
+    const dir = mkdtempSync(join(tmpdir(), "om-capin-"));
+    const IN = "walrus-pelican-prompt";
+    const CMD = "heron-otter-command";
+    try {
+      const db = join(dir, "state.db");
+      const key = ensureKey(dir);
+      let s = new Store(db);
+      const steps: Array<[any, Record<string, unknown>]> = [
+        ["user-prompt", { prompt: `please ${IN}` }],
+        ["post-tool", { tool_name: "Bash", tool_input: { command: `echo ${CMD}` }, tool_response: { stdout: "done" } }],
+        ["stop", {}],
+      ];
+      steps.forEach(([ev, raw], i) => recordEvent(s, normalizeHookInput(ev, { session_id: "s1", cwd: "/w", ...raw }, new Date(Date.now() - 60_000 + i * 1000)), "default"));
+      const inputs = (st: Store) => st.captureDb().prepare("SELECT seq, input, input_enc, output, output_enc FROM capture_events WHERE input <> '' OR input_enc IS NOT NULL").all() as Array<{ seq: number; input: string; input_enc: string | null; output: string; output_enc: string | null }>;
+      assert.ok(inputs(s).length >= 2 && inputs(s).every((r) => r.input === "" && r.input_enc && !r.input_enc.includes(IN) && !r.input_enc.includes(CMD)), "ciphertext at rest");
+      s.close();
+      assert.ok(!readFileSync(db).includes(IN) && !readFileSync(db).includes(CMD), "no plaintext input in the file");
+      s = new Store(db);
+      const sumId = distillSession(s, "s1").summaryId!;
+      assert.match(s.read(sumId)!.body, new RegExp(IN), "the distiller opens the sealed prompt");
+      assert.match(sessionGet(s, {}, "s1")!.prompts[0].text, new RegExp(IN), "session_get opens it too");
+
+      // The input and output envelopes are bound to their field: swapped, neither opens.
+      const r = inputs(s).find((x) => x.output_enc)!;
+      s.captureDb().prepare("UPDATE capture_events SET input_enc = ?, output_enc = ? WHERE seq = ?").run(r.output_enc, r.input_enc, r.seq);
+      const swapped = inputs(s).find((x) => x.seq === r.seq)!;
+      assert.equal(eventInput(s, swapped, "s1"), "", "a swapped output envelope does not open as an input");
+      assert.throws(() => s.openCapture(swapped.output, swapped.output_enc, captureAad(swapped.seq, "s1")));
+      s.captureDb().prepare("UPDATE capture_events SET input_enc = ?, output_enc = ? WHERE seq = ?").run(r.input_enc, r.output_enc, r.seq);
+
+      s.decryptAll(key);
+      assert.ok(inputs(s).every((x) => x.input_enc === null && x.input !== ""), "disable opens every input");
+      assert.ok(inputs(s).some((x) => x.input.includes(IN)));
+      s.encryptAll(key);
+      assert.ok(inputs(s).every((x) => x.input === "" && x.input_enc), "enable seals them again");
+      assert.match(sessionGet(s, {}, "s1")!.prompts[0].text, new RegExp(IN));
+      s.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  });
+
+  test("a database from the first v16 builds (no input_enc column) gets it on open", () => {
+    const dir = mkdtempSync(join(tmpdir(), "om-capcol-"));
+    try {
+      const db = join(dir, "state.db");
+      new Store(db).close();
+      const raw = new DatabaseSync(db);
+      raw.exec("ALTER TABLE capture_events DROP COLUMN input_enc");
+      raw.close();
+      const s = new Store(db);
+      recordEvent(s, normalizeHookInput("user-prompt", { session_id: "s1", cwd: "/w", prompt: "hello" }), "default");
+      assert.equal((s.captureDb().prepare("SELECT input FROM capture_events").get() as { input: string }).input, "hello");
       s.close();
     } finally {
       rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

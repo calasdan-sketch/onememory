@@ -148,9 +148,13 @@ export function recordEvent(store: Store, ev: CaptureEvent, namespace: string): 
         .run(ev.session_id, namespace, ev.cwd, ev.at).changes ?? 0
     );
     const res = db
-      .prepare("INSERT INTO capture_events (session_id, at, event, tool, input, output, output_enc, ok, bytes) VALUES (?, ?, ?, ?, ?, '', NULL, ?, ?)")
-      .run(ev.session_id, ev.at, ev.event, ev.tool, ev.input, ev.ok ? 1 : 0, ev.bytes);
+      .prepare("INSERT INTO capture_events (session_id, at, event, tool, input, input_enc, output, output_enc, ok, bytes) VALUES (?, ?, ?, ?, '', NULL, '', NULL, ?, ?)")
+      .run(ev.session_id, ev.at, ev.event, ev.tool, ev.ok ? 1 : 0, ev.bytes);
     const seq = Number(res.lastInsertRowid);
+    if (ev.input) {
+      const sealed = store.sealCapture(ev.input, captureAad(seq, ev.session_id, "input"));
+      db.prepare("UPDATE capture_events SET input = ?, input_enc = ? WHERE seq = ?").run(sealed.text, sealed.enc, seq);
+    }
     if (ev.output) {
       const sealed = store.sealCapture(ev.output, captureAad(seq, ev.session_id));
       db.prepare("UPDATE capture_events SET output = ?, output_enc = ? WHERE seq = ?").run(sealed.text, sealed.enc, seq);
@@ -172,8 +176,17 @@ export function recordEvent(store: Store, ev: CaptureEvent, namespace: string): 
   }
 }
 
-/** AAD binding a sealed event output to its row (crypto.ts, where every AAD lives). */
+/** AAD binding a sealed event output / input to its row (crypto.ts, where every AAD lives). */
 export { captureAad } from "./crypto.js";
+
+/** A stored event's input, opened like its output; "" when it was sealed with a key that is gone. */
+export function eventInput(store: Store, r: { seq: number; input: string; input_enc: string | null }, sessionId: string): string {
+  try {
+    return store.openCapture(r.input, r.input_enc, captureAad(r.seq, sessionId, "input"));
+  } catch {
+    return "";
+  }
+}
 
 // ---- spool ------------------------------------------------------------------------------------------------------------
 

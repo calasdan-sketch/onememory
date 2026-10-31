@@ -6,6 +6,12 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Captured prompts and tool inputs are now encrypted at rest** when encryption is on, the same way tool outputs already were. Turning
+  encryption on or off seals or opens them too. Databases made by earlier test builds of this version get the new column when opened.
+- **Session summaries rewritten by the local model are labelled.** `memory_get` and `memory_index` mark them `model_written`, and the
+  session-start context and index lines say "(model-written)". The file, command and outcome lines under them are still the automatic ones.
+
 ## [1.7.2] - 2026-10-25
 
 Windows fixes only. **No schema change** (still v15).

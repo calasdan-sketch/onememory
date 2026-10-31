@@ -9,6 +9,8 @@
 // (undefined = the whole store, the legacy no-resolution mode) and whether distrusted writers are shown.
 import type { Store, NoteRecord, NoteKind } from "./store.js";
 import { NOTE_KINDS, ValidationError } from "./store.js";
+import { isModelWritten } from "./reserved-tags.js";
+import { eventInput } from "./capture.js";
 
 export interface ReadScope {
   /** Readable namespaces; undefined = every namespace (no namespace resolution). */
@@ -25,6 +27,8 @@ export interface IndexRow {
   namespace: string;
   files: string[];
   tokens: number;
+  /** A session summary the local model rewrote (llm.ts), not the deterministic text. */
+  model_written?: true;
 }
 
 export interface IndexQuery {
@@ -67,6 +71,7 @@ export function toRows(store: Store, notes: NoteRecord[]): IndexRow[] {
     files: [...new Set((files.get(n.id) ?? []).map((f) => f.path))].slice(0, 20),
     tokens: Math.max(1, Math.ceil((n.title.length + n.body.length) / 4)),
     ...(n.distrusted ? { distrusted: true } : {}),
+    ...(isModelWritten(n) ? { model_written: true as const } : {}),
   }));
 }
 
@@ -144,7 +149,7 @@ function sessionRow(store: Store, scope: ReadScope, id: string): SessionRow | nu
   return { ...r };
 }
 
-export function memoryGet(store: Store, scope: ReadScope, ids: unknown): { notes: Array<NoteRecord & { files: Array<{ path: string; action: string }>; session: SessionRow | null; citation: string }>; missing: number[] } {
+export function memoryGet(store: Store, scope: ReadScope, ids: unknown): { notes: Array<NoteRecord & { files: Array<{ path: string; action: string }>; session: SessionRow | null; citation: string; model_written?: true }>; missing: number[] } {
   if (!Array.isArray(ids) || ids.length === 0 || !ids.every((x) => Number.isInteger(x))) throw new ValidationError("ids must be a non-empty list of note ids");
   if (ids.length > GET_MAX_IDS) throw new ValidationError(`at most ${GET_MAX_IDS} ids per call`);
   const found: NoteRecord[] = [];
@@ -156,7 +161,7 @@ export function memoryGet(store: Store, scope: ReadScope, ids: unknown): { notes
   }
   const files = store.noteFiles(found.map((n) => n.id));
   return {
-    notes: found.map((n) => ({ ...n, files: files.get(n.id) ?? [], session: n.session_id ? sessionRow(store, scope, n.session_id) : null, citation: `om:#${n.id}` })),
+    notes: found.map((n) => ({ ...n, files: files.get(n.id) ?? [], session: n.session_id ? sessionRow(store, scope, n.session_id) : null, citation: `om:#${n.id}`, ...(isModelWritten(n) ? { model_written: true as const } : {}) })),
     missing,
   };
 }
@@ -195,9 +200,11 @@ export function sessionGet(store: Store, scope: ReadScope, id: string): { sessio
   const prompts = (
     store
       .captureDb()
-      .prepare("SELECT at, input FROM capture_events WHERE session_id = ? AND event = 'user-prompt' ORDER BY seq LIMIT ?")
-      .all(id, MAX_PROMPTS) as Array<{ at: string; input: string }>
-  ).map((p) => ({ at: p.at, text: p.input.length > PROMPT_MAX ? p.input.slice(0, PROMPT_MAX - 1) + "…" : p.input }));
+      .prepare("SELECT seq, at, input, input_enc FROM capture_events WHERE session_id = ? AND event = 'user-prompt' ORDER BY seq LIMIT ?")
+      .all(id, MAX_PROMPTS) as Array<{ seq: number; at: string; input: string; input_enc: string | null }>
+  )
+    .map((p) => ({ at: p.at, text: eventInput(store, p, id) }))
+    .map((p) => ({ at: p.at, text: p.text.length > PROMPT_MAX ? p.text.slice(0, PROMPT_MAX - 1) + "…" : p.text }));
   return { session: s, summary, rows: toRows(store, find(store, { ...scope, namespaces: [s.namespace] }, { session: id, order: "created_asc" }, 200)), prompts };
 }
 

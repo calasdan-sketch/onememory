@@ -1441,6 +1441,14 @@ export class Store {
     } catch {
       /* read-only file: the flag stays unset until a writer opens the database */
     }
+    try {
+      // 2.0.0 (v16, before release): capture inputs are sealed like outputs; databases made by the first v16 builds lack the column.
+      if (this.hasColumn("capture_events", "input_enc") === false && this.hasColumn("capture_events", "seq")) {
+        this.addColumn("capture_events", "input_enc", "TEXT");
+      }
+    } catch {
+      /* read-only file: no writer can store a capture event either */
+    }
   }
 
   /**
@@ -2198,7 +2206,7 @@ export class Store {
       // they inherit lint, quarantine, history, FTS and trust. Every existing read asks for kind 'note' only (RangeOpts.kinds).
       //  - sessions: one row per agent session (cwd, counts, how far the distiller got, its summary note).
       //  - capture_events: raw hook events, short-lived (ONEMEMORY_CAPTURE_RETENTION_DAYS, see sweepCaptureEvents), never
-      //    synced. `output` is sealed into output_enc like a note body when at-rest encryption is on.
+      //    synced. `output` / `input` are sealed into output_enc / input_enc like a note body when at-rest encryption is on.
       //  - note_files: which files an observation read or changed (gone with the note).
       //  - file_context_seen: which files a session was already shown context for.
       this.addColumn("notes", "kind", "TEXT NOT NULL DEFAULT 'note'");
@@ -2225,6 +2233,7 @@ export class Store {
           event TEXT NOT NULL,
           tool TEXT NOT NULL DEFAULT '',
           input TEXT NOT NULL DEFAULT '',
+          input_enc TEXT,
           output TEXT NOT NULL DEFAULT '',
           output_enc TEXT,
           ok INTEGER NOT NULL DEFAULT 1,
@@ -3367,7 +3376,7 @@ export class Store {
     }
   }
 
-  /** v16: seal / open a capture event's output exactly like a note body (null envelope = plaintext store). */
+  /** v16: seal / open a capture event's output or input exactly like a note body (null envelope = plaintext store). */
   sealCapture(plain: string, aad: string): { text: string; enc: string | null } {
     const s = this.sealBody(plain, aad);
     return { text: s.body, enc: s.bodyEnc };
@@ -3562,20 +3571,24 @@ export class Store {
   }
 
   /**
-   * v16: seal every still-plaintext capture event output (caller holds the write lock; `encrypt enable`). The notes the
+   * v16: seal every still-plaintext capture event output and input (caller holds the write lock; `encrypt enable`). The notes the
    * capture writer made are ordinary notes rows, so encryptAll's own pass covers them.
    */
   private sealCaptureEvents(key: Buffer): void {
-    const rows = this.db.prepare("SELECT seq, session_id, output FROM capture_events WHERE output_enc IS NULL AND output <> ''").all() as Array<{ seq: number; session_id: string; output: string }>;
-    const upd = this.db.prepare("UPDATE capture_events SET output = '', output_enc = ? WHERE seq = ?");
-    for (const r of rows) upd.run(encrypt(r.output, key, captureAad(r.seq, r.session_id)), r.seq);
+    for (const f of ["output", "input"] as const) {
+      const rows = this.db.prepare(`SELECT seq, session_id, ${f} AS text FROM capture_events WHERE ${f}_enc IS NULL AND ${f} <> ''`).all() as Array<{ seq: number; session_id: string; text: string }>;
+      const upd = this.db.prepare(`UPDATE capture_events SET ${f} = '', ${f}_enc = ? WHERE seq = ?`);
+      for (const r of rows) upd.run(encrypt(r.text, key, captureAad(r.seq, r.session_id, f)), r.seq);
+    }
   }
 
   /** Inverse of sealCaptureEvents (caller holds the write lock; `encrypt disable`). */
   private unsealCaptureEvents(key: Buffer): void {
-    const rows = this.db.prepare("SELECT seq, session_id, output_enc FROM capture_events WHERE output_enc IS NOT NULL").all() as Array<{ seq: number; session_id: string; output_enc: string }>;
-    const upd = this.db.prepare("UPDATE capture_events SET output = ?, output_enc = NULL WHERE seq = ?");
-    for (const r of rows) upd.run(decryptIfEncrypted(r.output_enc, key, captureAad(r.seq, r.session_id)), r.seq);
+    for (const f of ["output", "input"] as const) {
+      const rows = this.db.prepare(`SELECT seq, session_id, ${f}_enc AS enc FROM capture_events WHERE ${f}_enc IS NOT NULL`).all() as Array<{ seq: number; session_id: string; enc: string }>;
+      const upd = this.db.prepare(`UPDATE capture_events SET ${f} = ?, ${f}_enc = NULL WHERE seq = ?`);
+      for (const r of rows) upd.run(decryptIfEncrypted(r.enc, key, captureAad(r.seq, r.session_id, f)), r.seq);
+    }
   }
 
   // --- Supersede (v15) ------------------------------------------------------

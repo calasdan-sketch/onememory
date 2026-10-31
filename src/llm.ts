@@ -13,6 +13,8 @@
 //    linter) the deterministic summary simply stays.
 import type { Store } from "./store.js";
 import { redact } from "./redact.js";
+import { eventInput } from "./capture.js";
+import { MODEL_WRITTEN_TAG } from "./reserved-tags.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const PROMPT_MAX_CHARS = 12_000;
@@ -105,14 +107,16 @@ export async function llmSummarize(store: Store, sessionId: string, env: NodeJS.
     if (!s || s.summary_note_id === null) return false;
     const sum = store.read(s.summary_note_id); // gate-ok: the capture writer re-reads its own summary note
     if (!sum || sum.kind !== "summary") return false;
-    const prompts = (db.prepare("SELECT input FROM capture_events WHERE session_id = ? AND event = 'user-prompt' ORDER BY seq LIMIT ?").all(sessionId, MAX_PROMPTS) as Array<{ input: string }>).map((p) => `- ${p.input.slice(0, 500)}`);
+    const prompts = (db.prepare("SELECT seq, input, input_enc FROM capture_events WHERE session_id = ? AND event = 'user-prompt' ORDER BY seq LIMIT ?").all(sessionId, MAX_PROMPTS) as Array<{ seq: number; input: string; input_enc: string | null }>).map((p) => `- ${eventInput(store, p, sessionId).slice(0, 500)}`);
     const user = [`Automatic summary:\n${sum.title}\n${sum.body}`, prompts.length ? `Prompts:\n${prompts.join("\n")}` : ""].filter(Boolean).join("\n\n").slice(0, PROMPT_MAX_CHARS);
     const answer = await chat(cfg, INSTRUCTIONS, user);
     const parsed = answer === null ? null : parseAnswer(answer);
     if (!parsed) return false;
     // The deterministic lines that are facts, not prose (files, commands, errors), are kept under the model's text.
     const facts = sum.body.split("\n").filter((l) => /^(?:Files changed|Files read|Commands|Errors|Outcome):/.test(l));
-    store.update(sum.id, { title: `Session: ${parsed.title}`, body: [parsed.body, ...facts].join("\n").slice(0, BODY_MAX + 2000) });
+    // Marked model-written (a reserved tag) so memory_get / the index / SessionStart can say so.
+    const tags = [...sum.tags.filter((t) => t !== MODEL_WRITTEN_TAG), MODEL_WRITTEN_TAG];
+    store.update(sum.id, { title: `Session: ${parsed.title}`, body: [parsed.body, ...facts].join("\n").slice(0, BODY_MAX + 2000), tags });
     return true;
   } catch (e) {
     process.stderr.write(`onememory: LLM summary skipped (${(e as Error).message}); the automatic summary stays\n`);
