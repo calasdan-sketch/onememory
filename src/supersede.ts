@@ -159,7 +159,7 @@ export function supersedePreview(
     if (o.namespace !== ns) throw new SupersedeError("notes from different namespaces cannot be replaced together");
     if (o.superseded_by !== undefined) throw new SupersedeError(`note ${o.id} was already replaced by note ${o.superseded_by}`, 409);
     if (o.archived_at) throw new SupersedeError(`note ${o.id} is archived, not a live note, so there is nothing to replace`, 409);
-    if (o.tags.some(isReservedTag)) throw new SupersedeError(`note ${o.id} is a task, a handoff or captured work; those are managed by their own tools, not replaced`);
+    if (o.tags.some(isReservedTag)) throw new SupersedeError(`note ${o.id} is a task or handoff, or captured work; those are managed by their own tools, not replaced`);
   }
 
   let replacementView: SupersedePreview["replacement"];
@@ -173,7 +173,7 @@ export function supersedePreview(
     const target = writable(store, caller, nid);
     if (target.namespace !== ns) throw new SupersedeError("the replacing note must be in the same namespace");
     if (target.superseded_by !== undefined || target.archived_at) throw new SupersedeError(`note ${nid} is not a live note, so it cannot take the place of another`, 409);
-    if (target.tags.some(isReservedTag)) throw new SupersedeError(`note ${nid} is a task, a handoff or captured work and cannot replace a note`);
+    if (target.tags.some(isReservedTag)) throw new SupersedeError(`note ${nid} is a task or handoff, or captured work, and cannot replace a note`);
     if (store.isDistrusted(target)) throw new SupersedeError("a note from a writer on the distrust list cannot replace another note", 403);
     newId = nid;
     newRev = target.rev;

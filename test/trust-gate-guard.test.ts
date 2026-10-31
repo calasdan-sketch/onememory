@@ -61,6 +61,8 @@ const EXPECTED_SITES: Record<string, string[]> = {
     "existence check only (deleted here?)",
     "import merge-base lookup: compares hashes, returns nothing to a caller",
   ],
+  "extract.ts": ["the capture writer re-reads its own summary note"],
+  "progressive.ts": ["access probe: readVisible decides before anything is returned"],
   "tasks.ts": [
     "requireTaskRef: a distrusted task reads as absent",
     "cycle check walks parent ids only",
@@ -138,13 +140,14 @@ describe("B: one gate for reading a note", () => {
     if (/req\.method === "GET" && idMatch/.test(api)) routes.add("/notes/:id");
     if (/req\.method === "GET" && getId/.test(api)) routes.add("/tasks/:id");
     if (/req\.method === "GET" && SIGN_PAGES\[path\]/.test(api)) routes.add("(sign pages)");
-    const NOTE_ROUTES = ["/notes", "/notes/:id", "/search", "/stats", "/changes", "/tasks", "/tasks/:id", "/handoffs", "/catch-up", "/export"];
+    if (/req\.method === "GET" && sessMatch/.test(api)) routes.add("/sessions/:id");
+    const NOTE_ROUTES = ["/notes", "/notes/:id", "/search", "/stats", "/changes", "/tasks", "/tasks/:id", "/handoffs", "/catch-up", "/export", "/index", "/timeline", "/sessions", "/sessions/:id", "/files/timeline"];
     const NO_NOTE_CONTENT = ["/health", "/ready", "/", "/dashboard.js", "(sign pages)", "/runner/status", "/trust"];
     assert.deepEqual([...routes].sort(), [...NOTE_ROUTES, ...NO_NOTE_CONTENT].sort(), "a GET route was added: add it to NOTE_ROUTES (and to the canary test below) or NO_NOTE_CONTENT");
 
     const mcp = read("mcp-server-core.ts");
     const tools = new Set<string>([...mcp.matchAll(/server\.registerTool\(\s*"([a-z_]+)"/g)].map((m) => m[1]));
-    const NOTE_TOOLS = ["state_read", "state_search", "state_relevant", "state_list", "memory_stats", "memory_consolidation_candidates", "memory_since", "task_get", "task_list", "catch_up", "memory_ack", "memory_history"];
+    const NOTE_TOOLS = ["state_read", "state_search", "state_relevant", "state_list", "memory_stats", "memory_consolidation_candidates", "memory_since", "task_get", "task_list", "catch_up", "memory_ack", "memory_history", "memory_index", "memory_timeline", "memory_get", "session_list"];
     const OTHER_TOOLS = ["state_write", "state_delete", "memory_consolidate", "memory_rebuild_edges", "task_put", "task_claim", "task_approve", "session_handoff", "memory_quarantine", "runner_status", "trust_policy", "memory_supersede_preview", "memory_supersede_confirm", "memory_supersede_undo", "memory_restore_version", "memory_history_purge"];
     assert.deepEqual([...tools].sort(), [...NOTE_TOOLS, ...OTHER_TOOLS].sort(), "an MCP tool was added: classify it here (and canary-test it below if it returns note content)");
   });
@@ -192,6 +195,12 @@ describe("B: the canary never reaches a non-admin reader through any classified 
         [`/tasks/${goodTask}`, 200, "plain task"],
         ["/handoffs?namespace=work", 200, "good-box"],
         ["/catch-up?namespace=work&consumer=zz", 200, "plain"],
+        ["/index?namespace=work", 200, "plain"],
+        ["/index?q=zebra&namespace=work", 200, "plain"],
+        [`/timeline?anchor=${goodNote}`, 200, "plain"],
+        [`/timeline?anchor=${evilNote}`, 200, ""],
+        ["/sessions?namespace=work", 200, "sessions"],
+        ["/files/timeline?path=src/x.ts", 200, "rows"],
       ];
       for (const [p, status, must] of routes) {
         const r = await fetch(base + p, { headers: { Authorization: `Bearer ${TOKEN}` } });
@@ -248,6 +257,12 @@ describe("B: the canary never reaches a non-admin reader through any classified 
         [writer, "task_list", { namespace: "work" }, false, "plain task"],
         [writer, "catch_up", { namespace: "work", consumer: "zz" }, false, "plain"],
         [writer, "memory_ack", { consumer: "zz", namespace: "work", ack_token: "bogus" }, true, ""],
+        [writer, "memory_index", { namespace: "work" }, false, "plain"],
+        [writer, "memory_index", { query: "zebra", namespace: "work" }, false, "plain"],
+        [writer, "memory_timeline", { anchor: goodNote }, false, "plain"],
+        [writer, "memory_timeline", { anchor: evilNote }, false, ""],
+        [writer, "memory_get", { ids: [evilNote, goodNote] }, false, "zebra but fine"],
+        [writer, "session_list", { namespace: "work" }, false, "sessions"],
         [writer, "state_write", { id: evilNote, tags: ["x"] }, true, ""],
         [writer, "state_write", { title: "fresh", body: "zebra", namespace: "work" }, false, "fresh"],
       ];

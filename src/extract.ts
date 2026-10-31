@@ -307,7 +307,7 @@ export function distillSession(store: Store, sessionId: string): { observations:
     if (batch.length < BATCH) break;
   }
   const all = eventsAfter(store, sessionId, 0, 20_000);
-  const titles = store.list({ kinds: ["observation"], sessionId, limit: 50, order: "created_asc", includeDistrusted: true }).notes.map((n) => n.title);
+  const titles = store.list({ kinds: ["observation"], sessionId, limit: 50, order: "created_asc" }).notes.map((n) => n.title);
   const sum = summarize(all, s.cwd, titles);
   if (!sum) return { observations: written, summaryId: s.summary_note_id };
   let id = s.summary_note_id;

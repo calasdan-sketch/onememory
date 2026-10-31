@@ -3280,6 +3280,17 @@ export class Store {
     return this.db;
   }
 
+  /** v16: the files the newest live rows of a namespace (undefined = all) are linked to (session-start keywords). */
+  recentFilePaths(namespace: string | undefined, limit: number): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT nf.path, MAX(n.created_at) AS at FROM note_files nf JOIN notes n ON n.id = nf.note_id
+         WHERE n.archived_at IS NULL${namespace !== undefined ? " AND n.namespace = ?" : ""} GROUP BY nf.path ORDER BY at DESC LIMIT ?`
+      )
+      .all(...(namespace !== undefined ? [namespace] : []), limit) as Array<{ path: string }>;
+    return rows.map((r) => r.path);
+  }
+
   /** v16: seal / open a capture event's output exactly like a note body (null envelope = plaintext store). */
   sealCapture(plain: string, aad: string): { text: string; enc: string | null } {
     const s = this.sealBody(plain, aad);

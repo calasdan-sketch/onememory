@@ -89,14 +89,7 @@ export async function rankContext(store: Store, opts: InjectOptions = {}): Promi
   const latestSummary = store.list({ ...base, kinds: ["summary"] as const, limit: 1 }).notes[0] ?? null;
   const signals = opts.signals ?? (await gitSignals(opts.cwd ?? process.cwd()));
   const db = store.captureDb();
-  const recentFiles = (
-    db
-      .prepare(
-        `SELECT DISTINCT nf.path FROM note_files nf JOIN notes n ON n.id = nf.note_id
-         WHERE n.archived_at IS NULL${ns !== undefined ? " AND n.namespace = ?" : ""} ORDER BY n.created_at DESC LIMIT 30`
-      )
-      .all(...(ns !== undefined ? [ns] : [])) as Array<{ path: string }>
-  ).map((r) => r.path);
+  const recentFiles = store.recentFilePaths(ns, 30);
   const words = (p: string): string => p.replace(/\.[A-Za-z0-9]+$/, "").replace(/[\\/._-]+/g, " ");
   const keywords = extractKeywords(
     [words(signals.branch ?? ""), ...(signals.diffFiles ?? []).map(words), ...recentFiles.map(words), latestSummary ? latestSummary.title : ""].join(" ")
