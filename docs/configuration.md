@@ -56,11 +56,11 @@ All environment variables are optional. This table lists **every** `ONEMEMORY_*`
 | `ONEMEMORY_MCP_PORT` | `8791` | MCP-over-HTTP port (tunnel this one) |
 | `ONEMEMORY_TRUST_PROXY` | unset | Set to `1` only behind a trusted proxy that sets `x-forwarded-for` |
 | `ONEMEMORY_TRUST_CLOUDFLARE` | unset | Set to `1` behind Cloudflare so per-client rate limiting keys on `cf-connecting-ip` |
-| `ONEMEMORY_EMBEDDINGS` | unset (off) | `on` to enable optional semantic search |
+| `ONEMEMORY_EMBEDDINGS` | unset (off) | `on` to enable optional semantic search; `auto` = use it when the embedding endpoint answers and stay keyword-only (silently, retrying once a minute) when it does not |
 | `ONEMEMORY_EMBED_URL` | `http://localhost:11434/v1/embeddings` | OpenAI-compatible embeddings endpoint |
 | `ONEMEMORY_EMBED_MODEL` | `nomic-embed-text` | Embedding model name |
 | `ONEMEMORY_EMBED_KEY` | unset | Optional bearer token for the embeddings endpoint |
-| `ONEMEMORY_EMBED_TIMEOUT_MS` | `30000` | Timeout per embedding call; raise if a local model's first (cold) call is slow |
+| `ONEMEMORY_EMBED_TIMEOUT_MS` | `30000` (`5000` with `ONEMEMORY_EMBEDDINGS=auto`) | Timeout per embedding call; raise if a local model's first (cold) call is slow |
 | `ONEMEMORY_ALLOWED_ORIGINS` | unset | Comma-separated browser Origins allowed to call the API (for a browser on the tunnel domain); loopback is always allowed |
 | `ONEMEMORY_RATE_MAX` | `120` | Max requests per client per window |
 | `ONEMEMORY_RATE_WINDOW_MS` | `10000` | Rate-limit window in milliseconds |

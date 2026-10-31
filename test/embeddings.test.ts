@@ -6,7 +6,7 @@
 import { test, describe, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { Store } from "../src/store.js";
-import { embed, type EmbeddingsConfig } from "../src/embeddings.js";
+import { embed, embeddingsConfig, resetEmbeddingsAuto, type EmbeddingsConfig } from "../src/embeddings.js";
 import { runSearch } from "../src/search-service.js";
 
 const CFG: EmbeddingsConfig = {
@@ -136,5 +136,68 @@ describe("runSearch semantic / hybrid / fallback", () => {
     const res = await runSearch(store, "deploy", { mode: "semantic" });
     assert.equal(res.length, 1);
     assert.equal(res[0].id, a.id);
+  });
+});
+
+describe("ONEMEMORY_EMBEDDINGS=auto", () => {
+  const SAVE = { e: process.env.ONEMEMORY_EMBEDDINGS, t: process.env.ONEMEMORY_EMBED_TIMEOUT_MS };
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    resetEmbeddingsAuto();
+    for (const [k, v] of [["ONEMEMORY_EMBEDDINGS", SAVE.e], ["ONEMEMORY_EMBED_TIMEOUT_MS", SAVE.t]] as const) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  test("on, with a short timeout unless one is set", () => {
+    process.env.ONEMEMORY_EMBEDDINGS = "auto";
+    delete process.env.ONEMEMORY_EMBED_TIMEOUT_MS;
+    const c = embeddingsConfig();
+    assert.equal(c.enabled, true);
+    assert.equal(c.auto, true);
+    assert.equal(c.timeoutMs, 5000);
+    process.env.ONEMEMORY_EMBED_TIMEOUT_MS = "12000";
+    assert.equal(embeddingsConfig().timeoutMs, 12000);
+    process.env.ONEMEMORY_EMBEDDINGS = "on";
+    assert.equal(embeddingsConfig().auto, undefined);
+  });
+
+  test("a backend that answers is used; one that does not is silent and not asked again for a while", async () => {
+    const auto = { ...CFG, auto: true };
+    let calls = 0;
+    stubFetch(() => (calls++, openaiResponse([1, 0])));
+    assert.equal((await embed("hi", auto))?.length, 2);
+    const err = console.error;
+    const logged: string[] = [];
+    console.error = (m: string) => void logged.push(m);
+    try {
+      stubFetch(() => {
+        calls++;
+        throw new Error("ECONNREFUSED");
+      });
+      assert.equal(await embed("hi", auto), null);
+      assert.equal(await embed("again", auto), null);
+      assert.equal(calls, 2, "after a failure the endpoint is not asked again until the back-off ends");
+      assert.deepEqual(logged, [], "auto mode is silent");
+      resetEmbeddingsAuto();
+      stubFetch(() => (calls++, openaiResponse([1, 0, 0])));
+      assert.equal((await embed("hi", auto))?.length, 3, "back once the backend answers");
+    } finally {
+      console.error = err;
+    }
+  });
+
+  test("search with auto and no backend is plain keyword search", async () => {
+    process.env.ONEMEMORY_EMBEDDINGS = "auto";
+    const s = new Store(":memory:");
+    const a = s.create({ title: "alpha", body: "we deploy on fly" });
+    s.create({ title: "beta", body: "unrelated" });
+    stubFetch(() => {
+      throw new Error("ECONNREFUSED");
+    });
+    const res = await runSearch(s, "deploy", {});
+    assert.deepEqual(res.map((n) => n.id), [a.id]);
+    s.close();
   });
 });
