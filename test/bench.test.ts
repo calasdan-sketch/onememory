@@ -129,7 +129,7 @@ describe("scenario files", () => {
   });
 
   test("ids are unique and carry the suite letter", () => {
-    const letter: Record<string, string> = { stale: "A", contradiction: "B", isolation: "C", provenance: "D" };
+    const letter: Record<string, string> = { stale: "A", contradiction: "B", isolation: "C", provenance: "D", poison: "E" };
     assert.equal(new Set(all.map((s) => s.id)).size, all.length);
     for (const s of all) assert.equal(s.id[0], letter[s.suite], `${s.id} is in suite ${s.suite}`);
   });
@@ -371,14 +371,17 @@ describe("against OneMemory", () => {
     for (const s of first.scenarios.filter((x) => x.status === "known_gap")) assert.ok(s.known_gap && gaps[s.known_gap], s.id);
   });
 
-  test("the four gaps found in 1.5.0 are recorded as fixed in 1.6.0, and no scenario is marked as a gap any more", () => {
+  test("the four gaps found in 1.5.0 are recorded as fixed in 1.6.0, the poison one in 2.0.0, and none is open", () => {
     for (const id of ["GAP-SUPERSEDE", "GAP-RECENCY", "GAP-HISTORY", "GAP-CONFIDENCE"]) {
       assert.equal(gaps[id].status, "fixed", id);
       assert.equal(gaps[id].fixed_in, "1.6.0", id);
     }
+    assert.equal(gaps["GAP-POISON-MDLINK"].status, "fixed");
+    assert.equal(gaps["GAP-POISON-MDLINK"].fixed_in, "2.0.0");
     assert.deepEqual(first.known_gaps, []);
     assert.equal(first.summary.known_gap, 0);
-    assert.ok(first.scenarios.every((s) => s.known_gap === undefined));
+    assert.deepEqual(first.scenarios.filter((s) => s.known_gap !== undefined).map((s) => s.id), []);
+    assert.equal(first.scenarios.find((s) => s.id === "E11")?.status, "pass");
   });
 
   test("the scenarios that used to be gaps now pass, and say what they test", () => {
@@ -718,10 +721,10 @@ describe("the command line", () => {
 });
 
 describe("shipping and docs", () => {
-  test("the package is 1.7.2 and ships the scenarios and the new docs", () => {
+  test("the package is 2.0.0 and ships the scenarios and the new docs", () => {
     const pkg = JSON.parse(read("package.json")) as { version: string; files: string[]; scripts: Record<string, string> };
-    assert.equal(pkg.version, "1.7.2");
-    assert.equal(PACKAGE_VERSION, "1.7.2");
+    assert.equal(pkg.version, "2.0.0");
+    assert.equal(PACKAGE_VERSION, "2.0.0");
     assert.ok(pkg.files.includes("bench/scenarios/*.json"));
     assert.ok(pkg.files.includes("docs/*.md"));
     assert.match(pkg.scripts.bench, /bench/);

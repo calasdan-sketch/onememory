@@ -286,6 +286,9 @@ function prepareCandidateDocs(
 ): { docs: CandidateDoc[]; threshold: number; limit: number } {
   const threshold = clampThreshold(opts.threshold, 0.95);
   const limit = clampInt(opts.limit, 50, 1, 500);
+  // v16: captured observations and summaries are not duplicates to merge (each is one session's record, linked to its
+  // files and session); every candidate scan (CLI, MCP, janitor) routes through here, so they are left out once.
+  notes = notes.filter((n) => !n.kind || n.kind === "note");
 
   const newestFirst = (list: NoteRecord[]): NoteRecord[] =>
     [...list].sort((x, y) => y.created_at.localeCompare(x.created_at) || y.id - x.id);
@@ -498,6 +501,9 @@ export function resolveConsolidationNotes(store: Store, ids: number[]): NoteReco
   const notes = uniqueIds.map((id) => {
     const n = store.read(id); // gate-ok: admin consolidation by ids: mixed trusted/distrusted sources are refused below
     if (!n) throw new ValidationError(`no note with id ${id}`);
+    if (n.kind && n.kind !== "note") {
+      throw new ValidationError(`note ${id} is a captured ${n.kind}; only ordinary notes are consolidated`);
+    }
     if (n.archived_at) {
       // Merging deletes the sources and creates a LIVE note: that would
       // permanently destroy an archived (forgotten, restorable) note.

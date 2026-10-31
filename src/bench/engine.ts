@@ -34,6 +34,7 @@ const STEP_OPS = new Set([
   "write", "update", "delete", "archive", "unarchive", "read", "search", "list", "recall", "changes", "sweep",
   "distrust", "undistrust", "export", "import", "trust_server", "merge", "wait",
   "supersede_preview", "supersede_confirm", "supersede_undo", "history", "restore_version",
+  "capture", "session_start",
 ]);
 const CHECKS = new Set([
   "outcome", "top", "has", "lacks", "fresh_answer", "hit_count", "field", "no_text", "contains_text", "same_response", "recoverable",
@@ -114,7 +115,7 @@ export function validateScenario(s: Scenario, gaps: Record<string, KnownGap> = {
     if (raw.op === "import" && !stepIds.has(raw.from as string)) return `step ${i + 1} (import): "from" must be the id of an earlier export step`;
     if (raw.op === "restore_version" && raw.if_rev_of !== undefined && !stepIds.has(raw.if_rev_of as string)) return `step ${i + 1} (restore_version): if_rev_of must be the id of an earlier read step`;
     if (raw.op === "update" && raw.if_rev_of !== undefined && !stepIds.has(raw.if_rev_of as string)) return `step ${i + 1} (update): if_rev_of must be the id of an earlier read step`;
-    const needsId = ["search", "list", "recall", "changes", "sweep", "export", "import"].includes(raw.op);
+    const needsId = ["search", "list", "recall", "changes", "sweep", "export", "import", "capture", "session_start"].includes(raw.op);
     if (needsId && typeof raw.id !== "string") return `step ${i + 1} (${raw.op}): id is required`;
     const id = defaultStepId(raw);
     if (id) stepIds.add(id);
@@ -189,6 +190,8 @@ function neededCapabilities(s: Scenario): Capability[] {
     if (raw.op === "update" && raw.if_rev_of !== undefined) need.add("cas");
     if (raw.op.startsWith("supersede_")) need.add("supersede");
     if (raw.op === "history" || raw.op === "restore_version") need.add("history");
+    if (raw.op === "capture") need.add("capture");
+    if (raw.op === "session_start") need.add("session_start");
   }
   return [...need];
 }
@@ -381,6 +384,23 @@ async function execStep(a: MemoryAdapter, run: Run, step: AnyStep): Promise<void
       keep(r);
       return;
     }
+    case "capture":
+      keep(
+        a.capture
+          ? await a.capture(as, {
+              event: step.event as string | undefined,
+              tool: step.tool as string | undefined,
+              input: step.input as string | undefined,
+              output: step.output as string | undefined,
+              session: step.session as string | undefined,
+              namespace: step.namespace as string | undefined,
+            })
+          : { outcome: "unsupported" }
+      );
+      return;
+    case "session_start":
+      keep(a.sessionStart ? await a.sessionStart(as, { namespace: step.namespace as string | undefined }) : { outcome: "unsupported" });
+      return;
     case "wait":
       await new Promise((r) => setTimeout(r, Math.min(Number(step.ms) || 0, 2000)));
       return;

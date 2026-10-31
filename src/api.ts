@@ -28,6 +28,7 @@ import {
   type ImportNote,
   validateForgetAfter,
   coerceNumeric,
+  DEFAULT_NAMESPACE,
 } from "./store.js";
 import { truthyParam } from "./trust.js";
 import { originAllowed, RateLimiter, AuthTarpit, clientKey, tokenKey, authenticateEntry, scopeAllows, LIMITS, audit } from "./security.js";
@@ -95,10 +96,15 @@ import {
   ClaimConflictError,
 } from "./tasks.js";
 import { ackChanges } from "./changes.js";
+import { qualityReport } from "./quality.js";
 import { SupersedeError, supersedePreview, supersedeConfirm, supersedeUndo, noteHistory, restoreVersion, purgeNoteHistory, type Caller } from "./supersede.js";
 import { assertPlainWriteTags, assertReviewedTag } from "./reserved-tags.js";
 import { waitForChanges, parseWait, WaitBusyError } from "./change-wait.js";
 import type { LintFinding } from "./lint.js";
+import { memoryIndex, memoryTimeline, memoryGet, sessionList, sessionGet, fileTimeline, type ReadScope } from "./progressive.js";
+import { HOOK_EVENTS, type HookEvent, isOwnTool, recordEvent, cleanField } from "./capture.js";
+import { distillSession } from "./extract.js";
+import { meterStats } from "./meter.js";
 
 // Minimum scope a request needs: deletes, imports and full /export are admin,
 // creates/updates are write, everything else (read/search/list) is read.
@@ -113,6 +119,8 @@ function requiredScope(method: string | undefined, path: string): Scope {
   // /relevant is a read despite the POST method (the message is a JSON body,
   // not a query string, because it can be long) -- same class as /search.
   if (method === "POST" && path === "/relevant") return "read";
+  // POST /get (automatic memory: full notes by id) is a read too; POST /capture is a write (the default below).
+  if (method === "POST" && path === "/get") return "read";
   // Acking a change-feed position moves only the caller's own consumer marker.
   if (method === "POST" && path === "/ack") return "read";
   // Approving a command task is the human gate in front of the runner.
@@ -124,6 +132,8 @@ function requiredScope(method: string | undefined, path: string): Scope {
   // Restoring is equally admin: it re-exposes a note an operator retired.
   if (method === "POST" && /^\/notes\/\d+\/(archive|restore)$/.test(path)) return "admin";
   if (method === "POST" && path === "/sweep-expired") return "admin";
+  // The quality view lists titles from every writer, and approving a held write is the linter's human gate.
+  if (path === "/quality" || /^\/quarantine\/\d+\/(approve|reject)$/.test(path)) return "admin";
   // A note's earlier versions can hold text that was taken out on purpose: administrators only, reads included.
   if (/^\/notes\/\d+\/history(\/restore)?$/.test(path)) return "admin";
   if (method === "POST" || method === "PUT") return "write";
@@ -783,6 +793,39 @@ export function createApiServer(
         return;
       }
 
+      // GET /quality -> the memory quality report (quality.ts). Admin; a namespace-pinned admin sees its own namespace only.
+      if (req.method === "GET" && path === "/quality") {
+        const namespace = url.searchParams.get("namespace") || undefined;
+        const namespaces = nsCtx.active ? [nsCtx.ownNamespace] : namespace ? [namespace] : undefined;
+        sendJson(res, 200, await qualityReport(store, namespaces));
+        return;
+      }
+
+      // POST /quarantine/:id/approve | reject -> the memory_quarantine tool's approve / reject, for the dashboard.
+      const qMatch = /^\/quarantine\/(\d+)\/(approve|reject)$/.exec(path);
+      if (req.method === "POST" && qMatch) {
+        const id = Number(qMatch[1]);
+        const entry = store.getQuarantine(id);
+        // Uniform "not found" for another namespace's entry: no existence oracle.
+        if (!entry || (nsCtx.active && entry.namespace !== nsCtx.ownNamespace)) {
+          sendJson(res, 404, { error: `no quarantined write with id ${id}` });
+          return;
+        }
+        try {
+          if (qMatch[2] === "reject") {
+            store.rejectQuarantine(id);
+            sendJson(res, 200, { rejected: id });
+          } else {
+            const note = store.approveQuarantine(id);
+            await maybeEmbed(store, note);
+            sendJson(res, 200, { approved: id, note });
+          }
+        } catch (e) {
+          sendError(res, e);
+        }
+        return;
+      }
+
       // GET /notes?namespace=&limit=&offset=&includeArchived=1&archived=1
       if (req.method === "GET" && path === "/notes") {
         const namespace = url.searchParams.get("namespace") ?? undefined;
@@ -1094,8 +1137,99 @@ export function createApiServer(
         }
         sendJson(res, 200, {
           ...store.accessStats(namespaces, { hideDistrusted: !isAdmin }),
+          meter: meterStats(store, namespaces),
           searchedNamespaces,
         });
+        return;
+      }
+
+      // ---- Automatic memory (progressive.ts; the MCP tools memory_index / memory_timeline / memory_get / session_list) ----
+      // Reads: GET /index, GET /timeline, POST /get (read scope despite the POST: the ids are a body), GET /sessions,
+      // GET /sessions/:id, GET /files/timeline?path=. Write: POST /capture (a hook that could not open the local database).
+      const capRead = (): ReadScope => {
+        const hint = url.searchParams.get("namespace") ?? undefined;
+        return {
+          namespaces: nsCtx.active ? (trustedHint(nsCtx, hint) ? [hint!] : readable(nsCtx)) : hint ? [hint] : undefined,
+          ...(flagParam(url, "include_distrusted") ? { includeDistrusted: true } : {}),
+        };
+      };
+      const sessMatch = /^\/sessions\/([^/]+)$/.exec(path);
+      if (
+        (req.method === "GET" && path === "/index") ||
+        (req.method === "GET" && path === "/timeline") ||
+        (req.method === "GET" && path === "/sessions") ||
+        (req.method === "GET" && path === "/files/timeline") ||
+        (req.method === "GET" && sessMatch) ||
+        (req.method === "POST" && path === "/get")
+      ) {
+        try {
+          const q = (k: string): string | undefined => url.searchParams.get(k) ?? undefined;
+          if (path === "/index") {
+            sendJson(res, 200, memoryIndex(store, capRead(), { query: q("q") ?? q("query"), kind: q("kind"), obs_type: q("obs_type"), file: q("file"), session: q("session"), since: q("since"), limit: intParam(url, "limit", 1) }));
+          } else if (path === "/timeline") {
+            sendJson(res, 200, memoryTimeline(store, capRead(), { anchor: intParam(url, "anchor", 1), query: q("q") ?? q("query"), file: q("file"), session: q("session"), before: intParam(url, "before", 1), after: intParam(url, "after", 1) }));
+          } else if (path === "/get") {
+            let body: { ids?: unknown };
+            try {
+              body = JSON.parse((await readBody(req)) || "{}");
+            } catch {
+              sendJson(res, 400, { error: "invalid JSON body" });
+              return;
+            }
+            sendJson(res, 200, memoryGet(store, capRead(), body.ids));
+          } else if (path === "/sessions") {
+            sendJson(res, 200, sessionList(store, capRead(), intParam(url, "limit", 1)));
+          } else if (path === "/files/timeline") {
+            sendJson(res, 200, fileTimeline(store, capRead(), q("path") ?? "", intParam(url, "limit", 1)));
+          } else {
+            const one = sessionGet(store, capRead(), decodeURIComponent(sessMatch![1]));
+            if (one) sendJson(res, 200, one);
+            else sendJson(res, 404, { error: "no such session" });
+          }
+        } catch (e) {
+          sendError(res, e);
+        }
+        return;
+      }
+
+      // POST /capture: one hook event, from a capture hook that could not use the local database (ONEMEMORY_HOOK_URL).
+      // The event is redacted AGAIN here (never trust the sender to have done it), lands in the token's own namespace
+      // when namespaces are resolved, and cannot be appended to another namespace's session.
+      if (req.method === "POST" && path === "/capture") {
+        let b: Record<string, unknown>;
+        try {
+          b = JSON.parse((await readBody(req)) || "{}");
+        } catch {
+          sendJson(res, 400, { error: "invalid JSON body" });
+          return;
+        }
+        if (!b || typeof b !== "object" || Array.isArray(b)) b = {};
+        const ev = typeof b.event === "string" && (HOOK_EVENTS as readonly string[]).includes(b.event) ? (b.event as HookEvent) : null;
+        if (!ev || typeof b.session_id !== "string" || !b.session_id.trim()) {
+          sendJson(res, 400, { error: `event (one of ${HOOK_EVENTS.join(", ")}) and session_id are required` });
+          return;
+        }
+        const s = (k: string, max: number): string => (typeof b[k] === "string" ? (b[k] as string) : "").slice(0, max);
+        const capNs = nsCtx.active ? nsCtx.ownNamespace : s("namespace", 200).trim() || DEFAULT_NAMESPACE;
+        try {
+          const owner = store.captureDb().prepare("SELECT namespace FROM sessions WHERE id = ?").get(b.session_id) as { namespace: string } | undefined;
+          if (owner && owner.namespace !== capNs) {
+            sendJson(res, 409, { error: "that session belongs to another namespace" });
+            return;
+          }
+          const tool = s("tool", 200);
+          if (tool && isOwnTool(tool)) {
+            sendJson(res, 202, { stored: false });
+            return;
+          }
+          const input = s("input", 64 * 1024);
+          const output = s("output", 64 * 1024);
+          recordEvent(store, { session_id: b.session_id.slice(0, 200), cwd: s("cwd", 1000), event: ev, tool, input: cleanField(input), output: cleanField(output), ok: b.ok !== false, bytes: input.length + output.length, at: new Date().toISOString() }, capNs);
+          if (ev === "stop" || ev === "session-end") distillSession(store, b.session_id.slice(0, 200));
+          sendJson(res, 202, { stored: true });
+        } catch (e) {
+          sendError(res, e);
+        }
         return;
       }
 

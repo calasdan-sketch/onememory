@@ -19,14 +19,25 @@
 // removing one, is rejected with a message pointing at task_put /
 // session_handoff. Internal paths (tasks.ts, the runner) call the store
 // directly and are not affected.
+//
+// v16 (automatic memory): the capture writer's tags are reserved the same way:
+// the exact tags `observation` and `summary`, and every tag starting with
+// `obs.` (obs.type:, obs.concept:). Only extract.ts writes them, so a note
+// cannot pass itself off as captured work.
 import { ValidationError } from "./store.js";
 
 export const RESERVED_TAG_PREFIX = "task.";
-const RESERVED_EXACT = new Set(["task", "handoff"]);
+/** v16: the capture writer's tag prefix (obs.type:, obs.concept:). */
+export const CAPTURE_TAG_PREFIX = "obs.";
+const RESERVED_EXACT = new Set(["task", "handoff", "observation", "summary"]);
+
+/** v16: set by llm.ts on a session summary the local model rewrote (reserved by the obs. prefix, so no note can fake it). */
+export const MODEL_WRITTEN_TAG = "obs.writer:model";
+export const isModelWritten = (n: { tags: readonly string[] }): boolean => n.tags.includes(MODEL_WRITTEN_TAG);
 
 export function isReservedTag(tag: string): boolean {
   const t = tag.trim();
-  return RESERVED_EXACT.has(t) || t.startsWith(RESERVED_TAG_PREFIX);
+  return RESERVED_EXACT.has(t) || t.startsWith(RESERVED_TAG_PREFIX) || t.startsWith(CAPTURE_TAG_PREFIX);
 }
 
 function reservedSet(tags: readonly string[] | undefined): Set<string> {
@@ -47,7 +58,8 @@ export function assertPlainWriteTags(next: readonly string[] | undefined, existi
   throw new ValidationError(
     `the tag(s) ${bad.map((t) => `"${t}"`).join(", ")} are reserved for the task board: ` +
       `use task_put (POST /tasks) to create or change tasks and session_handoff (POST /handoffs) for handoffs. ` +
-      `Reserved: "task", "handoff" and anything starting with "${RESERVED_TAG_PREFIX}".`
+      `Reserved: "task", "handoff" and anything starting with "${RESERVED_TAG_PREFIX}"; ` +
+      `"observation", "summary" and anything starting with "${CAPTURE_TAG_PREFIX}" are written only by the automatic capture.`
   );
 }
 
@@ -65,3 +77,11 @@ export function assertReviewedTag(next: readonly string[] | undefined, existing:
   if (want === have) return;
   throw new ValidationError(`the tag "${REVIEWED_TAG}" is set only by an administrator accepting a note in the dashboard's Review view`);
 }
+
+/**
+ * "Never show again": a note with this tag is never injected at session start (context-inject.ts), nor in the profile.
+ * It stays searchable and readable. Deliberately NOT reserved: any writer may already edit a note's tags (and body),
+ * so reserving it would protect nothing; set it with `onememory never-show <id>`, the dashboard's "never show" button,
+ * or a normal tag edit (PUT /notes/:id, MCP state_write).
+ */
+export const NEVER_SHOW_TAG = "never-show";

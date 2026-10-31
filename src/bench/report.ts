@@ -7,6 +7,7 @@ export const SUITE_NAMES: Record<Suite, string> = {
   contradiction: "B  Contradiction recovery",
   isolation: "C  Permission isolation",
   provenance: "D  Provenance retention",
+  poison: "E  Memory poisoning",
 };
 
 /** What this benchmark does NOT show. Printed with every report and included in the JSON. */
@@ -79,6 +80,13 @@ function suiteMetrics(suite: Suite, results: ScenarioResult[]): Record<string, u
     out["fields-checked"] = tally("field").checks;
     out["fields-lost"] = tally("field").failed;
     out["fields-kept-only-as-unverified-claim"] = rec.filter((c) => c.measure!.claim_only).length;
+  }
+  if (suite === "poison") {
+    // Count only defended paths: a declared known gap is reported separately and must not add to the headline count.
+    const defended = results.filter((r) => r.status === "pass" || r.status === "fail");
+    const probes = defended.flatMap((r) => r.checks).filter((c) => c.metric === "poison_reach");
+    out["poison-probes"] = probes.length;
+    out["poison-reach-count"] = probes.filter((c) => !c.pass).length;
   }
   return out;
 }
@@ -162,6 +170,7 @@ function headline(suite: Suite, m: Record<string, unknown>): string[] {
     return [`resolved to the correction ${t("resolved-to-correction")}   loser still visible with provenance ${t("loser-stays-visible-with-provenance")}   weak overwrite protected ${t("silent-overwrite-protection")}`];
   }
   if (suite === "isolation") return [`leakage count ${m["leakage-count"]} (over ${m["leak-probes"]} probes)   unexpected denials ${m["unexpected-denials"]} (over ${m["allowed-probes"]} allowed actions)`];
+  if (suite === "poison") return [`poison-reach-count ${m["poison-reach-count"]} (over ${m["poison-probes"]} defended probes)`];
   return [`fields checked ${m["fields-checked"]}   lost ${m["fields-lost"]}   kept only as an unverified claim ${m["fields-kept-only-as-unverified-claim"]}`];
 }
 

@@ -105,6 +105,6 @@ behind the newer one in search, even if it matches the words slightly better. It
 ## Upgrading
 
 The first start on 1.6.0 upgrades the database to schema v15 (columns for confidence and the replaced link, and tables for history and
-one-time codes). As for every schema change, a verified copy of the old database is kept first at `<database>.pre-v15-backup`; the upgrade
+one-time codes). As for every schema change, a verified copy of the old database is kept first at `<database>.pre-v16-backup`; the upgrade
 does not run if the copy cannot be made. There is no downgrade path: to go back, stop everything, put that copy back as the database,
 and install the older version. Upgrading from 1.3.x or 1.4.x: [upgrading.md](./upgrading.md).

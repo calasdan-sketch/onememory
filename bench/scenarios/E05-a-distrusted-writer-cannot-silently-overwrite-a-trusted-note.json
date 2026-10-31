@@ -1,0 +1,20 @@
+{
+  "id": "E05",
+  "suite": "poison",
+  "title": "A distrusted writer cannot silently overwrite a trusted note",
+  "what": "A distrusted writer edits a trusted note to plant a lie. The edited note must not be served to ordinary searches, and an admin who looks sees it flagged with the real writer on it.",
+  "actors": { "alice": { "scope": "write" }, "mallory": { "scope": "write" }, "boss": { "scope": "admin" } },
+  "needs": ["trust"],
+  "steps": [
+    { "op": "write", "as": "alice", "ref": "n", "title": "{{proj}} vpn endpoint", "body": "The {{proj}} VPN endpoint is {{good}}." },
+    { "op": "distrust", "as": "boss", "writer": "mallory" },
+    { "op": "update", "as": "mallory", "ref": "n", "body": "The {{proj}} VPN endpoint is {{bad}}." },
+    { "op": "search", "as": "alice", "q": "{{proj}} vpn endpoint", "id": "s" },
+    { "op": "search", "as": "boss", "q": "{{proj}} vpn endpoint", "id": "adm", "include_distrusted": true }
+  ],
+  "expect": [
+    { "check": "no_text", "step": "s", "text": "{{bad}}", "desc": "the overwriter's planted value is not served", "metric": "poison_reach" },
+    { "check": "field", "step": "adm", "path": "distrusted", "of": "n", "equals": true, "desc": "an admin who looks sees the note flagged as distrusted" },
+    { "check": "field", "step": "adm", "path": "writer", "of": "n", "equals": "mallory", "desc": "and the real overwriting writer is named on it" }
+  ]
+}

@@ -25,7 +25,10 @@ function usage(): void {
       "            When: something isn't working, or after changing config.",
       "  init      Print the config snippet to wire onememory into your agent.",
       "            When: you want to see the config before using it, or to copy it by hand.",
-      "  setup [--dry-run] [--yes] [--only claude-code,claude-desktop,cursor] [--project] [--hook|--no-hook] [--db <file>] [--undo]",
+      "  uninstall [--dry-run] [--yes] [--purge] [--no-backup]",
+      "            Take OneMemory out of every app setup connected (same as setup --undo, for every setup run).",
+      "            --purge also deletes the data folder, after a final backup it names (unless --no-backup).",
+      "  setup [--dry-run] [--yes] [--only claude-code,claude-desktop,cursor,codex,gemini,muse,vscode,zed] [--project] [--hook|--no-hook] [--capture|--no-capture] [--db <file>] [--undo]",
       "            Connect onememory to Claude Code / Claude Desktop / Cursor for you. Shows the plan and the exact lines it will",
       "            change, saves a backup of each file first, writes only after you type y. An old \"claude-bridge\" entry is offered",
       "            for migration with your data kept. --dry-run only shows; --undo puts back what it changed.",
@@ -37,6 +40,15 @@ function usage(): void {
       "            Notes from writers on the distrust list are left out unless --include-distrusted.",
       "            When: wired into Claude Code settings.json. See:",
       "            https://github.com/calasdan-sketch/onememory/blob/main/docs/sessionstart-hook.md",
+      "  hook <session-start|user-prompt|post-tool|post-tool-failure|stop|subagent-stop|session-end|file-context> [--db <file>]",
+      "            Automatic memory: the agent's lifecycle hooks (hook JSON on stdin). Records what the agent does, redacted,",
+      "            on this machine only, and distills it into observations and a session summary. Always exits 0.",
+      "            Off switch: ONEMEMORY_CAPTURE=off. When: installed by `onememory setup --capture`.",
+      "            file-context (PreToolUse on Read) lists what memory knows about the file, once per session; it never",
+      "            blocks or changes the Read.",
+      "  never-show <id> [--undo]",
+      "            Keep one note out of the session-start context for good (tags it never-show; it stays searchable).",
+      "            When: a memory keeps being shown that does not help. The dashboard has the same button.",
       "  consolidate [--dry-run] [--yes] [--threshold 0.95] [--namespace ns]",
       "            Find near-duplicate notes and merge them. Without --yes",
       "            (or with --dry-run) this only reports — nothing is merged.",
@@ -63,7 +75,7 @@ function usage(): void {
       "  backup [--out <dir>] [--include-approval-key] [--include-attest-key] | backup --prune-premigration",
       "            Consistent hot copy of the database (works while the server runs)",
       "            into <dir>/state.db, plus a copy of the encryption key (.key) if",
-      "            at-rest encryption is on. Default dir: ./onememory-backup-<time>.",
+      "            at-rest encryption is on. Default dir: ~/onememory-backup-<time>.",
       "            WARNING: store the key SEPARATELY from the backup; a backup without",
       "            its key is unreadable, and one stored with it is not encrypted.",
       "            --include-attest-key also copies the signing key (.attest-key) so a restore keeps",
@@ -107,12 +119,26 @@ function usage(): void {
       "            Import what Claude Code already remembers: CLAUDE.md files (user, this folder or --project) and auto memory",
       "            (~/.claude/projects/*/memory). Cut into separate notes at headings, tagged with their source file and project; running",
       "            it again adds only what is new. Anything that looks like a secret is skipped and never shown. Local only.",
+      "  import --from claude-mem|mem0|basic-memory [--path p] [--dry-run] [--yes] [--namespace ns]",
+      "            Import another memory tool's notes: claude-mem's database (~/.claude-mem/claude-mem.db, opened read only;",
+      "            observations and session summaries keep their type, files, project and dates), a mem0 JSON export (--path),",
+      "            or a basic-memory folder (~/basic-memory). Same rules as --claude: secrets skipped, re-runs add only what is new.",
+      "            How to switch over and uninstall the old tool: docs/switching.md.",
       "  import --dir <path> [--dry-run] [--allow-move]",
       "            Merge Markdown files back: newer side wins, conflicts are",
       "            reported and the losing version is saved under <dir>/.conflicts/.",
       "            Runs through the memory linter.",
       "  quarantine [list | approve <id> | reject <id>]",
       "            Review writes the memory linter held (ONEMEMORY_LINT).",
+      "  quality [--json] [--namespace ns]",
+      "            What is worth a look: near-duplicates, stale notes with a newer twin, quarantined writes, notes",
+      "            the linter flags, and captured rows about to decay. Each comes with the command that fixes it.",
+      "  decay [--dry-run] [--namespace ns]",
+      "            Archive (never delete) captured observations idle ONEMEMORY_DECAY_DAYS (30) and summaries idle",
+      "            ONEMEMORY_DECAY_SUMMARY_DAYS (180). Never: your own notes, decisions, anything tagged \"pinned\".",
+      "            Also runs on its own in the expiry sweep and at the end of a captured session.",
+      "  archive <id> | restore <id>",
+      "            Soft-archive a note, or bring an archived one back (the undo for decay and archive).",
       "  encrypt <enable|status|disable>",
       "            enable   Create the AES-256-GCM key and encrypt every note",
       "                     body at rest. Keyword search then covers title+tags",
@@ -135,11 +161,17 @@ function usage(): void {
       "            Run the provenance benchmark on a throwaway store: stale memory, contradiction recovery,",
       "            permission isolation, provenance retention. Offline, deterministic, exits 1 on a failure.",
       "            Your own data is never touched. See docs/BENCHMARK.md.",
+      "  bench --longmemeval | --locomo [--data file] [--limit n] [--mode keyword|hybrid] [--granularity session|turn] [--json]",
+      "            Retrieval benchmark (recall@k, nDCG, MRR) on a public dataset, in a temp folder. No LLM.",
       "  help      Show this help",
       "",
     ].join("\n")
   );
 }
+
+/** doctor warns above these (docs/footprint.md). */
+const DOCTOR_MAX_DATA_BYTES = 1e9;
+const DOCTOR_MAX_BACKLOG = 10_000;
 
 async function doctor(): Promise<void> {
   const {
@@ -203,8 +235,11 @@ async function doctor(): Promise<void> {
     const r = s.list({ limit: 1 });
     const edges = s.edgeCount();
     distrustCount = s.distrustRules().length;
+    const { meterStats, meterLine } = await import("./meter.js");
+    const footprint = meterLine(meterStats(s));
     s.close();
     ok(`database OK at ${DB_PATH} (${r.total} notes)`);
+    ok(footprint);
     // Migration v4 adds the similarity-edge table but does not score
     // existing notes: a store upgraded from 1.0.0 has notes and no edges
     // until a one-time rebuild.
@@ -348,7 +383,7 @@ async function doctor(): Promise<void> {
     const entries = parsed?.hooks?.SessionStart;
     const wired =
       Array.isArray(entries) &&
-      /(onememory|cli\.js)[\s\S]{0,60}\brecall\b/.test(JSON.stringify(entries));
+      /(onememory|cli\.js)[\s\S]{0,60}\b(recall|hook session-start)\b/.test(JSON.stringify(entries));
     if (wired) {
       ok("SessionStart hook wired in ~/.claude/settings.json");
     } else {
@@ -357,11 +392,47 @@ async function doctor(): Promise<void> {
           "see https://github.com/calasdan-sketch/onememory/blob/main/docs/sessionstart-hook.md"
       );
     }
+    const captureWired = /(onememory|cli\.js)[\s\S]{0,60}\bhook post-tool\b/.test(JSON.stringify(parsed?.hooks ?? {}));
+    console.log(`  [info] ${captureWired ? "automatic memory hooks wired" : "automatic memory hooks not installed (onememory setup --capture)"}`);
   } catch {
     warn(
       "~/.claude/settings.json not found or unreadable — hook not installed " +
         "(see https://github.com/calasdan-sketch/onememory/blob/main/docs/sessionstart-hook.md)"
     );
+  }
+
+  // Automatic memory: when did a hook last record something, and is anything waiting in the spool?
+  // Footprint: how big the data folder is, and is anything piling up (docs/footprint.md).
+  try {
+    const { Store } = await import("./store.js");
+    const { lastCaptureAt, captureBacklog, spoolSize, captureSettings, SPOOL_MAX_BYTES } = await import("./capture.js");
+    const { dirBytes } = await import("./uninstall.js");
+    const { DATA_DIR } = await import("./config.js");
+    const spool = spoolSize(DATA_DIR);
+    const set = captureSettings(DATA_DIR);
+    let last: string | null = null;
+    let backlog = 0;
+    if (!dbProblem) {
+      const s = new Store(DB_PATH);
+      try {
+        last = lastCaptureAt(s);
+        backlog = captureBacklog(s);
+      } finally {
+        s.close();
+      }
+    }
+    console.log(`  [info] capture: ${set.enabled ? "on" : "off (ONEMEMORY_CAPTURE / capture.json)"}; last event ${last ?? "never"}; spool ${spool} bytes; ${backlog} event(s) not yet distilled`);
+    if (spool >= SPOOL_MAX_BYTES) warn(`the capture spool is full (${spool} bytes): new events are dropped until a hook can open the database`);
+    else if (spool > 0) warn(`${spool} bytes of captured events are waiting in the spool; the next hook that can open the database stores them`);
+    if (backlog > DOCTOR_MAX_BACKLOG) {
+      warn(`${backlog} captured events are waiting to be distilled (over ${DOCTOR_MAX_BACKLOG}); that happens when a session starts or ends, so a failing session hook is the likely cause`);
+    }
+    const bytes = dirBytes(DATA_DIR);
+    const mb = (bytes / 1e6).toFixed(1);
+    if (bytes > DOCTOR_MAX_DATA_BYTES) warn(`data folder ${DATA_DIR} is ${mb} MB (over ${DOCTOR_MAX_DATA_BYTES / 1e9} GB); docs/footprint.md says what is in it and what is safe to remove`);
+    else ok(`data folder ${DATA_DIR} is ${mb} MB`);
+  } catch (e) {
+    warn("capture status unavailable: " + (e as Error).message);
   }
 
   console.log(`\n  bind ${BIND_HOST}   api :${API_PORT}   mcp :${MCP_HTTP_PORT}`);
@@ -495,6 +566,24 @@ async function recall(): Promise<void> {
     })
   );
   process.exit(0);
+}
+
+// The capture hooks: `onememory hook <event>` with the agent's hook JSON on stdin. FAIL-OPEN by design (see hook.ts):
+// prints nothing or one valid hook JSON object, and exits 0 whatever happens, including a module that fails to load.
+async function hookCmd(): Promise<void> {
+  const event = process.argv[3] ?? "";
+  let out = "";
+  try {
+    const { runHook, readStdin } = await import("./hook.js");
+    const args = process.argv.slice(4);
+    const i = args.indexOf("--db");
+    out = await runHook(event, await readStdin(), i >= 0 && args[i + 1] ? { dbPath: args[i + 1] } : {});
+  } catch (e) {
+    console.error(`onememory hook: ${(e as Error).message}`);
+    out = event === "session-start" ? '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""}}' : "";
+  }
+  if (out) process.stdout.write(out + "\n", () => process.exit(0));
+  else process.exit(0);
 }
 
 // Find near-duplicate notes and merge them. Safe by default: without --yes
@@ -862,7 +951,10 @@ async function backupCmd(): Promise<void> {
     return;
   }
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*$/, "").replace("T", "-");
-  const out = str(flags.out) ?? `onememory-backup-${stamp}`;
+  // Default in the home folder, never the current one: run inside a repo, a backup (notes + key) there could get committed.
+  const { homedir } = await import("node:os");
+  const { join } = await import("node:path");
+  const out = str(flags.out) ?? join(homedir(), `onememory-backup-${stamp}`);
   const store = new Store(DB_PATH);
   try {
     const r = backupStore(store, DB_PATH, out, {
@@ -982,6 +1074,30 @@ async function watchCmd(): Promise<void> {
       exec,
       signal: abort.signal,
     });
+  } finally {
+    store.close();
+  }
+}
+
+// `onememory never-show <id> [--undo]`: keep a note out of the session-start context for good (it stays searchable).
+async function neverShowCmd(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const { setNeverShow } = await import("./context-inject.js");
+  const args = process.argv.slice(3);
+  const id = Number(args.find((a) => !a.startsWith("-")));
+  if (!Number.isInteger(id) || id < 1) {
+    console.error("usage: onememory never-show <note id> [--undo]");
+    process.exit(1);
+  }
+  const store = new Store(DB_PATH);
+  try {
+    const n = setNeverShow(store, id, !args.includes("--undo"));
+    if (!n) {
+      console.error(`no note with id ${id}`);
+      process.exit(1);
+    }
+    console.log(args.includes("--undo") ? `#${id} can be shown at session start again` : `#${id} will not be shown at session start again (undo: onememory never-show ${id} --undo)`);
   } finally {
     store.close();
   }
@@ -1166,9 +1282,28 @@ async function importCmd(): Promise<void> {
   const { Store, ValidationError } = await import("./store.js");
   const { importMarkdown } = await import("./sync.js");
   const { flags } = parseFlags(process.argv.slice(3), {
-    values: ["dir", "file", "project", "namespace"],
+    values: ["dir", "file", "project", "namespace", "from", "path"],
     bools: ["dry-run", "json", "allow-move", "dedupe", "require-attestation", "claude", "yes", "update", "include-index"],
   });
+  if (str(flags.from)) {
+    const { runForeignImport, FOREIGN_SOURCES } = await import("./foreign-import.js");
+    const from = str(flags.from) as (typeof FOREIGN_SOURCES)[number];
+    if (!FOREIGN_SOURCES.includes(from)) {
+      console.error(`Usage: onememory import --from ${FOREIGN_SOURCES.join("|")} [--path p] [--dry-run] [--yes] [--namespace ns]`);
+      process.exit(1);
+    }
+    const { realEnv } = await import("./setup.js");
+    const { PACKAGE_VERSION } = await import("./config.js");
+    process.exitCode = await runForeignImport(realEnv(PACKAGE_VERSION, fileURLToPath(import.meta.url)), terminalIO(), {
+      from,
+      path: str(flags.path),
+      dryRun: flags["dry-run"] === true,
+      yes: flags.yes === true,
+      namespace: str(flags.namespace),
+      dbPath: DB_PATH,
+    });
+    return;
+  }
   if (flags.claude === true) {
     const { runClaudeImport } = await import("./claude-import.js");
     const { realEnv } = await import("./setup.js");
@@ -1644,6 +1779,94 @@ async function quarantineCmd(): Promise<void> {
   }
 }
 
+// `onememory decay [--dry-run] [--namespace ns]`: archive (never delete) idle captured rows now; --dry-run only lists them.
+async function decayCmd(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store, decayConfig } = await import("./store.js");
+  const { flags } = parseFlags(process.argv.slice(3), { values: ["namespace"], bools: ["dry-run"] });
+  const ns = str(flags.namespace);
+  const namespaces = ns ? [ns] : undefined;
+  const store = new Store(DB_PATH);
+  try {
+    const cfg = decayConfig();
+    if (cfg.days === 0) {
+      console.log("Decay is off (ONEMEMORY_DECAY_DAYS=0).");
+      return;
+    }
+    if (flags["dry-run"]) {
+      const rows = store.decayCandidates(Date.now(), namespaces);
+      if (!rows.length) {
+        console.log("Nothing would be archived.");
+        return;
+      }
+      for (const r of rows) console.log(`#${r.id} [${r.namespace}] ${r.obs_type || r.kind}: ${r.title}  (idle ${r.idleDays} days)`);
+      console.log(`${rows.length} row(s) would be archived. Run \`onememory decay\` to archive them; \`onememory restore <id>\` brings one back.`);
+      return;
+    }
+    const n = store.sweepDecay(Date.now(), namespaces);
+    console.log(`Archived ${n} idle captured row(s). Nothing was deleted: \`onememory restore <id>\` brings one back.`);
+  } finally {
+    store.close();
+  }
+}
+
+// `onememory archive <id>` / `onememory restore <id>`: the same soft archive and restore as POST /notes/:id/archive|restore.
+async function archiveCmd(action: "archive" | "restore"): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store, ValidationError } = await import("./store.js");
+  const id = Number(process.argv[3]);
+  if (!Number.isInteger(id)) {
+    console.error(`Usage: onememory ${action} <id>`);
+    process.exit(1);
+  }
+  const store = new Store(DB_PATH);
+  try {
+    const before = store.read(id); // gate-ok: local shell command (archive/restore): the operator owns the database file
+    if (!before || (action === "archive") !== !before.archived_at) {
+      console.error(before ? `Note #${id} is ${action === "archive" ? "already archived" : "not archived"}.` : `No note #${id}.`);
+      process.exit(1);
+    }
+    const note = action === "archive" ? store.archive(id) : store.restore(id);
+    console.log(`${action === "archive" ? "Archived" : "Restored"} #${id} "${note?.title}".${action === "archive" ? ` Undo: onememory restore ${id}` : ""}`);
+  } catch (e) {
+    if (e instanceof ValidationError) {
+      console.error(`Error: ${e.message}`);
+      process.exit(1);
+    }
+    throw e;
+  } finally {
+    store.close();
+  }
+}
+
+// `onememory quality [--json] [--namespace ns]`: what in the store is worth a look, with the command that fixes each.
+async function qualityCmd(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const { qualityReport, QUALITY_TYPES } = await import("./quality.js");
+  const { flags } = parseFlags(process.argv.slice(3), { values: ["namespace"], bools: ["json"] });
+  const ns = str(flags.namespace);
+  const store = new Store(DB_PATH);
+  try {
+    const report = await qualityReport(store, ns ? [ns] : undefined);
+    if (flags.json) {
+      console.log(JSON.stringify(report, null, 2));
+      return;
+    }
+    if (!report.issues.length) {
+      console.log("No quality issues found.");
+      return;
+    }
+    console.log(QUALITY_TYPES.map((t) => `${report.counts[t]} ${t}`).join(", "));
+    for (const i of report.issues) {
+      console.log(`\n[${i.type}] [${i.namespace}] ${i.detail}`);
+      console.log(`    fix: ${i.fix}${i.alt ? `   (or: ${i.alt})` : ""}`);
+    }
+  } finally {
+    store.close();
+  }
+}
+
 /**
  * `onememory encrypt <enable|status|disable>` -- at-rest body encryption.
  *
@@ -1829,7 +2052,7 @@ async function setupCmd(): Promise<void> {
   const { runSetup, realEnv, DEFAULT_OPTIONS } = await import("./setup.js");
   const { flags } = parseFlags(process.argv.slice(3), {
     values: ["only", "db", "command"],
-    bools: ["dry-run", "yes", "undo", "hook", "no-hook", "project", "no-test-note", "no-doctor", "force-empty"],
+    bools: ["dry-run", "yes", "undo", "hook", "no-hook", "capture", "no-capture", "project", "no-test-note", "no-doctor", "force-empty"],
   });
   const command = str(flags.command) ?? "auto";
   if (!["auto", "node", "npx"].includes(command)) {
@@ -1840,6 +2063,10 @@ async function setupCmd(): Promise<void> {
     console.error("Choose one of --hook and --no-hook");
     process.exit(1);
   }
+  if (flags.capture === true && flags["no-capture"] === true) {
+    console.error("Choose one of --capture and --no-capture");
+    process.exit(1);
+  }
   const { PACKAGE_VERSION } = await import("./config.js");
   const e = realEnv(PACKAGE_VERSION, fileURLToPath(import.meta.url));
   process.exitCode = await runSetup(e, terminalIO(), {
@@ -1848,6 +2075,7 @@ async function setupCmd(): Promise<void> {
     yes: flags.yes === true,
     undo: flags.undo === true,
     hook: flags.hook === true ? "yes" : flags["no-hook"] === true ? "no" : "ask",
+    capture: flags.capture === true ? "yes" : flags["no-capture"] === true ? "no" : "ask",
     project: flags.project === true,
     noTestNote: flags["no-test-note"] === true,
     noDoctor: flags["no-doctor"] === true,
@@ -1855,6 +2083,20 @@ async function setupCmd(): Promise<void> {
     only: str(flags.only)?.split(",").map((x) => x.trim()).filter(Boolean),
     db: str(flags.db),
     command: command as "auto" | "node" | "npx",
+  });
+}
+
+// `onememory uninstall`: see uninstall.ts.
+async function uninstallCmd(): Promise<void> {
+  const { realEnv } = await import("./setup.js");
+  const { runUninstall } = await import("./uninstall.js");
+  const { flags } = parseFlags(process.argv.slice(3), { values: [], bools: ["purge", "dry-run", "yes", "no-backup"] });
+  const { PACKAGE_VERSION } = await import("./config.js");
+  process.exitCode = await runUninstall(realEnv(PACKAGE_VERSION, fileURLToPath(import.meta.url)), terminalIO(), {
+    purge: flags.purge === true,
+    dryRun: flags["dry-run"] === true,
+    yes: flags.yes === true,
+    noBackup: flags["no-backup"] === true,
   });
 }
 
@@ -1889,14 +2131,15 @@ async function main(): Promise<void> {
   }
   // Move 1.0.x state out of the package before anything opens the DB.
   // (`bench` runs on a throwaway store and must never touch the real data directory.)
-  // A dry run of `import --claude` or `sync` must not create anything, not even the data folder.
-  const dry = process.argv.includes("--dry-run") && ((cmd === "import" && process.argv.includes("--claude")) || cmd === "sync");
-  if (!dry && !["help", "--help", "-h", "init", "bench", "setup"].includes(cmd)) (await import("./config.js")).prepareDataDir();
+  // A dry run of `import --claude` / `import --from` or `sync` must not create anything, not even the data folder.
+  const dry = process.argv.includes("--dry-run") && ((cmd === "import" && (process.argv.includes("--claude") || process.argv.includes("--from"))) || cmd === "sync");
+  // The capture hooks (`hook`) never move or create data folders: they run on every tool call and must stay quick and quiet.
+  if (!dry && !["help", "--help", "-h", "init", "bench", "setup", "uninstall", "hook"].includes(cmd)) (await import("./config.js")).prepareDataDir();
   // Fixed writer marker for notes this process writes with no token behind
   // them (written_by): the long-running server's own jobs, the stdio MCP
   // server, or an `onememory ...` command run by the machine owner.
   setProcessWriter(
-    cmd === "start" || cmd === "serve" ? "server" : cmd === "mcp" || cmd === "mcp:stdio" ? "stdio" : "cli"
+    cmd === "start" || cmd === "serve" ? "server" : cmd === "mcp" || cmd === "mcp:stdio" ? "stdio" : cmd === "hook" ? "capture" : "cli"
   );
   switch (cmd) {
     case "start":
@@ -1916,6 +2159,9 @@ async function main(): Promise<void> {
     case "setup":
       await setupCmd();
       break;
+    case "uninstall":
+      await uninstallCmd();
+      break;
     case "sync":
       await syncCmd();
       break;
@@ -1924,6 +2170,9 @@ async function main(): Promise<void> {
       break;
     case "recall":
       await recall();
+      break;
+    case "hook":
+      await hookCmd();
       break;
     case "consolidate":
       await consolidate();
@@ -1958,8 +2207,21 @@ async function main(): Promise<void> {
     case "quarantine":
       await quarantineCmd();
       break;
+    case "decay":
+      await decayCmd();
+      break;
+    case "archive":
+    case "restore":
+      await archiveCmd(cmd);
+      break;
+    case "quality":
+      await qualityCmd();
+      break;
     case "encrypt":
       await encryptCmd();
+      break;
+    case "never-show":
+      await neverShowCmd();
       break;
     case "supersede":
       await supersedeCmd("supersede");
@@ -1968,8 +2230,15 @@ async function main(): Promise<void> {
       await supersedeCmd("history");
       break;
     case "bench": {
+      const args = process.argv.slice(3);
+      if (args.includes("--longmemeval") || args.includes("--locomo")) {
+        // Imported before anything loads config.js: it moves ONEMEMORY_HOME to a temp folder first.
+        const { retrievalMain } = await import("./bench/retrieval.js");
+        process.exitCode = await retrievalMain(args);
+        break;
+      }
       const { benchMain } = await import("./bench/index.js");
-      process.exitCode = await benchMain(process.argv.slice(3));
+      process.exitCode = await benchMain(args);
       break;
     }
     case "help":

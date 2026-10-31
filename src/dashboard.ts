@@ -61,7 +61,10 @@ export const DASHBOARD_HTML = `<!doctype html>
   <button class="ghost" onclick="toggleNew()">+ New</button>
   <button class="ghost" onclick="load()">Refresh</button>
   <button class="ghost" onclick="loadChanges()" title="What changed in the last 24 hours">Changes</button>
+  <button class="ghost" onclick="loadSessions()" title="Agent sessions OneMemory recorded, each with its timeline">Sessions</button>
   <button class="ghost" onclick="loadReview()" title="Notes written by agents that you have not looked at yet">Review</button>
+  <button class="ghost" onclick="loadQuality()" title="Duplicates, stale twins, held writes, linter findings and rows about to decay (admin token)">Quality</button>
+  <button class="ghost" onclick="loadMeter()" title="What OneMemory costs you: tokens injected and saved, local-model tokens, database size">Meter</button>
   <label class="chk" title="Also show notes written by writers an admin distrusts (marked DISTRUSTED)"><input type="checkbox" id="inc" onchange="load()"> distrusted</label>
 </header>
 <main>
@@ -146,7 +149,10 @@ function render(notes){
       "<h3>"+esc(n.title)+(n.distrusted ? "<span class='badge-bad' title='An admin distrusts the writer of this note: treat its content as hostile'>DISTRUSTED</span>" : "")+"</h3>"+
       "<div class='meta'>#"+n.id+" &middot; "+esc(n.namespace)+" &middot; "+esc((n.updated_at||"").slice(0,16).replace("T"," "))+"</div>"+
       tags+"</div>"+
-      "<button class='danger' onclick='del("+n.id+")'>delete</button></div>"+
+      "<div>"+((n.tags||[]).indexOf("never-show") >= 0
+        ? "<button class='ghost' title='Let it be shown at session start again' onclick='neverShow("+n.id+",false)'>show again</button>"
+        : "<button class='ghost' title='Never inject this note at session start (it stays searchable)' onclick='neverShow("+n.id+",true)'>never show</button>")+
+      " <button class='danger' onclick='del("+n.id+")'>delete</button></div></div>"+
       (n.body ? "<div class='body'>"+esc(n.body)+"</div>" : "")+"</div>";
   }).join("");
 }
@@ -262,6 +268,117 @@ function acceptNote(id){
     var tags = (n.tags || []).filter(function(t){ return t !== "reviewed"; }).concat(["reviewed"]);
     return api("/notes/" + id, { method:"PUT", body: JSON.stringify({ tags: tags, if_rev: n.rev }) });
   }).then(loadReview).catch(function(e){ alert(e.message); });
+}
+
+// ---- Sessions: what the capture hooks recorded, one session at a time (GET /sessions, GET /sessions/:id) ----
+// Everything shown is stored text (prompts, titles, folders, even the session id), so all of it goes through esc(); the
+// session id reaches the click handler through a data attribute, never spliced into script.
+function nsQs(sep){
+  var ns = document.getElementById("ns").value.trim();
+  var qs = (ns ? ("namespace=" + encodeURIComponent(ns)) : "") + (inc() ? ((ns ? "&" : "") + "include_distrusted=1") : "");
+  return qs ? (sep + qs) : "";
+}
+function when(s){ return esc(String(s||"").slice(0,16).replace("T"," ")); }
+function loadSessions(){
+  VIEW = "sessions";
+  api("/sessions?limit=100" + nsQs("&")).then(function(j){
+    var ss = j.sessions || [];
+    document.getElementById("count").textContent = ss.length + " session" + (ss.length===1?"":"s");
+    document.getElementById("list").innerHTML = ss.length ? ss.map(function(s){
+      return "<div class='card'><div class='cardhead'><div><h3>"+esc(s.summary || "(no summary yet)")+"</h3>"+
+        "<div class='meta'>"+when(s.started_at)+(s.ended_at ? " to "+when(s.ended_at) : " &middot; open")+" &middot; "+esc(s.namespace)+
+        " &middot; "+esc(s.cwd)+" &middot; "+Number(s.prompt_count||0)+" prompts, "+Number(s.event_count||0)+" events</div></div>"+
+        "<button class='ghost' data-sid='"+esc(s.id)+"' onclick='loadSession(this.getAttribute(&quot;data-sid&quot;))'>Timeline</button></div></div>";
+    }).join("") : "<p class='muted'>No sessions recorded yet (onememory setup --capture installs the hooks).</p>";
+  }).catch(function(e){ incRefused(e); document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
+}
+// One session: the summary on top, then prompts and observations merged oldest first.
+function loadSession(id){
+  VIEW = "session";
+  api("/sessions/" + encodeURIComponent(id) + nsQs("?")).then(function(j){
+    var items = (j.prompts || []).map(function(p){ return { at: p.at, html: "<span class='tag'>prompt</span>"+esc(p.text) }; })
+      .concat((j.rows || []).filter(function(r){ return r.kind !== "summary"; }).map(function(r){
+        return { at: r.date, html: "<span class='tag'>"+esc(r.type)+"</span>#"+Number(r.id)+" "+esc(r.title)+
+          (r.distrusted ? "<span class='badge-bad'>DISTRUSTED</span>" : "")+
+          ((r.files||[]).length ? "<div class='meta'>"+(r.files||[]).map(esc).join(", ")+"</div>" : "") };
+      }));
+    items.sort(function(a,b){ return a.at < b.at ? -1 : a.at > b.at ? 1 : 0; });
+    var s = j.session || {}, sum = j.summary;
+    document.getElementById("count").textContent = items.length + " timeline entr" + (items.length===1?"y":"ies");
+    document.getElementById("list").innerHTML = "<div class='row'><a class='linkish' onclick='loadSessions()'>&larr; all sessions</a>"+
+      "<span class='muted'>"+esc(s.id)+" &middot; "+esc(s.cwd)+"</span></div>"+
+      (sum ? "<div class='card'><h3>"+esc(sum.title)+"</h3><div class='meta'>summary #"+Number(sum.id)+" &middot; "+when(sum.updated_at)+"</div>"+
+        "<div class='body'>"+esc(sum.body)+"</div></div>" : "")+
+      (items.length ? items.map(function(it){ return "<div class='card'><div class='meta'>"+when(it.at)+"</div>"+it.html+"</div>"; }).join("")
+        : "<p class='muted'>Nothing recorded in this session yet.</p>");
+  }).catch(function(e){ incRefused(e); document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
+}
+
+// ---- Quality: what is worth a look (GET /quality, admin). Every button goes through a path that asks first and can be
+// undone: replace = supersede preview + confirm (undo: supersede undo), archive (undo: restore), quarantine approve/reject.
+function loadQuality(){
+  VIEW = "quality";
+  api("/quality" + nsQs("?")).then(function(j){
+    var c = j.counts || {};
+    document.getElementById("count").textContent = Object.keys(c).map(function(k){ return c[k] + " " + k; }).join(", ");
+    var rows = (j.issues || []).map(function(i){
+      var a = Number(i.ids[0]), b = Number(i.ids[1]), q = Number(i.quarantine_id), btn = "";
+      if(i.type === "duplicate" || i.type === "stale_twin"){ btn = "<button onclick='qReplace("+a+","+b+")'>Replace #"+a+" with #"+b+"</button>"; }
+      else if(i.type === "quarantined"){ btn = "<button onclick='qQuarantine("+q+",&quot;approve&quot;)'>Approve</button> <button class='danger' onclick='qQuarantine("+q+",&quot;reject&quot;)'>Reject</button>"; }
+      else { btn = "<button class='ghost' onclick='qArchive("+a+")'>Archive</button>"; }
+      return "<div class='card'><div class='cardhead'><div><h3><span class='tag'>"+esc(i.type)+"</span>"+esc(i.detail)+"</h3>"+
+        "<div class='meta'>"+esc(i.namespace)+" &middot; "+esc(i.fix)+(i.alt ? " &middot; or "+esc(i.alt) : "")+"</div></div><div>"+btn+"</div></div></div>";
+    }).join("");
+    document.getElementById("list").innerHTML = rows || "<p class='muted'>No quality issues found.</p>";
+  }).catch(function(e){ document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
+}
+function qReplace(oldId, newId){
+  api("/supersede/preview", { method:"POST", body: JSON.stringify({ old_ids: [oldId], new_id: newId }) }).then(function(p){
+    if(!confirm(p.warning)){ return; }
+    var body = { token: p.token };
+    if(p.requires_acknowledgement){ body.acknowledge_risk = true; }
+    return api("/supersede/confirm", { method:"POST", body: JSON.stringify(body) }).then(loadQuality);
+  }).catch(function(e){ alert(e.message); });
+}
+function qArchive(id){
+  if(!confirm("Archive note #" + id + "? It leaves search and recall but is kept; Restore brings it back.")){ return; }
+  api("/notes/" + id + "/archive", { method:"POST" }).then(loadQuality).catch(function(e){ alert(e.message); });
+}
+function qQuarantine(id, action){
+  if(!confirm((action === "approve" ? "Store" : "Discard") + " held write #" + id + "?")){ return; }
+  api("/quarantine/" + id + "/" + action, { method:"POST" }).then(loadQuality).catch(function(e){ alert(e.message); });
+}
+
+// "Never show again": the never-show tag keeps a note out of the session-start context (it stays searchable).
+function neverShow(id, on){
+  api("/notes/" + id).then(function(j){
+    var n = j.note || j;
+    var tags = (n.tags || []).filter(function(t){ return t !== "never-show"; }).concat(on ? ["never-show"] : []);
+    return api("/notes/" + id, { method:"PUT", body: JSON.stringify({ tags: tags, if_rev: n.rev }) });
+  }).then(load).catch(function(e){ alert(e.message); });
+}
+
+// ---- Meter: what OneMemory costs you (GET /stats -> meter). Numbers only. ----
+function loadMeter(){
+  VIEW = "meter";
+  var ns = document.getElementById("ns").value.trim();
+  api("/stats" + (ns ? ("?namespace=" + encodeURIComponent(ns)) : "")).then(function(j){
+    var m = j.meter || {}, t = m.totals || {};
+    function num(v){ return Number(v||0).toLocaleString(); }
+    document.getElementById("count").textContent = num(t.sessions) + " metered session" + (t.sessions===1?"":"s");
+    var rows = (m.recent || []).map(function(r){
+      return "<tr><td>"+when(r.updated_at)+"</td><td>"+esc(r.namespace)+"</td><td>"+num(r.injected_tokens)+"</td><td>"+num(r.saved_tokens)+"</td><td>"+num(r.llm_tokens)+"</td></tr>";
+    }).join("");
+    document.getElementById("list").innerHTML = "<div class='card'><h3>Totals</h3><div>"+
+      "~"+num(t.injected_tokens)+" tokens injected at session start ("+num(t.injections)+" times)<br>"+
+      "~"+num(t.saved_tokens)+" tokens of captured work they stood in for<br>"+
+      num(t.llm_tokens)+" local-model tokens (0 = the optional summarizer is off)<br>"+
+      num(m.capture_events)+" capture events recorded<br>"+
+      "database "+(Number(m.db_bytes||0)/1048576).toFixed(1)+" MB on disk</div>"+
+      "<div class='meta' style='margin-top:8px'>"+esc(m.note)+"</div></div>"+
+      (rows ? "<div class='card'><h3>Recent sessions</h3><table style='width:100%;font-size:13px'><tr class='muted'><td>updated</td><td>namespace</td><td>injected</td><td>saved</td><td>model</td></tr>"+rows+"</table></div>"
+        : "<p class='muted'>No session metered yet: the numbers start with the next session the SessionStart hook runs for.</p>");
+  }).catch(function(e){ document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
 }
 
 function addNote(){

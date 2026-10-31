@@ -13,8 +13,10 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Store } from "../store.js";
 import { createApiServer } from "../api.js";
 import { createMcpServer } from "../mcp-server-core.js";
+import { runRecall } from "../recall.js";
+import { captureAad } from "../capture.js";
 import type { TokenEntry } from "../config.js";
-import type { BenchNote, Capability, MemoryAdapter, OpResult, Outcome, ReplacementInput, SearchOpts, UpdateInput, WorldSpec, WriteInput } from "./types.js";
+import type { BenchNote, CaptureInput, Capability, MemoryAdapter, OpResult, Outcome, ReplacementInput, SearchOpts, UpdateInput, WorldSpec, WriteInput } from "./types.js";
 
 interface ServerHandle {
   name: string;
@@ -33,7 +35,7 @@ interface ActorHandle {
   namespace?: string;
 }
 
-const CAPS: Capability[] = ["read", "list", "restore", "retire", "trust", "export_import", "attestation", "merge", "recall", "changes", "tenants", "cas", "supersede", "history"];
+const CAPS: Capability[] = ["read", "list", "restore", "retire", "trust", "export_import", "attestation", "merge", "recall", "changes", "tenants", "cas", "supersede", "history", "capture", "session_start"];
 
 function toOutcome(status: number): Outcome {
   if (status === 200 || status === 201) return "ok";
@@ -463,5 +465,64 @@ export class OneMemoryAdapter implements MemoryAdapter {
       await client.close().catch(() => undefined);
       await mcp.close().catch(() => undefined);
     }
+  }
+
+  // ---- automatic memory: capture a tool/web observation, and the SessionStart recall --------------------------
+
+  /**
+   * Record one capture hook event through POST /capture, then read back what was ACTUALLY persisted (decrypted from
+   * the capture_events table) so a check can prove the server redacted secrets and never stored the raw observation.
+   */
+  async capture(actor: string, input: CaptureInput): Promise<OpResult> {
+    await nextTick(this.clock);
+    const a = this.actor(actor);
+    const session = input.session ?? `sess-${actor}`;
+    const body: Raw = {
+      event: input.event ?? "post-tool",
+      session_id: session,
+      tool: input.tool ?? "WebFetch",
+      input: input.input ?? "",
+      output: input.output ?? "",
+    };
+    if (input.namespace !== undefined) body.namespace = input.namespace;
+    const r = await this.http(actor, "POST", "/capture", body);
+    if (r.status !== 202) return this.fail(r.status, r.json);
+    const stored = r.json.stored === true;
+    // Read the persisted row straight from the store (what an attacker's observation turned into on disk).
+    const db = this.srv(a).store.captureDb();
+    const row = db
+      .prepare("SELECT seq, input, input_enc, output, output_enc FROM capture_events WHERE session_id = ? ORDER BY seq DESC LIMIT 1")
+      .get(session) as { seq: number; input: string; input_enc: string | null; output: string; output_enc: string | null } | undefined;
+    let storedText = "";
+    if (row) {
+      const open = (text: string, enc: string | null, which?: "input"): string => {
+        if (!text) return "";
+        try {
+          return this.srv(a).store.openCapture(text, enc, captureAad(row.seq, session, which));
+        } catch {
+          return "";
+        }
+      };
+      storedText = [open(row.input, row.input_enc, "input"), open(row.output, row.output_enc)].filter(Boolean).join("\n");
+    }
+    return { outcome: "ok", text: storedText, data: { stored, persisted: Boolean(row) } };
+  }
+
+  /**
+   * The SessionStart recall injection: the exact text an agent is handed before its first prompt, produced by the
+   * product's own runRecall (so the UNTRUSTED banner and the distrusted-writer filter are the ones under test).
+   */
+  async sessionStart(actor: string): Promise<OpResult> {
+    const a = this.actor(actor);
+    const folder = join(this.dir, a.server);
+    const payload = await runRecall({ dbPath: join(folder, "state.db"), cwd: folder, budgetMs: 0 });
+    let context = "";
+    try {
+      const parsed = JSON.parse(payload) as { hookSpecificOutput?: { additionalContext?: unknown } };
+      if (typeof parsed.hookSpecificOutput?.additionalContext === "string") context = parsed.hookSpecificOutput.additionalContext;
+    } catch {
+      /* fail-silent, like the hook */
+    }
+    return { outcome: "ok", text: context, data: { length: context.length } };
   }
 }

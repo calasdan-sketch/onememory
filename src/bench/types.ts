@@ -142,7 +142,9 @@ export type Capability =
   | "tenants" //      per-tenant isolation
   | "cas" //         compare-and-swap update
   | "supersede" //   two-step replace (preview, then confirm with a one-time code) and undo
-  | "history"; //    earlier versions of a note, and restoring one
+  | "history" //     earlier versions of a note, and restoring one
+  | "capture" //     record an automatic-memory hook event (tool output, web fetch) the way the capture hooks do
+  | "session_start"; // produce the SessionStart recall injection an agent receives pre-prompt
 
 export interface MemoryAdapter {
   readonly name: string;
@@ -183,6 +185,23 @@ export interface MemoryAdapter {
   /** Earlier versions of a note. `data.versions` is the list, `text` the raw payload. */
   history?(actor: string, id: string, opts?: { include_distrusted?: boolean }): Promise<OpResult>;
   restoreVersion?(actor: string, id: string, version: number, opts?: { if_rev?: number }): Promise<OpResult>;
+  /** Record one capture hook event. `text` is what was actually persisted (after redaction), `data.stored` whether it was kept. */
+  capture?(actor: string, input: CaptureInput): Promise<OpResult>;
+  /** The SessionStart recall text an agent is handed before its first prompt. `text` is the injected context (banner included). */
+  sessionStart?(actor: string, opts?: { namespace?: string }): Promise<OpResult>;
+}
+
+/** One automatic-memory hook event, as a capture hook would hand it over. */
+export interface CaptureInput {
+  /** Hook event name (default "post-tool"). */
+  event?: string;
+  /** The tool whose work this is (default "WebFetch"); OneMemory's own tools are never recorded. */
+  tool?: string;
+  input?: string;
+  output?: string;
+  /** Session id (default: the actor name). */
+  session?: string;
+  namespace?: string;
 }
 
 /** The text of the note that takes the place of the old ones. */
@@ -196,12 +215,14 @@ export interface ReplacementInput {
 // ---------------------------------------------------------------------------------------------------------------
 // Scenario files
 
-export type Suite = "stale" | "contradiction" | "isolation" | "provenance";
-export const SUITES: readonly Suite[] = ["stale", "contradiction", "isolation", "provenance"];
+export type Suite = "stale" | "contradiction" | "isolation" | "provenance" | "poison";
+export const SUITES: readonly Suite[] = ["stale", "contradiction", "isolation", "provenance", "poison"];
 
 export type Step =
   | ({ op: "write"; as: string; ref: string; id?: string } & WriteInput)
   | ({ op: "update"; as: string; ref: string; id?: string; if_rev_of?: string } & UpdateInput)
+  | { op: "capture"; as: string; id: string; event?: string; tool?: string; input?: string; output?: string; session?: string; namespace?: string }
+  | { op: "session_start"; as: string; id: string; namespace?: string }
   | { op: "delete" | "archive" | "unarchive" | "read"; as: string; ref: string; id?: string; include_distrusted?: boolean }
   | { op: "search"; as: string; q: string; id: string; limit?: number; include_distrusted?: boolean; include_superseded?: boolean; namespace?: string }
   | { op: "list"; as: string; id: string; namespace?: string; include_archived?: boolean; include_superseded?: boolean }
@@ -233,7 +254,7 @@ export type CheckKind =
   | "recoverable"; // a provenance value is still findable on the note after a move
 
 /** Which headline number a check feeds. */
-export type Metric = "leak" | "unexpected_denial" | "field" | "resolution" | "loser_visible" | "silent_overwrite";
+export type Metric = "leak" | "unexpected_denial" | "field" | "resolution" | "loser_visible" | "silent_overwrite" | "poison_reach";
 
 export interface Check {
   check: CheckKind;

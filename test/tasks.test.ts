@@ -545,7 +545,7 @@ describe("recall: task board in the SessionStart hook", () => {
       s.create({ title: "Only", body: "note" });
       s.close();
       const ctx = ctxOf(await runRecall({ dbPath: db }));
-      assert.ok(ctx.includes("Recent memory (1 note):\n- [Only]: note"));
+      assert.ok(ctx.includes("Recent memory (1 note):\n- [Only] {recent 0d}: note"));
       assert.ok(!ctx.includes("Open tasks") && !ctx.includes("handoff"));
     } finally {
       rmSync(dir, { recursive: true, force: true });

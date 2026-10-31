@@ -87,7 +87,7 @@ note's original author. Read [docs/trust.md](./docs/trust.md) for exactly what t
 - **Version history (1.6.0)** keeps the text an edit replaces, so it can hold text someone removed on purpose. It is administrators-only,
   bounded per note, encrypted at rest when encryption is on (plaintext otherwise, like note bodies), included in `export` unless
   `?history=0` / `--no-history`, and removable with `history purge`. Treat an export that carries history like the database.
-- Pre-upgrade copies (`<db>.pre-v15-backup`) are plaintext snapshots: remove them
+- Pre-upgrade copies (`<db>.pre-v16-backup`) are plaintext snapshots: remove them
   (`onememory backup --prune-premigration`) once the upgrade is checked, especially before enabling encryption.
 
 ## Encryption at rest (shipped in 1.2.0)

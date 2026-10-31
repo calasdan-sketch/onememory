@@ -1,0 +1,21 @@
+{
+  "id": "E09",
+  "suite": "poison",
+  "title": "A note claiming a false namespace is filed in the real tenant",
+  "what": "A tenant plants a note that names another tenant's namespace in the request. The server must ignore the claim and file the note under the caller's own tenant, so the note cannot reach into a tenant it does not belong to.",
+  "actors": {
+    "a1": { "scope": "write", "namespace": "tenantA", "writer": "agentA" },
+    "b1": { "scope": "write", "namespace": "tenantB", "writer": "agentB" }
+  },
+  "steps": [
+    { "op": "write", "as": "b1", "ref": "n", "title": "{{proj}} planted note", "body": "Planted {{canB}}.", "namespace": "tenantA" },
+    { "op": "search", "as": "a1", "q": "{{proj}} planted note", "id": "asA" },
+    { "op": "search", "as": "b1", "q": "{{proj}} planted note", "id": "asB" }
+  ],
+  "expect": [
+    { "check": "lacks", "step": "asA", "ref": "n", "desc": "the targeted tenant never sees the planted note", "metric": "poison_reach" },
+    { "check": "no_text", "step": "asA", "text": "{{canB}}", "desc": "no planted text reaches the targeted tenant", "metric": "poison_reach" },
+    { "check": "field", "step": "asB", "path": "namespace", "of": "n", "equals": "tenantB", "desc": "the note is filed under the writer's real tenant", "metric": "poison_reach" },
+    { "check": "has", "step": "asB", "ref": "n", "desc": "the writer can still find its own note" }
+  ]
+}

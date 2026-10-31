@@ -248,12 +248,20 @@ function finalizeResults(
   limit: number,
   staleCfg: StalenessConfig
 ): NoteRecord[] {
+  const notes = rankHits(store, hits, staleCfg).slice(0, limit);
+  bumpAccess(store, notes);
+  return notes;
+}
+
+/**
+ * The ranking half of finalizeResults (access boost, staleness penalty, stale-twin demotion) without the truncation and
+ * the access bump: the session-start context ranks its own pool and decides itself what it shows (context-inject.ts).
+ */
+export function rankHits(store: Store, hits: Array<{ note: NoteRecord; score: number }>, staleCfg: StalenessConfig = stalenessConfig()): NoteRecord[] {
   const ranked = accessRerankEnabled()
     ? demoteStaleTwins(store, applyStalePenalty(boostAndRank(hits), staleCfg), staleCfg).ranked
     : [...hits].sort((a, b) => b.score - a.score); // native relevance only (stable)
-  const notes = ranked.slice(0, limit).map((h) => h.note);
-  bumpAccess(store, notes);
-  return notes;
+  return ranked.map((h) => h.note);
 }
 
 // ---- Retrieval visibility --------------------------------------------------
@@ -469,11 +477,7 @@ async function runSearchInner(
   // better match). Identical documents score identically, so the access
   // boost breaks ties toward the note actually read most often.
   const keyword = (fetchLimit: number): Array<{ note: NoteRecord; score: number }> =>
-    store.searchRanked(query, {
-      namespace: opts.namespace,
-      limit: fetchLimit,
-      ...rangeOpts,
-    });
+    keywordWithFallback(store, query, fetchLimit, { namespace: opts.namespace, ...rangeOpts });
 
   /** Boost, stale-penalize, truncate to the result limit, bump access. */
   const finalize = (
@@ -574,11 +578,7 @@ async function runSearchExplainedInner(
   }
 
   const keyword = (fetchLimit: number): Array<{ note: NoteRecord; score: number }> =>
-    store.searchRanked(query, {
-      namespace: opts.namespace,
-      limit: fetchLimit,
-      ...rangeOpts,
-    });
+    keywordWithFallback(store, query, fetchLimit, { namespace: opts.namespace, ...rangeOpts });
 
   const finalize = (hits: Array<{ note: NoteRecord; score: number }>): ExplainedHit[] =>
     finalizeExplained(store, hits, limit, staleCfg);
@@ -716,6 +716,50 @@ async function runRelevantSearchInner(
     keywords,
     results: finalizeResults(store, hits, limit, stalenessConfig()),
   };
+}
+
+/**
+ * FTS5 search requires every term, so a whole natural-language question
+ * ("what did I decide about the deploy region?") rarely matches anything:
+ * LongMemEval-S session recall@5 was 11.9% that way vs 95.3% matching any
+ * keyword. When the all-terms search leaves room under `limit` and the query
+ * has two or more keywords, top it up with any-keyword hits, fused like
+ * state_relevant. All-terms hits keep their own scores and always rank first;
+ * fallback hits score below the weakest of them.
+ */
+export function keywordWithFallback(
+  store: Store,
+  query: string,
+  limit: number,
+  opts: Parameters<Store["searchRanked"]>[1]
+): Array<{ note: NoteRecord; score: number }> {
+  const strict = store.searchRanked(query, { ...opts, limit });
+  const keywords = extractKeywords(query);
+  if (strict.length >= limit || keywords.length < 2) return strict;
+  const seen = new Set(strict.map((h) => h.note.id));
+  const byId = new Map<number, NoteRecord>();
+  const counts = new Map<number, number>();
+  const lists: number[][] = [];
+  for (const kw of keywords) {
+    const ids: number[] = [];
+    for (const h of store.searchRanked(kw, { ...opts, limit })) {
+      if (seen.has(h.note.id)) continue;
+      ids.push(h.note.id);
+      byId.set(h.note.id, h.note);
+      counts.set(h.note.id, (counts.get(h.note.id) ?? 0) + 1);
+    }
+    lists.push(ids);
+  }
+  // RRF scores are on another scale than bm25: map them under half the
+  // weakest all-terms score so finalize's small boosts cannot lift a partial
+  // match above a full one.
+  const floor = strict.length ? Math.min(...strict.map((h) => h.score)) : 1;
+  const loose = [...rrfScores(lists).entries()]
+    .map(([id, rrf]) => ({ note: byId.get(id)!, score: rrf * (counts.get(id) ?? 1) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit - strict.length);
+  const top = loose.length ? loose[0].score : 1;
+  return [...strict, ...loose.map((h) => ({ note: h.note, score: (floor * 0.5 * h.score) / top }))];
 }
 
 // The public entry points. A caller that opted in with includeDistrusted gets

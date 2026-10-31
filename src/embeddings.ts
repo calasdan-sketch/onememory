@@ -10,9 +10,22 @@
 // Every failure path returns null so the caller silently falls back to
 // keyword search. A memory tool must never lose a write or a query because
 // an optional embedding server was down.
+//
+// ONEMEMORY_EMBEDDINGS=auto: use embeddings when the configured endpoint
+// answers, keyword-only when it does not, without a word on stderr. A failed
+// call marks the endpoint down for AUTO_RETRY_MS (no request at all until
+// then), and the timeout is AUTO_TIMEOUT_MS unless ONEMEMORY_EMBED_TIMEOUT_MS
+// is set, so a machine without the backend never waits on it.
+
+const AUTO_RETRY_MS = 60_000;
+const AUTO_TIMEOUT_MS = 5000;
+/** auto mode: no call before this time (the endpoint failed recently). */
+let autoDownUntil = 0;
 
 export interface EmbeddingsConfig {
   enabled: boolean;
+  /** ONEMEMORY_EMBEDDINGS=auto: a failure is silent and backs off. */
+  auto?: boolean;
   url: string;
   model: string;
   apiKey?: string;
@@ -21,17 +34,24 @@ export interface EmbeddingsConfig {
 
 export function embeddingsConfig(): EmbeddingsConfig {
   const flag = (process.env.ONEMEMORY_EMBEDDINGS || "").trim().toLowerCase();
-  const enabled = flag === "1" || flag === "on" || flag === "true" || flag === "yes";
+  const auto = flag === "auto";
+  const enabled = auto || flag === "1" || flag === "on" || flag === "true" || flag === "yes";
   return {
     enabled,
+    ...(auto ? { auto: true } : {}),
     // Ollama's OpenAI-compatible route by default; override for any other.
     url: process.env.ONEMEMORY_EMBED_URL || "http://localhost:11434/v1/embeddings",
     model: process.env.ONEMEMORY_EMBED_MODEL || "nomic-embed-text",
     apiKey: process.env.ONEMEMORY_EMBED_KEY || undefined,
     // 30s default: a local embedding model's first (cold-load) call can be
     // slow; after that it's fast. Raise it with ONEMEMORY_EMBED_TIMEOUT_MS.
-    timeoutMs: Number(process.env.ONEMEMORY_EMBED_TIMEOUT_MS || 30000),
+    timeoutMs: Number(process.env.ONEMEMORY_EMBED_TIMEOUT_MS || (auto ? AUTO_TIMEOUT_MS : 30000)),
   };
+}
+
+/** Test hook: forget an auto-mode "endpoint is down" mark. */
+export function resetEmbeddingsAuto(): void {
+  autoDownUntil = 0;
 }
 
 export function embeddingsEnabled(): boolean {
@@ -64,6 +84,13 @@ export async function embed(
   cfg: EmbeddingsConfig = embeddingsConfig()
 ): Promise<Float32Array | null> {
   if (!cfg.enabled || !text || !text.trim()) return null;
+  if (cfg.auto && Date.now() < autoDownUntil) return null;
+  // auto: a failure is expected (no backend on this machine), so it is quiet and backs off instead of logging.
+  const fail = (msg: string): null => {
+    if (cfg.auto) autoDownUntil = Date.now() + AUTO_RETRY_MS;
+    else console.error(msg);
+    return null;
+  };
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
@@ -77,20 +104,14 @@ export async function embed(
       body: JSON.stringify({ model: cfg.model, input: text }),
       signal: controller.signal,
     });
-    if (!res.ok) {
-      console.error(`[onememory] embeddings endpoint returned ${res.status}; using keyword search`);
-      return null;
-    }
+    if (!res.ok) return fail(`[onememory] embeddings endpoint returned ${res.status}; using keyword search`);
     const json = (await res.json()) as unknown;
     const vec = parseEmbedding(json);
-    if (!vec || vec.length === 0) {
-      console.error("[onememory] embeddings response had no vector; using keyword search");
-      return null;
-    }
+    if (!vec || vec.length === 0) return fail("[onememory] embeddings response had no vector; using keyword search");
+    if (cfg.auto) autoDownUntil = 0;
     return vec;
   } catch (e) {
-    console.error(`[onememory] embeddings call failed (${(e as Error).message}); using keyword search`);
-    return null;
+    return fail(`[onememory] embeddings call failed (${(e as Error).message}); using keyword search`);
   } finally {
     clearTimeout(timer);
   }

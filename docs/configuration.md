@@ -56,11 +56,11 @@ All environment variables are optional. This table lists **every** `ONEMEMORY_*`
 | `ONEMEMORY_MCP_PORT` | `8791` | MCP-over-HTTP port (tunnel this one) |
 | `ONEMEMORY_TRUST_PROXY` | unset | Set to `1` only behind a trusted proxy that sets `x-forwarded-for` |
 | `ONEMEMORY_TRUST_CLOUDFLARE` | unset | Set to `1` behind Cloudflare so per-client rate limiting keys on `cf-connecting-ip` |
-| `ONEMEMORY_EMBEDDINGS` | unset (off) | `on` to enable optional semantic search |
+| `ONEMEMORY_EMBEDDINGS` | unset (off) | `on` to enable optional semantic search; `auto` = use it when the embedding endpoint answers and stay keyword-only (silently, retrying once a minute) when it does not |
 | `ONEMEMORY_EMBED_URL` | `http://localhost:11434/v1/embeddings` | OpenAI-compatible embeddings endpoint |
 | `ONEMEMORY_EMBED_MODEL` | `nomic-embed-text` | Embedding model name |
 | `ONEMEMORY_EMBED_KEY` | unset | Optional bearer token for the embeddings endpoint |
-| `ONEMEMORY_EMBED_TIMEOUT_MS` | `30000` | Timeout per embedding call; raise if a local model's first (cold) call is slow |
+| `ONEMEMORY_EMBED_TIMEOUT_MS` | `30000` (`5000` with `ONEMEMORY_EMBEDDINGS=auto`) | Timeout per embedding call; raise if a local model's first (cold) call is slow |
 | `ONEMEMORY_ALLOWED_ORIGINS` | unset | Comma-separated browser Origins allowed to call the API (for a browser on the tunnel domain); loopback is always allowed |
 | `ONEMEMORY_RATE_MAX` | `120` | Max requests per client per window |
 | `ONEMEMORY_RATE_WINDOW_MS` | `10000` | Rate-limit window in milliseconds |
@@ -79,6 +79,21 @@ All environment variables are optional. This table lists **every** `ONEMEMORY_*`
 | `ONEMEMORY_IMPORT_MAX_BYTES` | `268435456` (256 MB) | Request-body cap for `POST /import` (clamped to 1 MB - 2 GB). Other routes keep the 1 MB cap |
 | `ONEMEMORY_URL` | unset | Base URL (e.g. `http://localhost:8790`) used only by the runner signing helper's `--post` mode, together with `ONEMEMORY_TOKEN`. Not read by the server |
 | `ONEMEMORY_LINT` | `secrets=block,injection=quarantine` | Write-time memory linter policy: `block`, `quarantine`, `warn`, or per category (`secrets=block,injection=warn`). See [memory-linter.md](./memory-linter.md) |
+| `ONEMEMORY_CAPTURE` | on (once the hooks are installed) | `off` = the capture hooks record nothing (the session-start context still works). Also readable from `<data dir>/capture.json` as `{"capture":"off"}`; the variable wins |
+| `ONEMEMORY_CAPTURE_EXCLUDE` | unset | Comma-separated globs (`*`, `**`) on the working directory; sessions in a matching folder are not recorded (e.g. `**/secret-*,C:/clients/**`) |
+| `ONEMEMORY_CAPTURE_SKIP_TOOLS` | unset | Comma-separated tool names the capture hooks ignore (e.g. `TodoWrite,WebFetch`). OneMemory's own `mcp__onememory__*` tools are always skipped |
+| `ONEMEMORY_CAPTURE_RETENTION_DAYS` | `7` | Raw captured events are deleted after this many days (the observations distilled from them are kept like notes) |
+| `ONEMEMORY_DECAY_DAYS` | `30` | Captured observations nobody updated or read for this many days are **archived** (never deleted; `onememory restore <id>` brings one back) by the expiry sweep and at session end. Never decayed: your own notes, decisions, rows tagged `pinned`. `0` = decay off. Preview with `onememory decay --dry-run` |
+| `ONEMEMORY_DECAY_SUMMARY_DAYS` | `180` | The same for session summaries. `0` = summaries never decay |
+| `ONEMEMORY_LLM_URL` | unset (off) | Optional local model for session summaries: base URL of an OpenAI-compatible server (Ollama `http://127.0.0.1:11434`, LM Studio, llama.cpp). One call per session at session-end; on any failure the automatic summary stays. Needs `ONEMEMORY_LLM_MODEL`. Only loopback hosts are accepted |
+| `ONEMEMORY_LLM_MODEL` | unset | The model name sent to `ONEMEMORY_LLM_URL` (e.g. `qwen2.5:7b`) |
+| `ONEMEMORY_LLM_TIMEOUT_MS` | `30000` | Upper bound on the one summary call (1000 - 300000) |
+| `ONEMEMORY_LLM_ALLOW_REMOTE` | unset | `1` = allow an `ONEMEMORY_LLM_URL` that is not this machine. Session text then leaves the PC; leave unset unless you mean it |
+| `ONEMEMORY_RECALL_TOKENS` | `1500` | Token budget (about 4 characters each) of the context the session-start hook injects |
+| `ONEMEMORY_PROFILE_TOKENS` | `300` | Share of that budget (at most half) for the "What I know about this project" block at the top: decisions, conventions (notes tagged `convention`), key files, last session, open-task count, built from stored notes with no model |
+| `ONEMEMORY_PROFILE` | on | `off` = leave the project profile out of the session-start context |
+| `ONEMEMORY_HOOK_URL` | unset | Optional: when the local database cannot be opened, the capture hooks POST the event to `<url>/capture` instead of spooling it (2 s timeout). Needs `ONEMEMORY_HOOK_TOKEN` |
+| `ONEMEMORY_HOOK_TOKEN` | unset | A write-scope token for `ONEMEMORY_HOOK_URL` |
 | `ONEMEMORY_SPACES` | unset (feature off) | Optional JSON namespace config: `{"spaces":{"/home/you/work":"work"},"default_namespace":"default","reads_from":{"work":["shared"]}}` (or `<data dir>/spaces.json`; env wins). Enables server-side namespace resolution |
 | `ONEMEMORY_SPACE` | unset | Explicit namespace override: when set, the server uses this namespace directly instead of resolving from the working directory (only meaningful with a spaces config present) |
 

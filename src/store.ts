@@ -38,7 +38,7 @@ import {
 import { isStale, stalenessConfig, annotateStaleness } from "./staleness.js";
 // At-rest encryption for note bodies. No module cycle: crypto.ts imports
 // only node: builtins, never store.ts.
-import { encrypt, decryptIfEncrypted, loadKey, keyPath, noteAad } from "./crypto.js";
+import { encrypt, decryptIfEncrypted, loadKey, keyPath, noteAad, captureAad } from "./crypto.js";
 import { currentActor, currentWriter, cleanWriter } from "./actor.js";
 import {
   ALL_NAMESPACES,
@@ -92,6 +92,13 @@ import {
  * else is an unexpected fault mapped to a generic 500, so internals never leak.
  */
 export class ValidationError extends Error {}
+
+/** v16: a no-migrate open (the capture hooks) found a database at another schema version than this build's. */
+export class SchemaMismatchError extends Error {
+  constructor(readonly found: number) {
+    super(`onememory: the database is at schema v${found}, this build uses v${SCHEMA_VERSION}; not opening it without a migration`);
+  }
+}
 
 /**
  * A stored note body could not be decrypted (wrong key file, or the row was
@@ -355,7 +362,29 @@ export type ImportNote = NoteInput & {
   /** Carried by an export (1.6.0): this note was retired and replaced by the note with this id IN THE SAME FILE. */
   superseded_by?: number;
   superseded_at?: string;
+  /** v16, carried by an export: a captured row's kind, session, observation type and linked files (admin restore only). */
+  kind?: string;
+  session_id?: string;
+  obs_type?: string;
+  files?: unknown;
 };
+
+/** v16: what a captured row's kind / session / type / files look like on the way in from an export or a vault file. */
+export interface CaptureFields {
+  kind?: NoteKind;
+  sessionId?: string;
+  obsType?: string;
+}
+
+/** The capture fields of an import payload, validated: anything malformed or a plain 'note' means "an ordinary note". */
+export function captureFieldsOf(v: { kind?: unknown; session_id?: unknown; obs_type?: unknown }): CaptureFields {
+  if (v.kind !== "observation" && v.kind !== "summary") return {};
+  return {
+    kind: v.kind,
+    ...(typeof v.session_id === "string" && v.session_id.trim() ? { sessionId: v.session_id.trim().slice(0, 200) } : {}),
+    ...(v.kind === "observation" && typeof v.obs_type === "string" && /^[a-z_]{1,40}$/.test(v.obs_type) ? { obsType: v.obs_type } : {}),
+  };
+}
 
 /** What an import made of the attestations it met. */
 export interface AttestationReport {
@@ -471,7 +500,7 @@ export interface QuarantineEntry {
 export const CHANGE_LOG_RETENTION_DAYS = 90;
 
 /** Current schema version (PRAGMA user_version). See Store.migrate. */
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 /**
  * Notes fetched per page by exportBatch(), which both streaming export
@@ -629,6 +658,12 @@ export interface NoteRecord {
    * search and namespace isolation need them -- documented, not hidden.
    */
   encrypted?: boolean;
+  /** v16: set only on captured rows ('observation' | 'summary'); an ordinary note has no kind field. */
+  kind?: NoteKind;
+  /** v16: the capture session that produced this row. */
+  session_id?: string;
+  /** v16: observation type (bugfix, feature, refactor, change, discovery, decision, security_alert, security_note). */
+  obs_type?: string;
 }
 
 interface NoteRow {
@@ -660,6 +695,9 @@ interface NoteRow {
   superseded_by?: number | null;
   superseded_at?: string | null;
   superseded_by_writer?: string | null;
+  kind?: string | null;
+  session_id?: string | null;
+  obs_type?: string | null;
 }
 
 export const DEFAULT_NAMESPACE = "default";
@@ -727,6 +765,12 @@ function annotateRetention(row: NoteRow, rec: NoteRecord): NoteRecord {
   if (row.expires_at) out.expires_at = row.expires_at;
   if (row.archived_at) out.archived_at = row.archived_at;
   if (row.body_enc) out.encrypted = true;
+  // v16: only captured rows carry these, so an ordinary note keeps its exact old shape.
+  if (row.kind && row.kind !== "note") {
+    out.kind = row.kind as NoteKind;
+    if (row.session_id) out.session_id = row.session_id;
+    if (row.obs_type) out.obs_type = row.obs_type;
+  }
   return out;
 }
 
@@ -889,6 +933,14 @@ interface NsEdgeIndex {
 export const EDGE_CANDIDATE_LIMIT = 256;
 
 /**
+ * applyEdgePairs stores at most this many of a write's pairs (highest score
+ * first). Reads use the top EDGE_NEIGHBOR_LIMIT, so the rest only cost disk
+ * and commit time: repetitive captured observations matched ~430 neighbors
+ * each, 100 ms writes and 111 MB at 3,000 notes.
+ */
+export const EDGE_STORE_LIMIT = 32;
+
+/**
  * Edge-index cache bounds (env-tunable, read per use): a namespace's index
  * is released after ONEMEMORY_EDGE_INDEX_IDLE_MS without use (default 10
  * min), and least-recently-used namespaces are released while more than
@@ -1026,6 +1078,8 @@ export interface AccessStats {
   neverAccessed: number;
   /** Notes older than the staleness thresholds (see staleness.ts). */
   staleCount: number;
+  /** Captured rows the next decay sweep would archive, and rows decay has archived so far (see sweepDecay). */
+  decay: { candidates: number; archived: number };
 }
 
 /** One keyword hit with its FTS5 bm25 rank exposed as a positive score. */
@@ -1067,6 +1121,49 @@ export interface RangeOpts {
    * always labelled (`status: "superseded"`, `superseded_by`) and the caller decides who may ask.
    */
   includeSuperseded?: boolean;
+  /**
+   * v16: which kinds of row to return ('note' | 'observation' | 'summary'). Default ['note'], so captured work never shows
+   * up in a read that did not ask for it (list, search, recall behave exactly as before).
+   */
+  kinds?: readonly NoteKind[];
+  /** v16: only observations of these types (bugfix, feature, ...). */
+  obsTypes?: readonly string[];
+  /** v16: only rows captured in this session. */
+  sessionId?: string;
+  /** v16: only rows linked to this file path (note_files). */
+  filePath?: string;
+}
+
+/** v16: what a notes row is. Ordinary notes are 'note'; the capture writer adds 'observation' and 'summary' rows. */
+export type NoteKind = "note" | "observation" | "summary";
+export const NOTE_KINDS: readonly NoteKind[] = ["note", "observation", "summary"];
+
+/** Decay never archives a row carrying this tag (any writer may add it; it only keeps a row live). */
+export const PINNED_TAG = "pinned";
+const DECAY_META_PREFIX = "decay_archived:";
+
+/**
+ * Decay of captured rows (see Store.sweepDecay): ONEMEMORY_DECAY_DAYS (default 30; 0 = decay off) for observations,
+ * ONEMEMORY_DECAY_SUMMARY_DAYS (default 180; 0 = summaries never decay). Read per call so tests can flip it.
+ */
+export function decayConfig(env: NodeJS.ProcessEnv = process.env): { days: number; summaryDays: number } {
+  const num = (raw: string | undefined, def: number): number => {
+    if (raw === undefined || raw.trim() === "") return def;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : def;
+  };
+  return { days: num(env.ONEMEMORY_DECAY_DAYS, 30), summaryDays: num(env.ONEMEMORY_DECAY_SUMMARY_DAYS, 180) };
+}
+
+/** One row the next decay sweep would archive. */
+export interface DecayCandidate {
+  id: number;
+  namespace: string;
+  kind: NoteKind;
+  obs_type?: string;
+  title: string;
+  /** Whole days since the row was last updated or read. */
+  idleDays: number;
 }
 
 /**
@@ -1144,6 +1241,21 @@ function rangeClause(opts: RangeOpts, localId: string): { sql: string; params: s
     clauses.push(f.sql);
     params.push(...f.params);
   }
+  const kinds = opts.kinds?.length ? opts.kinds : ["note"];
+  clauses.push(`notes.kind IN (${kinds.map(() => "?").join(",")})`);
+  params.push(...kinds);
+  if (opts.obsTypes?.length) {
+    clauses.push(`notes.obs_type IN (${opts.obsTypes.map(() => "?").join(",")})`);
+    params.push(...opts.obsTypes);
+  }
+  if (opts.sessionId) {
+    clauses.push("notes.session_id = ?");
+    params.push(opts.sessionId);
+  }
+  if (opts.filePath) {
+    clauses.push("notes.id IN (SELECT note_id FROM note_files WHERE path = ?)");
+    params.push(opts.filePath);
+  }
   return { sql: clauses.length ? " AND " + clauses.join(" AND ") : "", params };
 }
 
@@ -1207,9 +1319,17 @@ export class Store {
    * a failed or stalled read is not.
    */
   private static readonly BUSY_TIMEOUT_MS = 5000;
+  /** See the constructor: refuse instead of migrating. */
+  private readonly noMigrate: boolean;
 
-  constructor(dbPath: string) {
+  /**
+   * `opts.noMigrate` (the capture hooks): never upgrade the file. A database at any other schema version than this build's
+   * is refused with a SchemaMismatchError instead (the hook then spools the event). `opts.busyTimeoutMs` shortens the lock
+   * wait for callers that would rather give up fast than block an agent.
+   */
+  constructor(dbPath: string, opts: { noMigrate?: boolean; busyTimeoutMs?: number } = {}) {
     this.dbPath = dbPath;
+    this.noMigrate = opts.noMigrate === true;
     if (dbPath !== ":memory:") {
       try {
         mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
@@ -1227,7 +1347,7 @@ export class Store {
       // busy_timeout FIRST: switching to WAL and migrating both need a lock
       // another process may be holding at the same moment. The pragmas are INSIDE the try: on a read-only mount the first
       // failure of an existing database is exactly here (the WAL switch), and it must get the readable message too.
-      this.db.exec(`PRAGMA busy_timeout = ${Store.BUSY_TIMEOUT_MS};`);
+      this.db.exec(`PRAGMA busy_timeout = ${Math.floor(opts.busyTimeoutMs ?? Store.BUSY_TIMEOUT_MS)};`);
       this.db.exec("PRAGMA journal_mode = WAL;");
       this.db.exec("PRAGMA foreign_keys = ON;");
       // Load the at-rest key before migrations so a v10 upgrade on an encrypted
@@ -1286,6 +1406,9 @@ export class Store {
     const version = (): number =>
       Number((this.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
     const found = version();
+    if (this.noMigrate && found !== SCHEMA_VERSION) {
+      throw new SchemaMismatchError(found);
+    }
     if (found > SCHEMA_VERSION) {
       // A newer onememory migrated this file. Opening it with older code
       // would silently misread/corrupt data it does not know about (for
@@ -1347,6 +1470,14 @@ export class Store {
       }
     } catch {
       /* read-only file: the flag stays unset until a writer opens the database */
+    }
+    try {
+      // 2.0.0 (v16, before release): capture inputs are sealed like outputs; databases made by the first v16 builds lack the column.
+      if (this.hasColumn("capture_events", "input_enc") === false && this.hasColumn("capture_events", "seq")) {
+        this.addColumn("capture_events", "input_enc", "TEXT");
+      }
+    } catch {
+      /* read-only file: no writer can store a capture event either */
     }
   }
 
@@ -1425,7 +1556,7 @@ export class Store {
 
   /**
    * Before the first upgrade of a non-empty file (any older version -> the current one), keep one
-   * copy of the pre-upgrade database next to it: `<db>.pre-v15-backup`. It is a
+   * copy of the pre-upgrade database next to it: `<db>.pre-v16-backup`. It is a
    * consistent snapshot (VACUUM INTO) still at the OLD schema version, so an
    * older onememory can open it (rollback = stop everything, put this file
    * back as the database, delete the -wal and -shm files beside it, install the older version). Never overwrites an
@@ -2100,6 +2231,59 @@ export class Store {
       // The confirmation-token key is made now (a preview must write nothing).
       this.feedKey();
     }
+    if (v < 16) {
+      // v16 (2.0.0): automatic memory. Captured observations and session summaries are ordinary notes rows with a kind, so
+      // they inherit lint, quarantine, history, FTS and trust. Every existing read asks for kind 'note' only (RangeOpts.kinds).
+      //  - sessions: one row per agent session (cwd, counts, how far the distiller got, its summary note).
+      //  - capture_events: raw hook events, short-lived (ONEMEMORY_CAPTURE_RETENTION_DAYS, see sweepCaptureEvents), never
+      //    synced. `output` / `input` are sealed into output_enc / input_enc like a note body when at-rest encryption is on.
+      //  - note_files: which files an observation read or changed (gone with the note).
+      //  - file_context_seen: which files a session was already shown context for.
+      this.addColumn("notes", "kind", "TEXT NOT NULL DEFAULT 'note'");
+      this.addColumn("notes", "session_id", "TEXT NOT NULL DEFAULT ''");
+      this.addColumn("notes", "obs_type", "TEXT NOT NULL DEFAULT ''");
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_notes_kind_session ON notes(namespace, kind, session_id, created_at);
+        CREATE TABLE IF NOT EXISTS sessions (
+          id TEXT PRIMARY KEY,
+          namespace TEXT NOT NULL DEFAULT '',
+          cwd TEXT NOT NULL DEFAULT '',
+          agent TEXT NOT NULL DEFAULT 'claude-code',
+          started_at TEXT NOT NULL,
+          ended_at TEXT,
+          prompt_count INTEGER NOT NULL DEFAULT 0,
+          event_count INTEGER NOT NULL DEFAULT 0,
+          distilled_seq INTEGER NOT NULL DEFAULT 0,
+          summary_note_id INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS capture_events (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT NOT NULL,
+          at TEXT NOT NULL,
+          event TEXT NOT NULL,
+          tool TEXT NOT NULL DEFAULT '',
+          input TEXT NOT NULL DEFAULT '',
+          input_enc TEXT,
+          output TEXT NOT NULL DEFAULT '',
+          output_enc TEXT,
+          ok INTEGER NOT NULL DEFAULT 1,
+          bytes INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_capture_events_session ON capture_events(session_id, seq);
+        CREATE TABLE IF NOT EXISTS note_files (
+          note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+          path TEXT NOT NULL,
+          action TEXT NOT NULL,
+          PRIMARY KEY (note_id, path, action)
+        );
+        CREATE INDEX IF NOT EXISTS idx_note_files_path ON note_files(path);
+        CREATE TABLE IF NOT EXISTS file_context_seen (
+          session_id TEXT NOT NULL,
+          path TEXT NOT NULL,
+          PRIMARY KEY (session_id, path)
+        );
+      `);
+    }
   }
 
   /** The delete log row also remembers the deleted note's writers (v14). Caller holds the write lock. */
@@ -2240,6 +2424,12 @@ export class Store {
       attestedBy?: string;
       /** Consolidation / verified import: writers whose notes this one derives from (kept for good). */
       mergedFromWriters?: Iterable<string>;
+      /** v16, capture writer only (an opt, never a NoteInput field, so no request body can forge it): the row's kind ... */
+      kind?: NoteKind;
+      /** ... the session it was captured in ... */
+      sessionId?: string;
+      /** ... and its observation type. */
+      obsType?: string;
     } & LintOpts = {}
   ): NoteRecord {
     if (!input.title || !input.title.trim()) {
@@ -2319,8 +2509,8 @@ export class Store {
           `INSERT INTO notes (namespace, title, body, tags, source, written_by, created_by, imported_written_by,
                               imported_created_by, attested_writer, attested_by, merged_from_writers,
                               created_at, updated_at, rev, body_enc, expires_at, archived_at, imported_unverified,
-                              confidence, confidence_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`
+                              confidence, confidence_by, kind, session_id, obs_type)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           namespace,
@@ -2342,7 +2532,10 @@ export class Store {
           archivedAt,
           opts.importedUnverified ? 1 : 0,
           typeof input.confidence === "number" ? input.confidence : null,
-          typeof input.confidence === "number" ? writer : ""
+          typeof input.confidence === "number" ? writer : "",
+          opts.kind ?? "note",
+          opts.sessionId ?? "",
+          opts.obsType ?? ""
         );
       id = Number(result.lastInsertRowid);
       if (encrypting) {
@@ -2746,15 +2939,17 @@ export class Store {
    * Access-tracking aggregates for the memory_stats surface. When
    * `namespaces` is given, only those namespaces are counted (namespace
    * resolution passes the readable set; an MCP hint passes one). Omit it to
-   * count the whole store (legacy no-resolution mode).
+   * count the whole store (legacy no-resolution mode). v16: ordinary notes
+   * only (kind 'note'); captured observations and summaries are not counted,
+   * listed or judged stale here.
    */
   accessStats(namespaces?: string[], opts: { hideDistrusted?: boolean } = {}): AccessStats {
     this.flushAccess(); // aggregates read the table
     // Archived notes are forgotten: they must not show up in totals or tops.
     const where =
       namespaces && namespaces.length > 0
-        ? `WHERE archived_at IS NULL AND namespace IN (${namespaces.map(() => "?").join(",")})`
-        : "WHERE archived_at IS NULL";
+        ? `WHERE archived_at IS NULL AND kind = 'note' AND namespace IN (${namespaces.map(() => "?").join(",")})`
+        : "WHERE archived_at IS NULL AND kind = 'note'";
     const params: string[] = namespaces && namespaces.length > 0 ? [...namespaces] : [];
     // Titles are note content: a distrusted writer's notes are never listed. The counts include them unless the
     // caller (any non-admin surface) asks for `hideDistrusted`, so a reader cannot learn that hidden notes exist.
@@ -2785,6 +2980,7 @@ export class Store {
       })),
       neverAccessed: Number(totals.never),
       staleCount: this.staleCount(namespaces, opts),
+      decay: this.decayStats(namespaces && namespaces.length > 0 ? namespaces : undefined),
     };
   }
 
@@ -2796,8 +2992,8 @@ export class Store {
   staleCount(namespaces?: string[], opts: { hideDistrusted?: boolean } = {}): number {
     const where =
       namespaces && namespaces.length > 0
-        ? `WHERE archived_at IS NULL AND namespace IN (${namespaces.map(() => "?").join(",")})`
-        : "WHERE archived_at IS NULL";
+        ? `WHERE archived_at IS NULL AND kind = 'note' AND namespace IN (${namespaces.map(() => "?").join(",")})`
+        : "WHERE archived_at IS NULL AND kind = 'note'";
     const params: string[] = namespaces && namespaces.length > 0 ? [...namespaces] : [];
     const dis = opts.hideDistrusted ? this.distrustFragment(NOTE_COLUMNS, namespaces && namespaces.length > 0 ? namespaces : undefined) : { sql: "", params: [] as string[] };
     const rows = this.db
@@ -3131,7 +3327,175 @@ export class Store {
       this.edgeIndexes.clear(); // archived notes leave the similarity index
       this.announceChange();
     }
+    this.sweepCaptureEvents(now, namespaces);
+    this.sweepDecay(now, namespaces);
     return n;
+  }
+
+  /**
+   * v16: raw capture events are short-lived (the distilled observations are what is kept): delete those older than
+   * ONEMEMORY_CAPTURE_RETENTION_DAYS (default 7). A namespace-pinned caller only clears its own sessions' events.
+   */
+  sweepCaptureEvents(now: number = Date.now(), namespaces?: string[]): number {
+    const raw = Number(process.env.ONEMEMORY_CAPTURE_RETENTION_DAYS);
+    const days = Number.isFinite(raw) && raw > 0 ? raw : 7;
+    const cutoff = new Date(now - days * 86_400_000).toISOString();
+    if (namespaces && namespaces.length === 0) return 0;
+    const nsSql = namespaces ? ` AND session_id IN (SELECT id FROM sessions WHERE namespace IN (${namespaces.map(() => "?").join(",")}))` : "";
+    // The once-per-session file announcements (file-context.ts) of sessions that started before the cutoff go too.
+    this.db.prepare(`DELETE FROM file_context_seen WHERE session_id IN (SELECT id FROM sessions WHERE started_at < ?${namespaces ? ` AND namespace IN (${namespaces.map(() => "?").join(",")})` : ""})`).run(cutoff, ...(namespaces ?? []));
+    return Number(this.db.prepare(`DELETE FROM capture_events WHERE at < ?${nsSql}`).run(cutoff, ...(namespaces ?? [])).changes ?? 0);
+  }
+
+  /**
+   * Decay: the WHERE clause for captured rows nobody wrote, read or touched for a while (see decayConfig). Observations
+   * (never a decision) idle `days`, summaries idle `summaryDays`; anything tagged PINNED_TAG, every ordinary note (kind
+   * 'note') and every replaced note are left alone. "Idle" = neither updated nor read (last_accessed) since the cutoff.
+   */
+  private decayWhere(now: number, namespaces?: string[]): { sql: string; params: string[] } | null {
+    const cfg = decayConfig();
+    if (cfg.days === 0 || (namespaces && namespaces.length === 0)) return null;
+    const cut = (d: number): string => new Date(now - d * 86_400_000).toISOString();
+    const idle = "MAX(updated_at, COALESCE(last_accessed, '')) < ?";
+    const kinds = [`(kind = 'observation' AND COALESCE(obs_type, '') <> 'decision' AND ${idle})`];
+    const params = [cut(cfg.days)];
+    if (cfg.summaryDays > 0) {
+      kinds.push(`(kind = 'summary' AND ${idle})`);
+      params.push(cut(cfg.summaryDays));
+    }
+    const nsSql = namespaces ? ` AND namespace IN (${namespaces.map(() => "?").join(",")})` : "";
+    return {
+      sql: `archived_at IS NULL AND superseded_by IS NULL AND instr(tags, ?) = 0 AND (${kinds.join(" OR ")})${nsSql}`,
+      params: [JSON.stringify(PINNED_TAG), ...params, ...(namespaces ?? [])],
+    };
+  }
+
+  /** Decay dry run: the captured rows the next sweep would archive (nothing is changed). */
+  decayCandidates(now: number = Date.now(), namespaces?: string[], limit = 500): DecayCandidate[] {
+    this.flushAccess(); // a read still in the buffer counts
+    const w = this.decayWhere(now, namespaces);
+    if (!w) return [];
+    const rows = this.db
+      .prepare(`SELECT id, namespace, kind, obs_type, title, MAX(updated_at, COALESCE(last_accessed, '')) AS at FROM notes WHERE ${w.sql} ORDER BY at, id LIMIT ?`)
+      .all(...w.params, limit) as Array<{ id: number; namespace: string; kind: NoteKind; obs_type: string | null; title: string; at: string }>;
+    return rows.map((r) => ({
+      id: Number(r.id),
+      namespace: r.namespace,
+      kind: r.kind,
+      ...(r.obs_type ? { obs_type: r.obs_type } : {}),
+      title: r.title,
+      idleDays: Math.max(0, Math.floor((now - Date.parse(r.at)) / 86_400_000)),
+    }));
+  }
+
+  /**
+   * Decay: soft-archive (never delete) every row decayCandidates lists. Runs inside the existing sweeps (sweepExpired and
+   * the session-end hook); undo is restore(). Counts per namespace are kept in _meta for the stats.
+   */
+  sweepDecay(now: number = Date.now(), namespaces?: string[]): number {
+    this.flushAccess();
+    const w = this.decayWhere(now, namespaces);
+    if (!w) return 0;
+    const iso = new Date(now).toISOString();
+    const done = this.transaction(() => {
+      const rows = this.db.prepare(`UPDATE notes SET archived_at = ? WHERE ${w.sql} RETURNING namespace`).all(iso, ...w.params) as Array<{ namespace: string }>;
+      const per = new Map<string, number>();
+      for (const r of rows) per.set(r.namespace, (per.get(r.namespace) ?? 0) + 1);
+      const bump = this.db.prepare(
+        "INSERT INTO _meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + CAST(excluded.value AS INTEGER)"
+      );
+      for (const [ns, n] of per) bump.run(DECAY_META_PREFIX + ns, String(n));
+      return rows.length;
+    });
+    if (done > 0) {
+      this.edgeIndexes.clear();
+      this.announceChange();
+    }
+    return done;
+  }
+
+  /** Decay numbers for the stats: rows the next sweep would archive, and rows decay has archived so far. */
+  decayStats(namespaces?: string[]): { candidates: number; archived: number } {
+    const w = this.decayWhere(Date.now(), namespaces);
+    const candidates = w ? Number((this.db.prepare(`SELECT COUNT(*) AS n FROM notes WHERE ${w.sql}`).get(...w.params) as { n: number }).n) : 0;
+    const keys = namespaces ? namespaces.map((ns) => DECAY_META_PREFIX + ns) : null;
+    const row = (
+      keys
+        ? this.db.prepare(`SELECT COALESCE(SUM(CAST(value AS INTEGER)), 0) AS n FROM _meta WHERE key IN (${keys.map(() => "?").join(",") || "''"})`).get(...keys)
+        : this.db.prepare("SELECT COALESCE(SUM(CAST(value AS INTEGER)), 0) AS n FROM _meta WHERE key LIKE ?").get(DECAY_META_PREFIX + "%")
+    ) as { n: number };
+    return { candidates, archived: Number(row.n) };
+  }
+
+  /**
+   * v16: the capture side tables (sessions, capture_events, note_files, file_context_seen) are reached through this handle by
+   * capture.ts / extract.ts. Notes rows are NOT: those always go through create/read so lint, sealing and history apply.
+   */
+  captureDb(): DatabaseSync {
+    return this.db;
+  }
+
+  /** v16: the files the newest live rows of a namespace (undefined = all) are linked to (session-start keywords). */
+  recentFilePaths(namespace: string | undefined, limit: number): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT nf.path, MAX(n.created_at) AS at FROM note_files nf JOIN notes n ON n.id = nf.note_id
+         WHERE n.archived_at IS NULL${namespace !== undefined ? " AND n.namespace = ?" : ""} GROUP BY nf.path ORDER BY at DESC LIMIT ?`
+      )
+      .all(...(namespace !== undefined ? [namespace] : []), limit) as Array<{ path: string }>;
+    return rows.map((r) => r.path);
+  }
+
+  /** v16: the files each of these notes is linked to (note_files), by note id. */
+  noteFiles(ids: number[]): Map<number, Array<{ path: string; action: string }>> {
+    const out = new Map<number, Array<{ path: string; action: string }>>();
+    for (let i = 0; i < ids.length; i += 500) {
+      const page = ids.slice(i, i + 500);
+      const rows = this.db
+        .prepare(`SELECT note_id, path, action FROM note_files WHERE note_id IN (${page.map(() => "?").join(",")}) ORDER BY path, action`)
+        .all(...page) as Array<{ note_id: number; path: string; action: string }>;
+      for (const r of rows) {
+        const l = out.get(r.note_id) ?? [];
+        l.push({ path: r.path, action: r.action });
+        out.set(r.note_id, l);
+      }
+    }
+    return out;
+  }
+
+  /** v16: link a note to files. `files` is untrusted (an import payload): only well-formed entries, at most 200, are kept. */
+  linkNoteFiles(noteId: number, files: unknown): void {
+    if (!Array.isArray(files)) return;
+    const ins = this.db.prepare("INSERT OR IGNORE INTO note_files (note_id, path, action) VALUES (?, ?, ?)");
+    for (const f of files.slice(0, 200) as Array<{ path?: unknown; action?: unknown }>) {
+      if (!f || typeof f.path !== "string" || !f.path.trim() || (f.action !== "changed" && f.action !== "read")) continue;
+      ins.run(noteId, f.path.slice(0, 1000), f.action);
+    }
+  }
+
+  /**
+   * v16 restore: a captured row that came back from an export or a vault file gets its files, and its session a row
+   * (a stub when this store never saw the session; an existing one in another namespace is left alone), so it shows in
+   * session_list and the dashboard again. A summary becomes its session's summary when the session has none.
+   */
+  restoreCaptureLinks(note: NoteRecord, files: unknown): void {
+    if (!note.kind || note.kind === "note") return;
+    this.linkNoteFiles(note.id, files);
+    if (!note.session_id) return;
+    this.db.prepare("INSERT OR IGNORE INTO sessions (id, namespace, cwd, started_at) VALUES (?, ?, '', ?)").run(note.session_id, note.namespace, note.created_at);
+    if (note.kind === "summary") {
+      this.db.prepare("UPDATE sessions SET summary_note_id = ? WHERE id = ? AND namespace = ? AND summary_note_id IS NULL").run(note.id, note.session_id, note.namespace);
+    }
+  }
+
+  /** v16: seal / open a capture event's output or input exactly like a note body (null envelope = plaintext store). */
+  sealCapture(plain: string, aad: string): { text: string; enc: string | null } {
+    const s = this.sealBody(plain, aad);
+    return { text: s.body, enc: s.bodyEnc };
+  }
+
+  openCapture(text: string, enc: string | null, aad: string): string {
+    return enc ? decryptIfEncrypted(enc, this.readKey(), aad) : text;
   }
 
   // --- Note history (v15) ---------------------------------------------------
@@ -3318,6 +3682,27 @@ export class Store {
     for (const r of rows) upd.run(decryptIfEncrypted(r.body_enc, key, historyAad(r.hid)), r.hid);
   }
 
+  /**
+   * v16: seal every still-plaintext capture event output and input (caller holds the write lock; `encrypt enable`). The notes the
+   * capture writer made are ordinary notes rows, so encryptAll's own pass covers them.
+   */
+  private sealCaptureEvents(key: Buffer): void {
+    for (const f of ["output", "input"] as const) {
+      const rows = this.db.prepare(`SELECT seq, session_id, ${f} AS text FROM capture_events WHERE ${f}_enc IS NULL AND ${f} <> ''`).all() as Array<{ seq: number; session_id: string; text: string }>;
+      const upd = this.db.prepare(`UPDATE capture_events SET ${f} = '', ${f}_enc = ? WHERE seq = ?`);
+      for (const r of rows) upd.run(encrypt(r.text, key, captureAad(r.seq, r.session_id, f)), r.seq);
+    }
+  }
+
+  /** Inverse of sealCaptureEvents (caller holds the write lock; `encrypt disable`). */
+  private unsealCaptureEvents(key: Buffer): void {
+    for (const f of ["output", "input"] as const) {
+      const rows = this.db.prepare(`SELECT seq, session_id, ${f}_enc AS enc FROM capture_events WHERE ${f}_enc IS NOT NULL`).all() as Array<{ seq: number; session_id: string; enc: string }>;
+      const upd = this.db.prepare(`UPDATE capture_events SET ${f} = ?, ${f}_enc = NULL WHERE seq = ?`);
+      for (const r of rows) upd.run(decryptIfEncrypted(r.enc, key, captureAad(r.seq, r.session_id, f)), r.seq);
+    }
+  }
+
   // --- Supersede (v15) ------------------------------------------------------
 
   /**
@@ -3485,9 +3870,14 @@ export class Store {
     if (cur && cur.superseded_by !== null) {
       throw new ValidationError(`note ${id} was replaced by note ${cur.superseded_by}; use "supersede undo" to bring it back (a plain restore would hide that it was replaced)`);
     }
+    // A restored captured row counts as just read, or the next decay sweep would archive it again at once.
     this.db
-      .prepare("UPDATE notes SET archived_at = NULL, expires_at = ? WHERE id = ? AND archived_at IS NOT NULL")
-      .run(opts.forget_after === undefined ? null : retentionDeadline(opts.forget_after), id);
+      .prepare(
+        `UPDATE notes SET archived_at = NULL, expires_at = ?,
+                last_accessed = CASE WHEN kind IN ('observation', 'summary') THEN ? ELSE last_accessed END
+          WHERE id = ? AND archived_at IS NOT NULL`
+      )
+      .run(opts.forget_after === undefined ? null : retentionDeadline(opts.forget_after), new Date().toISOString(), id);
     this.edgeIndexes.clear(); // restored note rejoins the similarity index lazily
     this.announceChange();
     return this.read(id);
@@ -3542,6 +3932,7 @@ export class Store {
       }
       this.sealQuarantine(key);
       this.sealHistory(key);
+      this.sealCaptureEvents(key);
       this.db.exec("COMMIT");
     } catch (e) {
       try {
@@ -3656,6 +4047,7 @@ export class Store {
       }
       this.unsealQuarantine(key);
       this.unsealHistory(key);
+      this.unsealCaptureEvents(key);
       hooks.beforeCommit?.();
       this.db.exec("COMMIT");
     } catch (e) {
@@ -3807,6 +4199,8 @@ export class Store {
       withoutTags?: string[];
       /** Only notes with at least one tag starting with this prefix. */
       withTagPrefix?: string;
+      /** v16: newest-created first or oldest-created first, instead of last-updated first (timelines). */
+      order?: "created_desc" | "created_asc";
     } & RangeOpts = {}
   ): {
     notes: NoteRecord[];
@@ -3822,6 +4216,7 @@ export class Store {
     // SQL LIKE is only a prefilter (tags are a JSON array string); the exact
     // match is re-checked below so a tag never matches inside another value.
     const exact = (r: NoteRow): boolean => tagsMatch(r.tags, opts.withTags, opts.withoutTags, opts.withTagPrefix);
+    const orderSql = opts.order === "created_asc" ? "created_at ASC, id ASC" : opts.order === "created_desc" ? "created_at DESC, id DESC" : "updated_at DESC, id DESC";
 
     let rows: NoteRow[];
     let total: number;
@@ -3831,7 +4226,7 @@ export class Store {
       const inList = `namespace IN (${opts.namespaces.map(() => "?").join(",")})`;
       rows = this.db
         .prepare(
-          `SELECT * FROM notes WHERE ${inList}${archSql}${range.sql}${tagF.sql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
+          `SELECT * FROM notes WHERE ${inList}${archSql}${range.sql}${tagF.sql} ORDER BY ${orderSql} LIMIT ? OFFSET ?`
         )
         .all(...opts.namespaces, ...extra, limit, offset) as unknown as NoteRow[];
       total = (
@@ -3842,7 +4237,7 @@ export class Store {
     } else if (opts.namespace) {
       rows = this.db
         .prepare(
-          `SELECT * FROM notes WHERE namespace = ?${archSql}${range.sql}${tagF.sql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
+          `SELECT * FROM notes WHERE namespace = ?${archSql}${range.sql}${tagF.sql} ORDER BY ${orderSql} LIMIT ? OFFSET ?`
         )
         .all(opts.namespace, ...extra, limit, offset) as unknown as NoteRow[];
       total = (
@@ -3853,7 +4248,7 @@ export class Store {
     } else {
       rows = this.db
         .prepare(
-          `SELECT * FROM notes WHERE 1 = 1${archSql}${range.sql}${tagF.sql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`
+          `SELECT * FROM notes WHERE 1 = 1${archSql}${range.sql}${tagF.sql} ORDER BY ${orderSql} LIMIT ? OFFSET ?`
         )
         .all(...extra, limit, offset) as unknown as NoteRow[];
       total = (
@@ -3989,8 +4384,11 @@ export class Store {
     const key = opts.attest ? this.signing() : null;
     const sid = key ? this.serverId() : "";
     const exportedAt = new Date().toISOString();
+    // v16: a captured row carries its linked files (not signed, like history).
+    const files = this.noteFiles(rows.filter((r) => r.kind && r.kind !== "note").map((r) => r.id));
     const sealed = (n: NoteRecord): NoteRecord & { attestation?: Attestation; history?: HistoryEntry[] } => {
-      const signed = key ? { ...n, attestation: signRecord(key, sid, n, exportedAt) } : n;
+      const attested = key ? { ...n, attestation: signRecord(key, sid, n, exportedAt) } : n;
+      const signed = files.has(n.id) ? { ...attested, files: files.get(n.id) } : attested;
       if (!opts.history) return signed;
       const h = this.historyOf(n.id);
       return h.length ? { ...signed, history: h } : signed;
@@ -4159,8 +4557,10 @@ export class Store {
                   // silently turned into "live, no TTL".
                   ...(note.expires_at ? { expiresAt: note.expires_at } : {}),
                   ...(note.archived_at ? { archivedAt: note.archived_at } : {}),
+                  ...captureFieldsOf(note),
                 }
               );
+            this.restoreCaptureLinks(madeNote, note.files);
             created.push(madeNote);
             if (typeof note.id === "number") idMap.set(note.id, madeNote.id);
             if (typeof note.superseded_by === "number" && note.archived_at) {
@@ -4679,7 +5079,11 @@ export class Store {
     const insert = this.db.prepare(
       "INSERT INTO note_edges (note_id, neighbor_id, score) VALUES (?, ?, ?)"
     );
-    for (const p of pairs) {
+    const kept =
+      pairs.length > EDGE_STORE_LIMIT
+        ? [...pairs].sort((a, b) => b.score - a.score || a.neighborId - b.neighborId).slice(0, EDGE_STORE_LIMIT)
+        : pairs;
+    for (const p of kept) {
       insert.run(id, p.neighborId, p.score);
       insert.run(p.neighborId, id, p.score);
     }
