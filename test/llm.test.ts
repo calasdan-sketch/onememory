@@ -134,13 +134,39 @@ describe("LLM summarizer", () => {
       await captureHook("user-prompt", { ...p, prompt: "do the thing" }, { dbPath: db, dataDir: dir, env });
       await captureHook("stop", p, { dbPath: db, dataDir: dir, env });
       assert.equal(seen.length, 0, "no call at stop");
-      await captureHook("session-end", p, { dbPath: db, dataDir: dir, env: {} });
+      await captureHook("session-end", p, { dbPath: db, dataDir: dir, env: {}, llmInline: true });
       assert.equal(seen.length, 0, "off: no call");
-      await captureHook("session-end", p, { dbPath: db, dataDir: dir, env });
+      await captureHook("session-end", p, { dbPath: db, dataDir: dir, env, llmInline: true });
       assert.equal(seen.length, 1);
       const s = new Store(db);
       assert.equal(s.list({ kinds: ["summary"] }).notes[0].title, "Session: Wired title");
       s.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("by default session-end returns at once; a detached child writes the model's summary later", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "om-llm-"));
+    try {
+      const db = join(dir, "state.db");
+      new Store(db).close();
+      const env = { ONEMEMORY_LLM_URL: base, ONEMEMORY_LLM_MODEL: "tiny" };
+      const slow = answer("Detached title\nThe body.");
+      reply = (req, body, res) => void setTimeout(() => slow(req, body, res), 1500);
+      const p = { session_id: "d1", cwd: "/w" };
+      await captureHook("user-prompt", { ...p, prompt: "do the thing" }, { dbPath: db, dataDir: dir, env });
+      const t0 = Date.now();
+      await captureHook("session-end", p, { dbPath: db, dataDir: dir, env });
+      assert.ok(Date.now() - t0 < 1500, `session-end waited ${Date.now() - t0} ms for the model`);
+      let title = "";
+      for (let i = 0; i < 100 && title !== "Session: Detached title"; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+        const s = new Store(db);
+        title = s.list({ kinds: ["summary"] }).notes[0]?.title ?? "";
+        s.close();
+      }
+      assert.equal(title, "Session: Detached title");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

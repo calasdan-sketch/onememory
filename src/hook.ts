@@ -10,6 +10,8 @@
 // session-start also prints the start-of-session context (recall.ts / context-inject.ts), exactly like `onememory recall`.
 // file-context (PreToolUse on Read) prints what memory knows about the file about to be read (file-context.ts); advisory only.
 import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { HOOK_EVENTS, type HookEvent, captureSettings, normalizeHookInput, shouldCapture, recordEvent, spoolEvent, drainSpool, type CaptureEvent } from "./capture.js";
 
 /** stdin is read up to this much; the rest is ignored (a hook payload past 1 MiB is a tool output we only keep 4 KB of). */
@@ -60,6 +62,24 @@ export interface HookOptions {
   dbPath?: string;
   dataDir?: string;
   env?: NodeJS.ProcessEnv;
+  /** Run the optional LLM summary in this process (tests) instead of a detached child (the CLI default). */
+  llmInline?: boolean;
+}
+
+/**
+ * Hand the LLM summary to a detached child: a local model can take a minute, and the host waits on session-end.
+ * Fails open: if the child cannot start, the automatic summary stays.
+ */
+function spawnLlmSummary(sessionId: string, dbPath: string, env: NodeJS.ProcessEnv): void {
+  try {
+    const cli = fileURLToPath(new URL("./cli.js", import.meta.url));
+    const child = spawn(process.execPath, [cli, "hook", "llm-summary", "--db", dbPath], { env: { ...process.env, ...env }, detached: true, stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
+    child.on("error", () => {});
+    child.stdin?.end(JSON.stringify({ session_id: sessionId }));
+    child.unref();
+  } catch {
+    /* fail open */
+  }
 }
 
 async function postCapture(env: NodeJS.ProcessEnv, ev: CaptureEvent & { namespace: string }): Promise<boolean> {
@@ -109,8 +129,9 @@ export async function captureHook(event: HookEvent, payload: Record<string, unkn
     if (event === "stop" || event === "session-end") distillSession(store, ev.session_id);
     if (event === "session-end") {
       // Optional local model (llm.ts, off unless configured): one call per session; on any failure the summary above stays.
-      const { llmSummarize } = await import("./llm.js");
-      await llmSummarize(store, ev.session_id, env);
+      const { llmConfig, llmSummarize } = await import("./llm.js");
+      if (opts.llmInline) await llmSummarize(store, ev.session_id, env);
+      else if (llmConfig(env)) spawnLlmSummary(ev.session_id, dbPath, env);
       store.sweepCaptureEvents();
     }
     return "stored";
@@ -139,6 +160,27 @@ export async function runHook(eventArg: string, stdinText: string, opts: HookOpt
     } catch {
       return "";
     }
+  }
+  // The detached child spawnLlmSummary starts: rewrite one session's summary with the local model.
+  if (eventArg === "llm-summary") {
+    try {
+      const sid = parsePayload(stdinText).session_id;
+      const { DB_PATH } = await import("./config.js");
+      const dbPath = opts.dbPath ?? DB_PATH;
+      if (typeof sid !== "string" || !sid || !existsSync(dbPath)) return "";
+      const { Store } = await import("./store.js");
+      const { llmSummarize } = await import("./llm.js");
+      const store = new Store(dbPath, { noMigrate: true });
+      try {
+        await llmSummarize(store, sid, opts.env ?? process.env);
+      } finally {
+        store.close();
+      }
+    } catch (e) {
+      process.stderr.write(`onememory hook llm-summary: ${(e as Error).message}
+`);
+    }
+    return "";
   }
   const event = (HOOK_EVENTS as readonly string[]).includes(eventArg) ? (eventArg as HookEvent) : null;
   if (!event) {
