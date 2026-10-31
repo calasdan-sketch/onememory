@@ -141,6 +141,8 @@ function usage(): void {
       "            Run the provenance benchmark on a throwaway store: stale memory, contradiction recovery,",
       "            permission isolation, provenance retention. Offline, deterministic, exits 1 on a failure.",
       "            Your own data is never touched. See docs/BENCHMARK.md.",
+      "  bench --longmemeval | --locomo [--data file] [--limit n] [--mode keyword|hybrid] [--granularity session|turn] [--json]",
+      "            Retrieval benchmark (recall@k, nDCG, MRR) on a public dataset, in a temp folder. No LLM.",
       "  help      Show this help",
       "",
     ].join("\n")
@@ -2025,8 +2027,15 @@ async function main(): Promise<void> {
       await supersedeCmd("history");
       break;
     case "bench": {
+      const args = process.argv.slice(3);
+      if (args.includes("--longmemeval") || args.includes("--locomo")) {
+        // Imported before anything loads config.js: it moves ONEMEMORY_HOME to a temp folder first.
+        const { retrievalMain } = await import("./bench/retrieval.js");
+        process.exitCode = await retrievalMain(args);
+        break;
+      }
       const { benchMain } = await import("./bench/index.js");
-      process.exitCode = await benchMain(process.argv.slice(3));
+      process.exitCode = await benchMain(args);
       break;
     }
     case "help":

@@ -81,6 +81,12 @@ export const BENCH_USAGE = [
   "  --strict-gaps        Also fail on known gaps (default: they are listed but do not fail the run).",
   "  --verbose            Show every failing check, including the known gaps, with expected vs actual.",
   "  --help               This text.",
+  "",
+  "onememory bench --longmemeval | --locomo [--data file] [--limit N] [--mode keyword|hybrid]",
+  "                [--granularity session|turn] [--json]",
+  "",
+  "  Retrieval benchmark on LongMemEval-S or LoCoMo (downloaded once to ~/.cache/onememory-bench unless --data):",
+  "  recall@5/10, recall_all@10, nDCG@10, MRR per question type, search latency, indexing time. No LLM.",
 ].join("\n");
 
 /** Parse argv (the part after the word `bench`), run, print, and return the process exit code. */
