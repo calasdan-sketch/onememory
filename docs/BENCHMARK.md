@@ -236,28 +236,31 @@ onememory bench --locomo      [--data file] [--limit N] [--mode keyword|hybrid] 
   `evidence` dialog ids; `--granularity session` writes one note per session and scores sessions.
 - **Questions.** LongMemEval's 30 abstention questions (`_abs`) have no gold session and are left out: 470 of
   500 are scored. LoCoMo questions with no usable evidence id are left out: 1,982 of 1,986.
-- **Two keyword searches are scored.** `keyword` is `store.searchRanked(question, {limit: 50})`, the FTS5/BM25
-  call behind `state_search` and `GET /search`: **every word of the query must match** (prefix AND).
-  `relevant` is `runRelevantSearch` (the `state_relevant` tool and `POST /relevant`): stop words dropped, a
-  note matching any keyword qualifies, per-keyword BM25 rankings fused with RRF. `--mode hybrid` also scores
-  `runSearch(mode: "hybrid")` (BM25 + embeddings, RRF) when an embedding server answers; otherwise it is
-  reported as skipped.
+- **Three searches are scored.** `keyword` is `runSearch(mode: "keyword")`, the path behind `state_search` and
+  `GET /search`: FTS5/BM25 with every word first, then (since 2.0.0) notes matching some of the words, always ranked
+  below full matches. `relevant` is `runRelevantSearch` (the `state_relevant` tool and `POST /relevant`): stop words
+  dropped, any keyword qualifies, per-keyword BM25 rankings fused with RRF. `--mode hybrid` also scores
+  `runSearch(mode: "hybrid")` (BM25 + embeddings, RRF) when an embedding server answers; otherwise it is reported as skipped.
 - **Metrics.** `R@5`, `R@10`: any gold session (or turn) in the top k. `Rall@10`: every gold one in the top 10.
   `nDCG@10` with binary relevance. `MRR` over the top 50. Search latency p50/p95 per query; indexing time per
   haystack (single process, SQLite in a temp folder).
 
 ### Results, 2026-10-31
 
-Machine: Windows 11 Home, RTX 5080 PC (the GPU is not used: no embeddings in these runs), Node v24.18.0,
-OneMemory 1.7.2 on the `feat/v2-surpass` branch. Commands exactly as above with no options except
-`--granularity` and `--json`. Wall time: LongMemEval session 30 s, turn 3 min, LoCoMo under 10 s each.
+Machine: Windows 11 Home, RTX 5080 PC, Node v24.18.0, OneMemory 2.0.0. Embeddings for `hybrid`: `nomic-embed-text`
+through a local Ollama (`ONEMEMORY_EMBEDDINGS=on`, `ONEMEMORY_EMBED_URL=http://127.0.0.1:11499/v1/embeddings`).
+Commands exactly as above. Wall time with embeddings: LongMemEval session 15 min (embedding every session is the cost),
+LoCoMo a few minutes; keyword-only runs take seconds.
 
-**LongMemEval-S (cleaned), 470 questions, session granularity** (22,419 notes; indexing 18.4 s total, p50 38 ms per haystack)
+**LongMemEval-S (cleaned), 470 questions, session granularity** (22,419 notes)
 
 | Search | R@5 | R@10 | Rall@10 | nDCG@10 | MRR | search p50 / p95 |
 |---|---|---|---|---|---|---|
-| keyword (`searchRanked`, AND) | 11.9 | 11.9 | 6.6 | 9.8 | 11.8 | 0.85 / 1.87 ms |
-| relevant (`state_relevant`, OR + RRF) | **95.3** | **97.4** | 88.5 | 87.1 | 88.0 | 1.32 / 2.87 ms |
+| keyword (`state_search`) | 95.1 | 97.2 | 88.3 | 87.0 | 87.9 | 2.7 / 5.3 ms |
+| relevant (`state_relevant`) | 95.3 | 97.4 | 88.5 | 87.1 | 88.0 | 1.4 / 3.0 ms |
+| hybrid (BM25 + embeddings) | **96.8** | **98.5** | **93.0** | **90.4** | **91.4** | 21 / 30 ms |
+
+Before the 2.0.0 fallback, `state_search` needed every word of the question and scored R@5 11.9 here.
 
 Per question type, `relevant`:
 
@@ -270,35 +273,30 @@ Per question type, `relevant`:
 | single-session-user | 64 | 98.4 | 100.0 | 100.0 | 95.2 |
 | temporal-reasoning | 127 | 92.9 | 96.1 | 83.5 | 83.4 |
 
-**LongMemEval-S (cleaned), 470 questions, turn granularity** (231,606 notes; indexing 162 s total, p50 299 ms per haystack)
-
-| Search | R@5 | R@10 | Rall@10 | nDCG@10 | MRR | search p50 / p95 |
-|---|---|---|---|---|---|---|
-| keyword (AND) | 0.9 | 0.9 | 0.0 | 0.5 | 0.9 | 1.06 / 2.17 ms |
-| relevant (OR + RRF) | 95.3 | 97.7 | 87.9 | 87.5 | 88.6 | 1.73 / 3.98 ms |
+**LongMemEval-S, turn granularity** (231,606 notes, keyword-only run): relevant R@5 95.3, R@10 97.7, Rall@10 87.9,
+nDCG@10 87.5, MRR 88.6, search p50 1.7 ms.
 
 **LoCoMo-10, 1,982 questions** (categories as numbered in the file; usually read as 1 multi-hop, 2 temporal,
 3 open-domain, 4 single-hop, 5 adversarial)
 
-| Granularity / search | R@5 | R@10 | Rall@10 | nDCG@10 | MRR |
-|---|---|---|---|---|---|
-| turn (dialog id), keyword (AND) | 0.1 | 0.1 | 0.1 | 0.1 | 0.1 |
-| turn (dialog id), relevant | 46.1 | 52.5 | 46.0 | 38.6 | 37.7 |
-| session, keyword (AND) | 13.7 | 13.7 | 11.6 | 12.5 | 13.3 |
-| session, relevant | 89.1 | 95.0 | 86.5 | 77.2 | 74.9 |
-
-LoCoMo turn level, `relevant`, R@10 by category: 1: 32.6, 2: 61.7, 3: 29.3, 4: 55.9, 5: 56.7 (5,882 notes,
-search p50 1.53 ms). Session level R@10 by category: 1: 92.2, 2: 92.5, 3: 80.4, 4: 97.1, 5: 97.3.
-
-**Hybrid: not measured.** No embedding model was loaded on this machine on the run date, so `--mode hybrid`
-reports itself as skipped. All numbers above are keyword-only.
+| Granularity / search | R@5 | R@10 | Rall@10 | nDCG@10 | MRR | search p50 |
+|---|---|---|---|---|---|---|
+| session, keyword (`state_search`) | 89.1 | 95.0 | 86.4 | 77.3 | 75.0 | 1.3 ms |
+| session, relevant | 89.1 | 95.0 | 86.5 | 77.2 | 74.9 | 1.0 ms |
+| session, hybrid | 80.0 | 93.0 | 85.2 | 64.0 | 58.1 | 13 ms |
+| turn (dialog id), keyword | 44.8 | 52.3 | 46.0 | 38.1 | 37.2 | 2.1 ms |
+| turn (dialog id), relevant | 46.1 | 52.8 | 46.2 | 38.8 | 37.9 | 2.1 ms |
+| turn (dialog id), hybrid | **52.1** | **64.1** | **54.8** | 38.9 | 35.1 | 27 ms |
 
 ### How to read these numbers
 
-- **The AND search is the weak spot, and it is a real product finding.** `state_search` / `GET /search` given a
-  whole natural-language question finds the right session only 12 % of the time on LongMemEval-S, and almost
-  never at turn level, because every word ("what", "did", "I", ...) has to appear in one note. An agent that
-  passes a full question to `state_search` instead of `state_relevant` gets this behaviour.
+- **Natural-language questions to `state_search` used to fail.** Before 2.0.0 it needed every word ("what", "did",
+  "I", ...) in one note and found the right session 12 % of the time on LongMemEval-S. The any-word fallback fixed it
+  (95 %); full matches still rank first, so short exact queries behave as before.
+- **Hybrid is not always better.** It helps when notes are short (LoCoMo turns: R@10 52 to 64) and on LongMemEval-S
+  sessions (R@5 95 to 97), but on LoCoMo whole sessions it ranks worse than keywords alone (R@5 89 to 80): a long,
+  many-topic session embeds as one blurred vector, and RRF weights both lists equally. Weighting the two lists is open work.
+  Embeddings are off by default, so the default path is the keyword row.
 - **LongMemEval-S is easy for retrieval.** Each haystack has about 50 sessions, most of them filler from
   unrelated chat datasets, so the evidence session is often the only one on its topic. High recall here does
   not mean high recall on a real single-topic memory. LoCoMo at turn level, where every turn is from the same
