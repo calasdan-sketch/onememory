@@ -248,12 +248,20 @@ function finalizeResults(
   limit: number,
   staleCfg: StalenessConfig
 ): NoteRecord[] {
+  const notes = rankHits(store, hits, staleCfg).slice(0, limit);
+  bumpAccess(store, notes);
+  return notes;
+}
+
+/**
+ * The ranking half of finalizeResults (access boost, staleness penalty, stale-twin demotion) without the truncation and
+ * the access bump: the session-start context ranks its own pool and decides itself what it shows (context-inject.ts).
+ */
+export function rankHits(store: Store, hits: Array<{ note: NoteRecord; score: number }>, staleCfg: StalenessConfig = stalenessConfig()): NoteRecord[] {
   const ranked = accessRerankEnabled()
     ? demoteStaleTwins(store, applyStalePenalty(boostAndRank(hits), staleCfg), staleCfg).ranked
     : [...hits].sort((a, b) => b.score - a.score); // native relevance only (stable)
-  const notes = ranked.slice(0, limit).map((h) => h.note);
-  bumpAccess(store, notes);
-  return notes;
+  return ranked.map((h) => h.note);
 }
 
 // ---- Retrieval visibility --------------------------------------------------

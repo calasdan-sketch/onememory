@@ -5,7 +5,8 @@
 // valid JSON payload with empty additionalContext and exit code 0 — a
 // broken DB must never break session start.
 //
-// Recency is the recall signal for session start; no embeddings involved.
+// What is injected is ranked by relevance to where you are (git branch, changed files, recent work) and packed into a
+// token budget by context-inject.ts; no embeddings involved.
 import type { NoteRecord } from "./store.js";
 import { UNTRUSTED_BANNER, describeWriter } from "./security.js";
 import {
@@ -154,7 +155,8 @@ export async function resolveRecallNamespace(cwd: string = process.cwd()): Promi
 }
 
 interface RecallData {
-  notes: NoteRecord[];
+  /** The ranked, budgeted memory text from context-inject.ts ("" when there is none). */
+  memory: string;
   /** Open-task + latest-handoff text ("" when there are none). */
   board: string;
 }
@@ -162,13 +164,13 @@ interface RecallData {
 async function fetchRecentNotes(opts: RecallOptions): Promise<RecallData> {
   const { DB_PATH } = await import("./config.js");
   const { Store, SCHEMA_VERSION } = await import("./store.js");
-  const { listTasks, listHandoffs, buildBoardSummary, TASK_TAG, HANDOFF_TAG } = await import("./tasks.js");
+  const { listTasks, listHandoffs, buildBoardSummary } = await import("./tasks.js");
   const { runnerNotice } = await import("./liveness.js");
   const limit = clampInt(opts.limit ?? 10, 10, 1, 100);
   const resolution = await resolveRecallNamespace(opts.cwd);
   if (resolution.kind === "unresolvable") {
     // Configured-but-unresolvable: fail closed to NOTHING, never unscoped.
-    return { notes: [], board: "" };
+    return { memory: "", board: "" };
   }
   // NOTE on token/scope checks: the hook path deliberately performs none.
   // The recall hook runs as a local subprocess on the operator's own machine
@@ -191,7 +193,7 @@ async function fetchRecentNotes(opts: RecallOptions): Promise<RecallData> {
       `onememory recall: the database is at schema v${onDisk} (this release uses v${SCHEMA_VERSION}); ` +
         "not upgrading it from the hook. Run any `onememory` command (for example `onememory doctor`) to upgrade it."
     );
-    return { notes: [], board: "" };
+    return { memory: "", board: "" };
   }
   const store = new Store(dbFile);
   try {
@@ -202,8 +204,9 @@ async function fetchRecentNotes(opts: RecallOptions): Promise<RecallData> {
       ...(opts.notWrittenBy ? { notWrittenBy: opts.notWrittenBy } : {}),
       ...(opts.includeDistrusted ? { includeDistrusted: true } : {}),
     };
-    const listed = store.list({ namespace, limit, withoutTags: [TASK_TAG, HANDOFF_TAG], ...wf }).notes;
-    const notes = opts.includeDistrusted ? store.markDistrusted(listed) : listed;
+    // Relevance-ranked across notes, observations and session summaries, inside the token budget (context-inject.ts).
+    const { injectContext } = await import("./context-inject.js");
+    const memory = await injectContext(store, { namespace, limit, cwd: opts.cwd, ...wf });
     let board = "";
     try {
       const ns = namespace ? [namespace] : undefined;
@@ -217,7 +220,7 @@ async function fetchRecentNotes(opts: RecallOptions): Promise<RecallData> {
       // The board is a bonus: never let it cost the recent-notes recall.
       console.error("onememory recall: task board skipped: " + (e as Error).message);
     }
-    return { notes, board };
+    return { memory, board };
   } finally {
     store.close();
   }
@@ -264,8 +267,7 @@ export async function runRecall(opts: RecallOptions = {}): Promise<string> {
     // injection-on-read guard uses so the agent treats notes as data, never
     // instructions. Empty context stays empty (no banner noise for a
     // nothing-to-report hook).
-    const recent = buildSummary(data.notes);
-    let summary = [data.board, recent].filter(Boolean).join("\n\n");
+    let summary = [data.board, data.memory].filter(Boolean).join("\n\n");
     if (summary.length > RECALL_MAX_CHARS) summary = summary.slice(0, RECALL_MAX_CHARS - 1) + "…";
     return buildHookOutput(summary ? UNTRUSTED_BANNER + summary : "");
   } catch (e) {
