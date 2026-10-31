@@ -232,9 +232,9 @@ export async function runRetrieval(o: RetrievalOptions): Promise<RetrievalReport
       for (const q of h.questions) {
         nq++;
         let t = performance.now();
-        const hits = store.searchRanked(q.query, { limit: TOP });
+        const hits = await runSearch(store, q.query, { mode: "keyword", limit: TOP });
         kwLat.push(performance.now() - t);
-        kw.push({ type: q.type, score: scoreQuestion(units(hits.map((x) => x.note.id)), q.gold) });
+        kw.push({ type: q.type, score: scoreQuestion(units(hits.map((n) => n.id)), q.gold) });
         t = performance.now();
         const relHits = (await runRelevantSearch(store, q.query, { limit: TOP })).results;
         relLat.push(performance.now() - t);
@@ -286,7 +286,7 @@ export function renderRetrieval(r: RetrievalReport): string {
       lines.push(`${k.padEnd(28)}${String(x.n).padStart(5)} ${pct(x.r5)} ${pct(x.r10)}  ${pct(x.rAll10)}  ${pct(x.ndcg10)} ${pct(x.mrr)}`);
     }
   };
-  table("keyword (store.searchRanked: FTS5 BM25, every query word must match)", r.keyword);
+  table("keyword (runSearch mode=keyword / state_search: BM25, all-terms first, any-keyword fallback)", r.keyword);
   table("relevant (runRelevantSearch / state_relevant: stop-words dropped, any keyword matches, RRF)", r.relevant);
   if ("skipped" in r.hybrid) lines.push("", `hybrid: skipped, ${r.hybrid.skipped}`);
   else table("hybrid (runSearch mode=hybrid, BM25 + embeddings RRF)", r.hybrid);
