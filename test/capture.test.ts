@@ -1,7 +1,7 @@
 // capture.ts: hook payload -> redacted, truncated capture event; settings; spool.
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../src/store.js";
@@ -14,6 +14,8 @@ import {
   recordEvent,
   spoolEvent,
   drainSpool,
+  captureBacklog,
+  SPOOL_MAX_TRIES,
   spoolSize,
   FIELD_MAX,
   SPOOL_FILE,
@@ -114,6 +116,33 @@ describe("recordEvent and the spool", () => {
       assert.equal(drainSpool(s, dir), 2);
       assert.ok(!existsSync(join(dir, SPOOL_FILE)));
       assert.equal((s.captureDb().prepare("SELECT COUNT(*) AS n FROM capture_events").get() as { n: number }).n, 2);
+      assert.equal(captureBacklog(s), 2, "doctor's backlog: both events still wait to be distilled");
+      s.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("an event that never stores is dropped after SPOOL_MAX_TRIES drains; a killed drain's file is adopted", () => {
+    const dir = mkdtempSync(join(tmpdir(), "om-cap-b-"));
+    try {
+      const ev = normalizeHookInput("user-prompt", { session_id: "s8", cwd: "/w", prompt: "x" });
+      spoolEvent(dir, { ...ev, namespace: "default" });
+      const broken = new Store(join(dir, "broken.db"));
+      broken.close(); // every recordEvent now throws
+      for (let i = 1; i < SPOOL_MAX_TRIES; i++) {
+        assert.equal(drainSpool(broken, dir), 0);
+        assert.equal(JSON.parse(readFileSync(join(dir, SPOOL_FILE), "utf8")).tries, i);
+      }
+      drainSpool(broken, dir);
+      assert.ok(!existsSync(join(dir, SPOOL_FILE)), "dropped, not cycled forever");
+      assert.equal(spoolSize(dir), 0);
+      const orphan = join(dir, `${SPOOL_FILE}.999-0.draining`);
+      writeFileSync(orphan, JSON.stringify({ ...ev, namespace: "default" }) + "\n");
+      const s = new Store(join(dir, "state.db"));
+      assert.equal(drainSpool(s, dir), 0, "a fresh .draining file belongs to a running drain");
+      utimesSync(orphan, new Date(Date.now() - 3600_000), new Date(Date.now() - 3600_000));
+      assert.equal(drainSpool(s, dir), 1);
+      assert.ok(!existsSync(orphan));
       s.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });

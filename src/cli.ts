@@ -25,6 +25,9 @@ function usage(): void {
       "            When: something isn't working, or after changing config.",
       "  init      Print the config snippet to wire onememory into your agent.",
       "            When: you want to see the config before using it, or to copy it by hand.",
+      "  uninstall [--dry-run] [--yes] [--purge] [--no-backup]",
+      "            Take OneMemory out of every app setup connected (same as setup --undo, for every setup run).",
+      "            --purge also deletes the data folder, after a final backup it names (unless --no-backup).",
       "  setup [--dry-run] [--yes] [--only claude-code,claude-desktop,cursor,codex,gemini,muse,vscode,zed] [--project] [--hook|--no-hook] [--capture|--no-capture] [--db <file>] [--undo]",
       "            Connect onememory to Claude Code / Claude Desktop / Cursor for you. Shows the plan and the exact lines it will",
       "            change, saves a backup of each file first, writes only after you type y. An old \"claude-bridge\" entry is offered",
@@ -69,7 +72,7 @@ function usage(): void {
       "  backup [--out <dir>] [--include-approval-key] [--include-attest-key] | backup --prune-premigration",
       "            Consistent hot copy of the database (works while the server runs)",
       "            into <dir>/state.db, plus a copy of the encryption key (.key) if",
-      "            at-rest encryption is on. Default dir: ./onememory-backup-<time>.",
+      "            at-rest encryption is on. Default dir: ~/onememory-backup-<time>.",
       "            WARNING: store the key SEPARATELY from the backup; a backup without",
       "            its key is unreadable, and one stored with it is not encrypted.",
       "            --include-attest-key also copies the signing key (.attest-key) so a restore keeps",
@@ -146,6 +149,10 @@ function usage(): void {
     ].join("\n")
   );
 }
+
+/** doctor warns above these (docs/footprint.md). */
+const DOCTOR_MAX_DATA_BYTES = 1e9;
+const DOCTOR_MAX_BACKLOG = 10_000;
 
 async function doctor(): Promise<void> {
   const {
@@ -373,23 +380,35 @@ async function doctor(): Promise<void> {
   }
 
   // Automatic memory: when did a hook last record something, and is anything waiting in the spool?
+  // Footprint: how big the data folder is, and is anything piling up (docs/footprint.md).
   try {
     const { Store } = await import("./store.js");
-    const { lastCaptureAt, spoolSize, captureSettings } = await import("./capture.js");
+    const { lastCaptureAt, captureBacklog, spoolSize, captureSettings, SPOOL_MAX_BYTES } = await import("./capture.js");
+    const { dirBytes } = await import("./uninstall.js");
     const { DATA_DIR } = await import("./config.js");
     const spool = spoolSize(DATA_DIR);
     const set = captureSettings(DATA_DIR);
     let last: string | null = null;
+    let backlog = 0;
     if (!dbProblem) {
       const s = new Store(DB_PATH);
       try {
         last = lastCaptureAt(s);
+        backlog = captureBacklog(s);
       } finally {
         s.close();
       }
     }
-    console.log(`  [info] capture: ${set.enabled ? "on" : "off (ONEMEMORY_CAPTURE / capture.json)"}; last event ${last ?? "never"}; spool ${spool} bytes`);
-    if (spool > 0) warn(`${spool} bytes of captured events are waiting in the spool; the next hook that can open the database stores them`);
+    console.log(`  [info] capture: ${set.enabled ? "on" : "off (ONEMEMORY_CAPTURE / capture.json)"}; last event ${last ?? "never"}; spool ${spool} bytes; ${backlog} event(s) not yet distilled`);
+    if (spool >= SPOOL_MAX_BYTES) warn(`the capture spool is full (${spool} bytes): new events are dropped until a hook can open the database`);
+    else if (spool > 0) warn(`${spool} bytes of captured events are waiting in the spool; the next hook that can open the database stores them`);
+    if (backlog > DOCTOR_MAX_BACKLOG) {
+      warn(`${backlog} captured events are waiting to be distilled (over ${DOCTOR_MAX_BACKLOG}); that happens when a session starts or ends, so a failing session hook is the likely cause`);
+    }
+    const bytes = dirBytes(DATA_DIR);
+    const mb = (bytes / 1e6).toFixed(1);
+    if (bytes > DOCTOR_MAX_DATA_BYTES) warn(`data folder ${DATA_DIR} is ${mb} MB (over ${DOCTOR_MAX_DATA_BYTES / 1e9} GB); docs/footprint.md says what is in it and what is safe to remove`);
+    else ok(`data folder ${DATA_DIR} is ${mb} MB`);
   } catch (e) {
     warn("capture status unavailable: " + (e as Error).message);
   }
@@ -910,7 +929,10 @@ async function backupCmd(): Promise<void> {
     return;
   }
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*$/, "").replace("T", "-");
-  const out = str(flags.out) ?? `onememory-backup-${stamp}`;
+  // Default in the home folder, never the current one: run inside a repo, a backup (notes + key) there could get committed.
+  const { homedir } = await import("node:os");
+  const { join } = await import("node:path");
+  const out = str(flags.out) ?? join(homedir(), `onememory-backup-${stamp}`);
   const store = new Store(DB_PATH);
   try {
     const r = backupStore(store, DB_PATH, out, {
@@ -1911,6 +1933,20 @@ async function setupCmd(): Promise<void> {
   });
 }
 
+// `onememory uninstall`: see uninstall.ts.
+async function uninstallCmd(): Promise<void> {
+  const { realEnv } = await import("./setup.js");
+  const { runUninstall } = await import("./uninstall.js");
+  const { flags } = parseFlags(process.argv.slice(3), { values: [], bools: ["purge", "dry-run", "yes", "no-backup"] });
+  const { PACKAGE_VERSION } = await import("./config.js");
+  process.exitCode = await runUninstall(realEnv(PACKAGE_VERSION, fileURLToPath(import.meta.url)), terminalIO(), {
+    purge: flags.purge === true,
+    dryRun: flags["dry-run"] === true,
+    yes: flags.yes === true,
+    noBackup: flags["no-backup"] === true,
+  });
+}
+
 function askYesNo(prompt: string): Promise<boolean> {
   return new Promise((resolve) => {
     const rl = readline.createInterface({
@@ -1945,7 +1981,7 @@ async function main(): Promise<void> {
   // A dry run of `import --claude` or `sync` must not create anything, not even the data folder.
   const dry = process.argv.includes("--dry-run") && ((cmd === "import" && process.argv.includes("--claude")) || cmd === "sync");
   // The capture hooks (`hook`) never move or create data folders: they run on every tool call and must stay quick and quiet.
-  if (!dry && !["help", "--help", "-h", "init", "bench", "setup", "hook"].includes(cmd)) (await import("./config.js")).prepareDataDir();
+  if (!dry && !["help", "--help", "-h", "init", "bench", "setup", "uninstall", "hook"].includes(cmd)) (await import("./config.js")).prepareDataDir();
   // Fixed writer marker for notes this process writes with no token behind
   // them (written_by): the long-running server's own jobs, the stdio MCP
   // server, or an `onememory ...` command run by the machine owner.
@@ -1969,6 +2005,9 @@ async function main(): Promise<void> {
       break;
     case "setup":
       await setupCmd();
+      break;
+    case "uninstall":
+      await uninstallCmd();
       break;
     case "sync":
       await syncCmd();

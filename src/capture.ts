@@ -7,7 +7,7 @@
 // spool only ever holds redacted events.
 //
 // Nothing here throws to the hook: errors are the caller's to swallow (hook.ts never fails the agent).
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, chmodSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import type { Store } from "./store.js";
 import { redact } from "./redact.js";
@@ -21,7 +21,7 @@ export const FIELD_MAX = 4096;
 /** What is redacted at most per field: a 1 MiB tool output is cut to this BEFORE the (linear, but not free) secret scan. */
 const REDACT_WINDOW = 64 * 1024;
 /** The spool stops growing past this (events are then dropped; capture is best effort, the agent never waits). */
-const SPOOL_MAX_BYTES = 10 * 1024 * 1024;
+export const SPOOL_MAX_BYTES = 10 * 1024 * 1024;
 export const SPOOL_FILE = "capture-spool.jsonl";
 
 export interface CaptureEvent {
@@ -179,7 +179,13 @@ export { captureAad } from "./crypto.js";
 
 export interface SpooledEvent extends CaptureEvent {
   namespace: string;
+  /** Failed drains so far; past SPOOL_MAX_TRIES the event is dropped, so one bad line cannot cycle through the spool forever. */
+  tries?: number;
 }
+
+export const SPOOL_MAX_TRIES = 5;
+/** A `.draining` file this old was left by a hook that died mid-drain: the next drain adopts it. */
+const STALE_DRAIN_MS = 10 * 60_000;
 
 export function spoolEvent(dataDir: string, ev: SpooledEvent): boolean {
   try {
@@ -198,53 +204,78 @@ export function spoolEvent(dataDir: string, ev: SpooledEvent): boolean {
   }
 }
 
+/**
+ * Move the spool aside (a rename is atomic, so two hooks never drain the same lines) and store every event in it.
+ * A line that cannot be stored is put back into the spool. Returns how many were stored.
+ */
+export function drainSpool(store: Store, dataDir: string, now = Date.now()): number {
+  const p = join(dataDir, SPOOL_FILE);
+  const files: string[] = [];
+  const take = (from: string, n: number): void => {
+    const to = `${p}.${process.pid}-${n}.draining`;
+    try {
+      renameSync(from, to);
+      files.push(to);
+    } catch {
+      /* another hook is draining it */
+    }
+  };
+  if (existsSync(p)) take(p, 0);
+  // Adopt what a killed hook left behind, so it is stored (or dropped) instead of lying there forever.
+  try {
+    for (const f of readdirSync(dataDir)) {
+      const full = join(dataDir, f);
+      if (f.startsWith(SPOOL_FILE + ".") && f.endsWith(".draining") && !files.includes(full) && now - statSync(full).mtimeMs > STALE_DRAIN_MS) take(full, files.length + 1);
+    }
+  } catch {
+    /* no data dir */
+  }
+  let stored = 0;
+  for (const taken of files) {
+    try {
+      for (const line of readFileSync(taken, "utf8").split("\n")) {
+        if (!line.trim()) continue;
+        let ev: SpooledEvent;
+        try {
+          ev = JSON.parse(line) as SpooledEvent;
+        } catch {
+          continue; // a torn line (a hook killed mid-write) is dropped
+        }
+        if (!ev || typeof ev.session_id !== "string" || !(HOOK_EVENTS as readonly string[]).includes(ev.event)) continue;
+        try {
+          recordEvent(store, ev, typeof ev.namespace === "string" ? ev.namespace : "");
+          stored++;
+        } catch {
+          const tries = (Number(ev.tries) || 0) + 1;
+          if (tries < SPOOL_MAX_TRIES) spoolEvent(dataDir, { ...ev, tries });
+        }
+      }
+    } finally {
+      try {
+        unlinkSync(taken);
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+  return stored;
+}
+
+/** Spool bytes, including `.draining` files a drain is working on (or a killed one left). */
 export function spoolSize(dataDir: string): number {
   try {
-    return statSync(join(dataDir, SPOOL_FILE)).size;
+    return readdirSync(dataDir)
+      .filter((f) => f === SPOOL_FILE || (f.startsWith(SPOOL_FILE + ".") && f.endsWith(".draining")))
+      .reduce((n, f) => n + statSync(join(dataDir, f)).size, 0);
   } catch {
     return 0;
   }
 }
 
-/**
- * Move the spool aside (a rename is atomic, so two hooks never drain the same lines) and store every event in it.
- * A line that cannot be stored is put back into the spool. Returns how many were stored.
- */
-export function drainSpool(store: Store, dataDir: string): number {
-  const p = join(dataDir, SPOOL_FILE);
-  if (!existsSync(p)) return 0;
-  const taken = `${p}.${process.pid}.draining`;
-  try {
-    renameSync(p, taken);
-  } catch {
-    return 0; // another hook is draining it
-  }
-  let stored = 0;
-  try {
-    for (const line of readFileSync(taken, "utf8").split("\n")) {
-      if (!line.trim()) continue;
-      let ev: SpooledEvent;
-      try {
-        ev = JSON.parse(line) as SpooledEvent;
-      } catch {
-        continue; // a torn line (a hook killed mid-write) is dropped
-      }
-      if (!ev || typeof ev.session_id !== "string" || !(HOOK_EVENTS as readonly string[]).includes(ev.event)) continue;
-      try {
-        recordEvent(store, ev, typeof ev.namespace === "string" ? ev.namespace : "");
-        stored++;
-      } catch {
-        spoolEvent(dataDir, ev);
-      }
-    }
-  } finally {
-    try {
-      unlinkSync(taken);
-    } catch {
-      /* best effort */
-    }
-  }
-  return stored;
+/** Captured events no session summary has taken in yet (doctor): a growing number means session hooks are failing. */
+export function captureBacklog(store: Store): number {
+  const r = store.captureDb().prepare("SELECT COUNT(*) AS n FROM capture_events e JOIN sessions s ON s.id = e.session_id WHERE e.seq > s.distilled_seq").get() as { n: number };
+  return Number(r.n);
 }
 
 /** Most recent capture time (doctor), or null. */

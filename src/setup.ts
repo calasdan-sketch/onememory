@@ -618,7 +618,7 @@ export interface WrittenChange {
 
 const sha = (s: string): string => createHash("sha256").update(s).digest("hex");
 
-function stamp(d: Date): string {
+export function stamp(d: Date): string {
   return d.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
 }
 
@@ -757,9 +757,14 @@ export interface HistorySession {
   migratedLegacy?: boolean;
 }
 
-export function historyFile(e: SetupEnv): string {
+/** The data folder: ONEMEMORY_HOME, else ~/.onememory. */
+export function dataHome(e: SetupEnv): string {
   const home = e.env.ONEMEMORY_HOME?.trim();
-  return join(home ? resolve(home) : join(e.home, ".onememory"), "setup-history.json");
+  return home ? resolve(home) : join(e.home, ".onememory");
+}
+
+export function historyFile(e: SetupEnv): string {
+  return join(dataHome(e), "setup-history.json");
 }
 
 export function readHistory(e: SetupEnv): HistorySession[] {
@@ -771,7 +776,7 @@ export function readHistory(e: SetupEnv): HistorySession[] {
   }
 }
 
-function saveHistory(e: SetupEnv, all: HistorySession[]): void {
+export function saveHistory(e: SetupEnv, all: HistorySession[]): void {
   const f = historyFile(e);
   mkdirSync(dirname(f), { recursive: true, mode: 0o700 });
   writeAtomic(f, JSON.stringify(all, null, 2) + "\n", 0o600);
@@ -814,6 +819,18 @@ export async function undoLast(e: SetupEnv, io: SetupIO): Promise<number> {
   }
   const s = all[idx];
   io.out(`Undoing the setup from ${s.at}:`);
+  if (undoSession(e, io, s) === 0) {
+    s.undone = true;
+    saveHistory(e, all);
+    io.out("Done. Restart Claude Code.");
+    await reportDatabaseAfterUndo(s, io);
+    return 0;
+  }
+  return 1;
+}
+
+/** Put back every file one setup session changed (newest change first). Returns how many could not be undone. */
+export function undoSession(e: SetupEnv, io: SetupIO, s: HistorySession): number {
   let failed = 0;
   for (const c of [...s.changes].reverse()) {
     try {
@@ -851,14 +868,7 @@ export async function undoLast(e: SetupEnv, io: SetupIO): Promise<number> {
       io.err(`  ${c.file}: could not undo (${(err as Error).message}). Your backup is ${c.backup ?? "(none; the file was new)"}`);
     }
   }
-  if (failed === 0) {
-    s.undone = true;
-    saveHistory(e, all);
-    io.out("Done. Restart Claude Code.");
-    await reportDatabaseAfterUndo(s, io);
-    return 0;
-  }
-  return 1;
+  return failed;
 }
 
 // ---- the command --------------------------------------------------------------------------------------------------------------
