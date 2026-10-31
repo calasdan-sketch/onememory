@@ -162,6 +162,23 @@ onememory setup --capture        # or answer y to "Also record what Claude does 
   `memory_get` (full text, cite as `om:#id`), plus `session_list`. REST: `GET /index`, `GET /timeline`, `POST /get`,
   `GET /sessions`, `GET /files/timeline?path=`. The [onememory-mem skill](./skills/onememory-mem/SKILL.md) teaches
   an agent this order.
+- **Before a file is read:** a `PreToolUse` hook on `Read` (`onememory hook file-context`, installed with
+  `--capture`) tells the agent which memories are linked to that file, once per session per file. It is advisory
+  only: it never blocks, allows or changes the Read. Same namespace, trust and UNTRUSTED-banner rules as the
+  start-of-session context.
+- **In the dashboard:** the **Sessions** tab lists recorded sessions; open one for its timeline (summary, prompts,
+  observations, oldest first).
+- **Optional local model:** set `ONEMEMORY_LLM_URL` (an OpenAI-compatible server such as Ollama,
+  `http://127.0.0.1:11434`) and `ONEMEMORY_LLM_MODEL`, and at session end one call rewrites the session summary in
+  plain words. Off by default; only a loopback URL is accepted (`ONEMEMORY_LLM_ALLOW_REMOTE=1` to override); bounded
+  by `ONEMEMORY_LLM_TIMEOUT_MS`; the answer is redacted and linted like any write, and on any failure the automatic
+  summary stays.
+- **Moves with your data:** export / import and the Markdown vault sync carry an observation's kind, session, type
+  and files; `onememory encrypt enable` seals captured event outputs too. Captured rows are left out of the stale
+  count, `memory_stats` totals and consolidation.
+
+**Semantic search when available:** `ONEMEMORY_EMBEDDINGS=auto` uses your local embedding endpoint when it answers
+and quietly stays on keyword search when it does not (it retries once a minute).
 
 `onememory doctor` shows whether the hooks are wired, the last captured event and the spool size;
 `onememory setup --undo` takes the hooks out again.
