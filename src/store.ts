@@ -362,7 +362,29 @@ export type ImportNote = NoteInput & {
   /** Carried by an export (1.6.0): this note was retired and replaced by the note with this id IN THE SAME FILE. */
   superseded_by?: number;
   superseded_at?: string;
+  /** v16, carried by an export: a captured row's kind, session, observation type and linked files (admin restore only). */
+  kind?: string;
+  session_id?: string;
+  obs_type?: string;
+  files?: unknown;
 };
+
+/** v16: what a captured row's kind / session / type / files look like on the way in from an export or a vault file. */
+export interface CaptureFields {
+  kind?: NoteKind;
+  sessionId?: string;
+  obsType?: string;
+}
+
+/** The capture fields of an import payload, validated: anything malformed or a plain 'note' means "an ordinary note". */
+export function captureFieldsOf(v: { kind?: unknown; session_id?: unknown; obs_type?: unknown }): CaptureFields {
+  if (v.kind !== "observation" && v.kind !== "summary") return {};
+  return {
+    kind: v.kind,
+    ...(typeof v.session_id === "string" && v.session_id.trim() ? { sessionId: v.session_id.trim().slice(0, 200) } : {}),
+    ...(v.kind === "observation" && typeof v.obs_type === "string" && /^[a-z_]{1,40}$/.test(v.obs_type) ? { obsType: v.obs_type } : {}),
+  };
+}
 
 /** What an import made of the attestations it met. */
 export interface AttestationReport {
@@ -3293,6 +3315,48 @@ export class Store {
     return rows.map((r) => r.path);
   }
 
+  /** v16: the files each of these notes is linked to (note_files), by note id. */
+  noteFiles(ids: number[]): Map<number, Array<{ path: string; action: string }>> {
+    const out = new Map<number, Array<{ path: string; action: string }>>();
+    for (let i = 0; i < ids.length; i += 500) {
+      const page = ids.slice(i, i + 500);
+      const rows = this.db
+        .prepare(`SELECT note_id, path, action FROM note_files WHERE note_id IN (${page.map(() => "?").join(",")}) ORDER BY path, action`)
+        .all(...page) as Array<{ note_id: number; path: string; action: string }>;
+      for (const r of rows) {
+        const l = out.get(r.note_id) ?? [];
+        l.push({ path: r.path, action: r.action });
+        out.set(r.note_id, l);
+      }
+    }
+    return out;
+  }
+
+  /** v16: link a note to files. `files` is untrusted (an import payload): only well-formed entries, at most 200, are kept. */
+  linkNoteFiles(noteId: number, files: unknown): void {
+    if (!Array.isArray(files)) return;
+    const ins = this.db.prepare("INSERT OR IGNORE INTO note_files (note_id, path, action) VALUES (?, ?, ?)");
+    for (const f of files.slice(0, 200) as Array<{ path?: unknown; action?: unknown }>) {
+      if (!f || typeof f.path !== "string" || !f.path.trim() || (f.action !== "changed" && f.action !== "read")) continue;
+      ins.run(noteId, f.path.slice(0, 1000), f.action);
+    }
+  }
+
+  /**
+   * v16 restore: a captured row that came back from an export or a vault file gets its files, and its session a row
+   * (a stub when this store never saw the session; an existing one in another namespace is left alone), so it shows in
+   * session_list and the dashboard again. A summary becomes its session's summary when the session has none.
+   */
+  restoreCaptureLinks(note: NoteRecord, files: unknown): void {
+    if (!note.kind || note.kind === "note") return;
+    this.linkNoteFiles(note.id, files);
+    if (!note.session_id) return;
+    this.db.prepare("INSERT OR IGNORE INTO sessions (id, namespace, cwd, started_at) VALUES (?, ?, '', ?)").run(note.session_id, note.namespace, note.created_at);
+    if (note.kind === "summary") {
+      this.db.prepare("UPDATE sessions SET summary_note_id = ? WHERE id = ? AND namespace = ? AND summary_note_id IS NULL").run(note.id, note.session_id, note.namespace);
+    }
+  }
+
   /** v16: seal / open a capture event's output exactly like a note body (null envelope = plaintext store). */
   sealCapture(plain: string, aad: string): { text: string; enc: string | null } {
     const s = this.sealBody(plain, aad);
@@ -4161,8 +4225,11 @@ export class Store {
     const key = opts.attest ? this.signing() : null;
     const sid = key ? this.serverId() : "";
     const exportedAt = new Date().toISOString();
+    // v16: a captured row carries its linked files (not signed, like history).
+    const files = this.noteFiles(rows.filter((r) => r.kind && r.kind !== "note").map((r) => r.id));
     const sealed = (n: NoteRecord): NoteRecord & { attestation?: Attestation; history?: HistoryEntry[] } => {
-      const signed = key ? { ...n, attestation: signRecord(key, sid, n, exportedAt) } : n;
+      const attested = key ? { ...n, attestation: signRecord(key, sid, n, exportedAt) } : n;
+      const signed = files.has(n.id) ? { ...attested, files: files.get(n.id) } : attested;
       if (!opts.history) return signed;
       const h = this.historyOf(n.id);
       return h.length ? { ...signed, history: h } : signed;
@@ -4331,8 +4398,10 @@ export class Store {
                   // silently turned into "live, no TTL".
                   ...(note.expires_at ? { expiresAt: note.expires_at } : {}),
                   ...(note.archived_at ? { archivedAt: note.archived_at } : {}),
+                  ...captureFieldsOf(note),
                 }
               );
+            this.restoreCaptureLinks(madeNote, note.files);
             created.push(madeNote);
             if (typeof note.id === "number") idMap.set(note.id, madeNote.id);
             if (typeof note.superseded_by === "number" && note.archived_at) {

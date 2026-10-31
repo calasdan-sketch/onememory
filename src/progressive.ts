@@ -55,23 +55,8 @@ function sinceIso(since: string | undefined): string | undefined {
 const clamp = (v: number | undefined, def: number, max: number): number =>
   typeof v === "number" && Number.isFinite(v) ? Math.min(Math.max(Math.floor(v), 1), max) : def;
 
-function filesOf(store: Store, ids: number[]): Map<number, Array<{ path: string; action: string }>> {
-  const out = new Map<number, Array<{ path: string; action: string }>>();
-  if (!ids.length) return out;
-  const rows = store
-    .captureDb()
-    .prepare(`SELECT note_id, path, action FROM note_files WHERE note_id IN (${ids.map(() => "?").join(",")}) ORDER BY path`)
-    .all(...ids) as Array<{ note_id: number; path: string; action: string }>;
-  for (const r of rows) {
-    const l = out.get(r.note_id) ?? [];
-    l.push({ path: r.path, action: r.action });
-    out.set(r.note_id, l);
-  }
-  return out;
-}
-
 export function toRows(store: Store, notes: NoteRecord[]): IndexRow[] {
-  const files = filesOf(store, notes.map((n) => n.id));
+  const files = store.noteFiles(notes.map((n) => n.id));
   return notes.map((n) => ({
     id: n.id,
     kind: n.kind ?? "note",
@@ -169,7 +154,7 @@ export function memoryGet(store: Store, scope: ReadScope, ids: unknown): { notes
     if (n) found.push(n);
     else missing.push(id);
   }
-  const files = filesOf(store, found.map((n) => n.id));
+  const files = store.noteFiles(found.map((n) => n.id));
   return {
     notes: found.map((n) => ({ ...n, files: files.get(n.id) ?? [], session: n.session_id ? sessionRow(store, scope, n.session_id) : null, citation: `om:#${n.id}` })),
     missing,

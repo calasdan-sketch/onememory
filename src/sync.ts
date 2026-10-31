@@ -76,6 +76,7 @@ import {
   Store,
   ValidationError,
   QuarantinedError,
+  captureFieldsOf,
   type NoteRecord,
 } from "./store.js";
 import { parseWriterRef } from "./trust.js";
@@ -253,7 +254,7 @@ function claimNames(raw: string): string[] {
 export function renderNoteFile(
   note: NoteRecord,
   identity: { origin: string; id: number },
-  extra: { distrusted?: boolean; foreign?: boolean } = {}
+  extra: { distrusted?: boolean; foreign?: boolean; files?: Array<{ path: string; action: string }> } = {}
 ): string {
   const fm: Record<(typeof KEYS)[number], unknown> = {
     id: identity.id,
@@ -273,6 +274,12 @@ export function renderNoteFile(
   const lines = KEYS.map((k) => `${k}: ${JSON.stringify(fm[k])}`);
   // Written only for a note the trust policy hides from agents (export --include-distrusted).
   if (extra.distrusted) lines.push("distrusted: true");
+  // v16: only a captured row carries these, so an ordinary note's file is byte-identical to before.
+  if (note.kind && note.kind !== "note") {
+    lines.push(`kind: ${JSON.stringify(note.kind)}`, `session_id: ${JSON.stringify(note.session_id ?? "")}`);
+    if (note.obs_type) lines.push(`obs_type: ${JSON.stringify(note.obs_type)}`);
+    if (extra.files?.length) lines.push(`files: ${JSON.stringify(extra.files)}`);
+  }
   return `---\n${lines.join("\n")}\n---\n${lf(note.body)}\n`;
 }
 
@@ -426,6 +433,7 @@ export function exportMarkdown(
   const skipped: ExportResult["skipped"] = [];
   let written = 0;
   let unchanged = 0;
+  const files = store.noteFiles(notes.filter((n) => n.kind && n.kind !== "note").map((n) => n.id));
   for (const note of notes) {
     const o = origins.get(note.id);
     const identity = o ? { origin: o.origin, id: o.originId } : { origin: self, id: note.id };
@@ -440,7 +448,7 @@ export function exportMarkdown(
     const base = store.syncBase(note.id);
     exported.set(note.id, [base, hash]);
     try {
-      const text = renderNoteFile(note, identity, { distrusted: marked.has(note.id), foreign: identity.origin !== self });
+      const text = renderNoteFile(note, identity, { distrusted: marked.has(note.id), foreign: identity.origin !== self, files: files.get(note.id) });
       const current = safeRead(dir, path);
       if (current === text) {
         store.setSyncBase(note.id, hash);
@@ -672,13 +680,16 @@ export async function importMarkdown(
           ...(typeof fm.origin_writer === "string" && fm.origin_writer.trim()
             ? { importedWrittenBy: fm.origin_writer.trim().slice(0, 200), mergedFromWriters: claimNames(fm.origin_writer) }
             : {}),
+          // A captured row (observation / summary) comes back as one, with its files and session.
+          ...captureFieldsOf(fm),
         }
       );
+      store.restoreCaptureLinks(n, fm.files);
       if (hasIdentity && origin !== self) store.syncLink(origin!, originId!, n.id);
       // A hand-written file, or one restoring a note deleted here (which
       // got a new id), gets the note's identity written back, so the next
       // import updates this note instead of creating it again.
-      else safeWrite(dir, file, renderNoteFile(n, { origin: self, id: n.id }));
+      else safeWrite(dir, file, renderNoteFile(n, { origin: self, id: n.id }, { files: store.noteFiles([n.id]).get(n.id) }));
       return n;
     };
 

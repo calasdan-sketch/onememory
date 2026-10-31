@@ -228,8 +228,7 @@ function write(store: Store, s: SessionRow, kind: "observation" | "summary", typ
 }
 
 function linkFiles(store: Store, noteId: number, files: Observation["files"]): void {
-  const ins = store.captureDb().prepare("INSERT OR IGNORE INTO note_files (note_id, path, action) VALUES (?, ?, ?)");
-  for (const f of files.slice(0, 200)) ins.run(noteId, f.path.slice(0, 1000), f.action);
+  store.linkNoteFiles(noteId, files);
 }
 
 /** Pure: the summary text of a whole session. Null when there is nothing worth summarizing. */
