@@ -11,6 +11,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSy
 import { join } from "node:path";
 import type { Store } from "./store.js";
 import { redact } from "./redact.js";
+import { captureAad } from "./crypto.js";
 
 export const HOOK_EVENTS = ["session-start", "user-prompt", "post-tool", "post-tool-failure", "stop", "subagent-stop", "session-end"] as const;
 export type HookEvent = (typeof HOOK_EVENTS)[number];
@@ -171,10 +172,8 @@ export function recordEvent(store: Store, ev: CaptureEvent, namespace: string): 
   }
 }
 
-/** AAD binding a sealed event output to its row. */
-export function captureAad(seq: number, sessionId: string): string {
-  return `capture|${seq}|${sessionId}`;
-}
+/** AAD binding a sealed event output to its row (crypto.ts, where every AAD lives). */
+export { captureAad } from "./crypto.js";
 
 // ---- spool ------------------------------------------------------------------------------------------------------------
 

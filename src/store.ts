@@ -38,7 +38,7 @@ import {
 import { isStale, stalenessConfig, annotateStaleness } from "./staleness.js";
 // At-rest encryption for note bodies. No module cycle: crypto.ts imports
 // only node: builtins, never store.ts.
-import { encrypt, decryptIfEncrypted, loadKey, keyPath, noteAad } from "./crypto.js";
+import { encrypt, decryptIfEncrypted, loadKey, keyPath, noteAad, captureAad } from "./crypto.js";
 import { currentActor, currentWriter, cleanWriter } from "./actor.js";
 import {
   ALL_NAMESPACES,
@@ -3553,6 +3553,23 @@ export class Store {
     for (const r of rows) upd.run(decryptIfEncrypted(r.body_enc, key, historyAad(r.hid)), r.hid);
   }
 
+  /**
+   * v16: seal every still-plaintext capture event output (caller holds the write lock; `encrypt enable`). The notes the
+   * capture writer made are ordinary notes rows, so encryptAll's own pass covers them.
+   */
+  private sealCaptureEvents(key: Buffer): void {
+    const rows = this.db.prepare("SELECT seq, session_id, output FROM capture_events WHERE output_enc IS NULL AND output <> ''").all() as Array<{ seq: number; session_id: string; output: string }>;
+    const upd = this.db.prepare("UPDATE capture_events SET output = '', output_enc = ? WHERE seq = ?");
+    for (const r of rows) upd.run(encrypt(r.output, key, captureAad(r.seq, r.session_id)), r.seq);
+  }
+
+  /** Inverse of sealCaptureEvents (caller holds the write lock; `encrypt disable`). */
+  private unsealCaptureEvents(key: Buffer): void {
+    const rows = this.db.prepare("SELECT seq, session_id, output_enc FROM capture_events WHERE output_enc IS NOT NULL").all() as Array<{ seq: number; session_id: string; output_enc: string }>;
+    const upd = this.db.prepare("UPDATE capture_events SET output = ?, output_enc = NULL WHERE seq = ?");
+    for (const r of rows) upd.run(decryptIfEncrypted(r.output_enc, key, captureAad(r.seq, r.session_id)), r.seq);
+  }
+
   // --- Supersede (v15) ------------------------------------------------------
 
   /**
@@ -3777,6 +3794,7 @@ export class Store {
       }
       this.sealQuarantine(key);
       this.sealHistory(key);
+      this.sealCaptureEvents(key);
       this.db.exec("COMMIT");
     } catch (e) {
       try {
@@ -3891,6 +3909,7 @@ export class Store {
       }
       this.unsealQuarantine(key);
       this.unsealHistory(key);
+      this.unsealCaptureEvents(key);
       hooks.beforeCommit?.();
       this.db.exec("COMMIT");
     } catch (e) {

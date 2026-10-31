@@ -54,6 +54,11 @@ export function noteAad(id: number, namespace: string): string {
   return `${id}|${namespace}`;
 }
 
+/** The AAD that binds a sealed capture event output (capture.ts) to its row. */
+export function captureAad(seq: number, sessionId: string): string {
+  return `capture|${seq}|${sessionId}`;
+}
+
 /** Default key location: beside the database, in the data dir. */
 export const KEY_FILENAME = ".key";
 
