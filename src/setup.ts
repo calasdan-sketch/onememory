@@ -383,6 +383,8 @@ const HOOK_DETECT = /recall --budget-ms|onememory[^\n]{0,120}\b(?:recall|hook se
  */
 export const CAPTURE_HOOKS: ReadonlyArray<{ on: string; event: string; async: boolean; matcher?: string }> = [
   { on: "UserPromptSubmit", event: "user-prompt", async: false },
+  // Advisory: what memory knows about a file, shown just before the agent reads it (never denies). Synchronous: its output is the context.
+  { on: "PreToolUse", event: "file-context", async: false, matcher: "Read" },
   { on: "PostToolUse", event: "post-tool", async: true, matcher: "*" },
   { on: "PostToolUseFailure", event: "post-tool-failure", async: true, matcher: "*" },
   { on: "Stop", event: "stop", async: true },

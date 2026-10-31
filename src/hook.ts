@@ -8,6 +8,7 @@
 // (or, when ONEMEMORY_HOOK_URL and ONEMEMORY_HOOK_TOKEN are set, to POST <url>/capture first) and a later hook drains it.
 //
 // session-start also prints the start-of-session context (recall.ts / context-inject.ts), exactly like `onememory recall`.
+// file-context (PreToolUse on Read) prints what memory knows about the file about to be read (file-context.ts); advisory only.
 import { existsSync } from "node:fs";
 import { HOOK_EVENTS, type HookEvent, captureSettings, normalizeHookInput, shouldCapture, recordEvent, spoolEvent, drainSpool, type CaptureEvent } from "./capture.js";
 
@@ -125,6 +126,15 @@ export async function captureHook(event: HookEvent, payload: Record<string, unkn
  * The whole hook: returns the text to print on stdout ("" = print nothing). Never throws.
  */
 export async function runHook(eventArg: string, stdinText: string, opts: HookOptions = {}): Promise<string> {
+  // PreToolUse(Read): advisory file context, not a capture event (the Read itself is recorded by post-tool).
+  if (eventArg === "file-context") {
+    try {
+      const { fileContextHook } = await import("./file-context.js");
+      return await fileContextHook(parsePayload(stdinText), opts);
+    } catch {
+      return "";
+    }
+  }
   const event = (HOOK_EVENTS as readonly string[]).includes(eventArg) ? (eventArg as HookEvent) : null;
   if (!event) {
     process.stderr.write(`onememory hook: unknown event "${eventArg}" (one of ${HOOK_EVENTS.join(", ")}); ignored\n`);

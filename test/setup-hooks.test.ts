@@ -54,6 +54,8 @@ describe("setup: automatic memory hooks", () => {
     }
     assert.equal(after.hooks.UserPromptSubmit[0].hooks[0].async, undefined);
     assert.equal(after.hooks.PostToolUse.at(-1).hooks[0].async, true);
+    assert.equal(after.hooks.PreToolUse.at(-1).matcher, "Read", "file context runs on Read only");
+    assert.equal(after.hooks.PreToolUse.at(-1).hooks[0].async, undefined, "file context is synchronous (its output is the context)");
   });
 
   test("idempotent: once installed nothing more is planned; an existing recall hook is kept, not replaced", () => {

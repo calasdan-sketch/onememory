@@ -3269,6 +3269,8 @@ export class Store {
     const cutoff = new Date(now - days * 86_400_000).toISOString();
     if (namespaces && namespaces.length === 0) return 0;
     const nsSql = namespaces ? ` AND session_id IN (SELECT id FROM sessions WHERE namespace IN (${namespaces.map(() => "?").join(",")}))` : "";
+    // The once-per-session file announcements (file-context.ts) of sessions that started before the cutoff go too.
+    this.db.prepare(`DELETE FROM file_context_seen WHERE session_id IN (SELECT id FROM sessions WHERE started_at < ?${namespaces ? ` AND namespace IN (${namespaces.map(() => "?").join(",")})` : ""})`).run(cutoff, ...(namespaces ?? []));
     return Number(this.db.prepare(`DELETE FROM capture_events WHERE at < ?${nsSql}`).run(cutoff, ...(namespaces ?? [])).changes ?? 0);
   }
 

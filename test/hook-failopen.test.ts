@@ -36,7 +36,7 @@ describe("hook fail-open", () => {
   test("garbage stdin: exit 0, valid output, for every event", () => {
     const home = mkdtempSync(join(tmpdir(), "om-hook-g-"));
     try {
-      for (const ev of ["session-start", "user-prompt", "post-tool", "post-tool-failure", "stop", "subagent-stop", "session-end", "no-such-event"]) {
+      for (const ev of ["session-start", "user-prompt", "post-tool", "post-tool-failure", "stop", "subagent-stop", "session-end", "file-context", "no-such-event"]) {
         for (const stdin of ["", "{not json", "[1,2]", "null", "\u0000\u0001"]) {
           const r = hook(home, ev, stdin);
           assert.equal(r.status, 0, `${ev} ${JSON.stringify(stdin)}: ${r.stderr}`);
