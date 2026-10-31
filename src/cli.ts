@@ -119,6 +119,15 @@ function usage(): void {
       "            Runs through the memory linter.",
       "  quarantine [list | approve <id> | reject <id>]",
       "            Review writes the memory linter held (ONEMEMORY_LINT).",
+      "  quality [--json] [--namespace ns]",
+      "            What is worth a look: near-duplicates, stale notes with a newer twin, quarantined writes, notes",
+      "            the linter flags, and captured rows about to decay. Each comes with the command that fixes it.",
+      "  decay [--dry-run] [--namespace ns]",
+      "            Archive (never delete) captured observations idle ONEMEMORY_DECAY_DAYS (30) and summaries idle",
+      "            ONEMEMORY_DECAY_SUMMARY_DAYS (180). Never: your own notes, decisions, anything tagged \"pinned\".",
+      "            Also runs on its own in the expiry sweep and at the end of a captured session.",
+      "  archive <id> | restore <id>",
+      "            Soft-archive a note, or bring an archived one back (the undo for decay and archive).",
       "  encrypt <enable|status|disable>",
       "            enable   Create the AES-256-GCM key and encrypt every note",
       "                     body at rest. Keyword search then covers title+tags",
@@ -1692,6 +1701,94 @@ async function quarantineCmd(): Promise<void> {
   }
 }
 
+// `onememory decay [--dry-run] [--namespace ns]`: archive (never delete) idle captured rows now; --dry-run only lists them.
+async function decayCmd(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store, decayConfig } = await import("./store.js");
+  const { flags } = parseFlags(process.argv.slice(3), { values: ["namespace"], bools: ["dry-run"] });
+  const ns = str(flags.namespace);
+  const namespaces = ns ? [ns] : undefined;
+  const store = new Store(DB_PATH);
+  try {
+    const cfg = decayConfig();
+    if (cfg.days === 0) {
+      console.log("Decay is off (ONEMEMORY_DECAY_DAYS=0).");
+      return;
+    }
+    if (flags["dry-run"]) {
+      const rows = store.decayCandidates(Date.now(), namespaces);
+      if (!rows.length) {
+        console.log("Nothing would be archived.");
+        return;
+      }
+      for (const r of rows) console.log(`#${r.id} [${r.namespace}] ${r.obs_type || r.kind}: ${r.title}  (idle ${r.idleDays} days)`);
+      console.log(`${rows.length} row(s) would be archived. Run \`onememory decay\` to archive them; \`onememory restore <id>\` brings one back.`);
+      return;
+    }
+    const n = store.sweepDecay(Date.now(), namespaces);
+    console.log(`Archived ${n} idle captured row(s). Nothing was deleted: \`onememory restore <id>\` brings one back.`);
+  } finally {
+    store.close();
+  }
+}
+
+// `onememory archive <id>` / `onememory restore <id>`: the same soft archive and restore as POST /notes/:id/archive|restore.
+async function archiveCmd(action: "archive" | "restore"): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store, ValidationError } = await import("./store.js");
+  const id = Number(process.argv[3]);
+  if (!Number.isInteger(id)) {
+    console.error(`Usage: onememory ${action} <id>`);
+    process.exit(1);
+  }
+  const store = new Store(DB_PATH);
+  try {
+    const before = store.read(id); // gate-ok: local shell command (archive/restore): the operator owns the database file
+    if (!before || (action === "archive") !== !before.archived_at) {
+      console.error(before ? `Note #${id} is ${action === "archive" ? "already archived" : "not archived"}.` : `No note #${id}.`);
+      process.exit(1);
+    }
+    const note = action === "archive" ? store.archive(id) : store.restore(id);
+    console.log(`${action === "archive" ? "Archived" : "Restored"} #${id} "${note?.title}".${action === "archive" ? ` Undo: onememory restore ${id}` : ""}`);
+  } catch (e) {
+    if (e instanceof ValidationError) {
+      console.error(`Error: ${e.message}`);
+      process.exit(1);
+    }
+    throw e;
+  } finally {
+    store.close();
+  }
+}
+
+// `onememory quality [--json] [--namespace ns]`: what in the store is worth a look, with the command that fixes each.
+async function qualityCmd(): Promise<void> {
+  const { DB_PATH } = await import("./config.js");
+  const { Store } = await import("./store.js");
+  const { qualityReport, QUALITY_TYPES } = await import("./quality.js");
+  const { flags } = parseFlags(process.argv.slice(3), { values: ["namespace"], bools: ["json"] });
+  const ns = str(flags.namespace);
+  const store = new Store(DB_PATH);
+  try {
+    const report = await qualityReport(store, ns ? [ns] : undefined);
+    if (flags.json) {
+      console.log(JSON.stringify(report, null, 2));
+      return;
+    }
+    if (!report.issues.length) {
+      console.log("No quality issues found.");
+      return;
+    }
+    console.log(QUALITY_TYPES.map((t) => `${report.counts[t]} ${t}`).join(", "));
+    for (const i of report.issues) {
+      console.log(`\n[${i.type}] [${i.namespace}] ${i.detail}`);
+      console.log(`    fix: ${i.fix}${i.alt ? `   (or: ${i.alt})` : ""}`);
+    }
+  } finally {
+    store.close();
+  }
+}
+
 /**
  * `onememory encrypt <enable|status|disable>` -- at-rest body encryption.
  *
@@ -2014,6 +2111,16 @@ async function main(): Promise<void> {
       break;
     case "quarantine":
       await quarantineCmd();
+      break;
+    case "decay":
+      await decayCmd();
+      break;
+    case "archive":
+    case "restore":
+      await archiveCmd(cmd);
+      break;
+    case "quality":
+      await qualityCmd();
       break;
     case "encrypt":
       await encryptCmd();

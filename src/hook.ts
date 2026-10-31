@@ -133,6 +133,11 @@ export async function captureHook(event: HookEvent, payload: Record<string, unkn
       if (opts.llmInline) await llmSummarize(store, ev.session_id, env);
       else if (llmConfig(env)) spawnLlmSummary(ev.session_id, dbPath, env);
       store.sweepCaptureEvents();
+      try {
+        store.sweepDecay(); // idle captured rows are archived (never deleted) on the same pass
+      } catch (e) {
+        process.stderr.write(`onememory hook: decay sweep skipped: ${(e as Error).message}\n`); // the event itself is stored
+      }
     }
     return "stored";
   } catch (e) {

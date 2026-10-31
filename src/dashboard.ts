@@ -63,6 +63,7 @@ export const DASHBOARD_HTML = `<!doctype html>
   <button class="ghost" onclick="loadChanges()" title="What changed in the last 24 hours">Changes</button>
   <button class="ghost" onclick="loadSessions()" title="Agent sessions OneMemory recorded, each with its timeline">Sessions</button>
   <button class="ghost" onclick="loadReview()" title="Notes written by agents that you have not looked at yet">Review</button>
+  <button class="ghost" onclick="loadQuality()" title="Duplicates, stale twins, held writes, linter findings and rows about to decay (admin token)">Quality</button>
   <label class="chk" title="Also show notes written by writers an admin distrusts (marked DISTRUSTED)"><input type="checkbox" id="inc" onchange="load()"> distrusted</label>
 </header>
 <main>
@@ -307,6 +308,41 @@ function loadSession(id){
       (items.length ? items.map(function(it){ return "<div class='card'><div class='meta'>"+when(it.at)+"</div>"+it.html+"</div>"; }).join("")
         : "<p class='muted'>Nothing recorded in this session yet.</p>");
   }).catch(function(e){ incRefused(e); document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
+}
+
+// ---- Quality: what is worth a look (GET /quality, admin). Every button goes through a path that asks first and can be
+// undone: replace = supersede preview + confirm (undo: supersede undo), archive (undo: restore), quarantine approve/reject.
+function loadQuality(){
+  VIEW = "quality";
+  api("/quality" + nsQs("?")).then(function(j){
+    var c = j.counts || {};
+    document.getElementById("count").textContent = Object.keys(c).map(function(k){ return c[k] + " " + k; }).join(", ");
+    var rows = (j.issues || []).map(function(i){
+      var a = Number(i.ids[0]), b = Number(i.ids[1]), q = Number(i.quarantine_id), btn = "";
+      if(i.type === "duplicate" || i.type === "stale_twin"){ btn = "<button onclick='qReplace("+a+","+b+")'>Replace #"+a+" with #"+b+"</button>"; }
+      else if(i.type === "quarantined"){ btn = "<button onclick='qQuarantine("+q+",&quot;approve&quot;)'>Approve</button> <button class='danger' onclick='qQuarantine("+q+",&quot;reject&quot;)'>Reject</button>"; }
+      else { btn = "<button class='ghost' onclick='qArchive("+a+")'>Archive</button>"; }
+      return "<div class='card'><div class='cardhead'><div><h3><span class='tag'>"+esc(i.type)+"</span>"+esc(i.detail)+"</h3>"+
+        "<div class='meta'>"+esc(i.namespace)+" &middot; "+esc(i.fix)+(i.alt ? " &middot; or "+esc(i.alt) : "")+"</div></div><div>"+btn+"</div></div></div>";
+    }).join("");
+    document.getElementById("list").innerHTML = rows || "<p class='muted'>No quality issues found.</p>";
+  }).catch(function(e){ document.getElementById("list").innerHTML = "<p class='err'>"+esc(e.message)+"</p>"; });
+}
+function qReplace(oldId, newId){
+  api("/supersede/preview", { method:"POST", body: JSON.stringify({ old_ids: [oldId], new_id: newId }) }).then(function(p){
+    if(!confirm(p.warning)){ return; }
+    var body = { token: p.token };
+    if(p.requires_acknowledgement){ body.acknowledge_risk = true; }
+    return api("/supersede/confirm", { method:"POST", body: JSON.stringify(body) }).then(loadQuality);
+  }).catch(function(e){ alert(e.message); });
+}
+function qArchive(id){
+  if(!confirm("Archive note #" + id + "? It leaves search and recall but is kept; Restore brings it back.")){ return; }
+  api("/notes/" + id + "/archive", { method:"POST" }).then(loadQuality).catch(function(e){ alert(e.message); });
+}
+function qQuarantine(id, action){
+  if(!confirm((action === "approve" ? "Store" : "Discard") + " held write #" + id + "?")){ return; }
+  api("/quarantine/" + id + "/" + action, { method:"POST" }).then(loadQuality).catch(function(e){ alert(e.message); });
 }
 
 function addNote(){

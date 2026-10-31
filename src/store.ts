@@ -1078,6 +1078,8 @@ export interface AccessStats {
   neverAccessed: number;
   /** Notes older than the staleness thresholds (see staleness.ts). */
   staleCount: number;
+  /** Captured rows the next decay sweep would archive, and rows decay has archived so far (see sweepDecay). */
+  decay: { candidates: number; archived: number };
 }
 
 /** One keyword hit with its FTS5 bm25 rank exposed as a positive score. */
@@ -1135,6 +1137,34 @@ export interface RangeOpts {
 /** v16: what a notes row is. Ordinary notes are 'note'; the capture writer adds 'observation' and 'summary' rows. */
 export type NoteKind = "note" | "observation" | "summary";
 export const NOTE_KINDS: readonly NoteKind[] = ["note", "observation", "summary"];
+
+/** Decay never archives a row carrying this tag (any writer may add it; it only keeps a row live). */
+export const PINNED_TAG = "pinned";
+const DECAY_META_PREFIX = "decay_archived:";
+
+/**
+ * Decay of captured rows (see Store.sweepDecay): ONEMEMORY_DECAY_DAYS (default 30; 0 = decay off) for observations,
+ * ONEMEMORY_DECAY_SUMMARY_DAYS (default 180; 0 = summaries never decay). Read per call so tests can flip it.
+ */
+export function decayConfig(env: NodeJS.ProcessEnv = process.env): { days: number; summaryDays: number } {
+  const num = (raw: string | undefined, def: number): number => {
+    if (raw === undefined || raw.trim() === "") return def;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : def;
+  };
+  return { days: num(env.ONEMEMORY_DECAY_DAYS, 30), summaryDays: num(env.ONEMEMORY_DECAY_SUMMARY_DAYS, 180) };
+}
+
+/** One row the next decay sweep would archive. */
+export interface DecayCandidate {
+  id: number;
+  namespace: string;
+  kind: NoteKind;
+  obs_type?: string;
+  title: string;
+  /** Whole days since the row was last updated or read. */
+  idleDays: number;
+}
 
 /**
  * SQL fragment filtering by archive state.
@@ -2950,6 +2980,7 @@ export class Store {
       })),
       neverAccessed: Number(totals.never),
       staleCount: this.staleCount(namespaces, opts),
+      decay: this.decayStats(namespaces && namespaces.length > 0 ? namespaces : undefined),
     };
   }
 
@@ -3297,6 +3328,7 @@ export class Store {
       this.announceChange();
     }
     this.sweepCaptureEvents(now, namespaces);
+    this.sweepDecay(now, namespaces);
     return n;
   }
 
@@ -3313,6 +3345,86 @@ export class Store {
     // The once-per-session file announcements (file-context.ts) of sessions that started before the cutoff go too.
     this.db.prepare(`DELETE FROM file_context_seen WHERE session_id IN (SELECT id FROM sessions WHERE started_at < ?${namespaces ? ` AND namespace IN (${namespaces.map(() => "?").join(",")})` : ""})`).run(cutoff, ...(namespaces ?? []));
     return Number(this.db.prepare(`DELETE FROM capture_events WHERE at < ?${nsSql}`).run(cutoff, ...(namespaces ?? [])).changes ?? 0);
+  }
+
+  /**
+   * Decay: the WHERE clause for captured rows nobody wrote, read or touched for a while (see decayConfig). Observations
+   * (never a decision) idle `days`, summaries idle `summaryDays`; anything tagged PINNED_TAG, every ordinary note (kind
+   * 'note') and every replaced note are left alone. "Idle" = neither updated nor read (last_accessed) since the cutoff.
+   */
+  private decayWhere(now: number, namespaces?: string[]): { sql: string; params: string[] } | null {
+    const cfg = decayConfig();
+    if (cfg.days === 0 || (namespaces && namespaces.length === 0)) return null;
+    const cut = (d: number): string => new Date(now - d * 86_400_000).toISOString();
+    const idle = "MAX(updated_at, COALESCE(last_accessed, '')) < ?";
+    const kinds = [`(kind = 'observation' AND COALESCE(obs_type, '') <> 'decision' AND ${idle})`];
+    const params = [cut(cfg.days)];
+    if (cfg.summaryDays > 0) {
+      kinds.push(`(kind = 'summary' AND ${idle})`);
+      params.push(cut(cfg.summaryDays));
+    }
+    const nsSql = namespaces ? ` AND namespace IN (${namespaces.map(() => "?").join(",")})` : "";
+    return {
+      sql: `archived_at IS NULL AND superseded_by IS NULL AND instr(tags, ?) = 0 AND (${kinds.join(" OR ")})${nsSql}`,
+      params: [JSON.stringify(PINNED_TAG), ...params, ...(namespaces ?? [])],
+    };
+  }
+
+  /** Decay dry run: the captured rows the next sweep would archive (nothing is changed). */
+  decayCandidates(now: number = Date.now(), namespaces?: string[], limit = 500): DecayCandidate[] {
+    this.flushAccess(); // a read still in the buffer counts
+    const w = this.decayWhere(now, namespaces);
+    if (!w) return [];
+    const rows = this.db
+      .prepare(`SELECT id, namespace, kind, obs_type, title, MAX(updated_at, COALESCE(last_accessed, '')) AS at FROM notes WHERE ${w.sql} ORDER BY at, id LIMIT ?`)
+      .all(...w.params, limit) as Array<{ id: number; namespace: string; kind: NoteKind; obs_type: string | null; title: string; at: string }>;
+    return rows.map((r) => ({
+      id: Number(r.id),
+      namespace: r.namespace,
+      kind: r.kind,
+      ...(r.obs_type ? { obs_type: r.obs_type } : {}),
+      title: r.title,
+      idleDays: Math.max(0, Math.floor((now - Date.parse(r.at)) / 86_400_000)),
+    }));
+  }
+
+  /**
+   * Decay: soft-archive (never delete) every row decayCandidates lists. Runs inside the existing sweeps (sweepExpired and
+   * the session-end hook); undo is restore(). Counts per namespace are kept in _meta for the stats.
+   */
+  sweepDecay(now: number = Date.now(), namespaces?: string[]): number {
+    this.flushAccess();
+    const w = this.decayWhere(now, namespaces);
+    if (!w) return 0;
+    const iso = new Date(now).toISOString();
+    const done = this.transaction(() => {
+      const rows = this.db.prepare(`UPDATE notes SET archived_at = ? WHERE ${w.sql} RETURNING namespace`).all(iso, ...w.params) as Array<{ namespace: string }>;
+      const per = new Map<string, number>();
+      for (const r of rows) per.set(r.namespace, (per.get(r.namespace) ?? 0) + 1);
+      const bump = this.db.prepare(
+        "INSERT INTO _meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + CAST(excluded.value AS INTEGER)"
+      );
+      for (const [ns, n] of per) bump.run(DECAY_META_PREFIX + ns, String(n));
+      return rows.length;
+    });
+    if (done > 0) {
+      this.edgeIndexes.clear();
+      this.announceChange();
+    }
+    return done;
+  }
+
+  /** Decay numbers for the stats: rows the next sweep would archive, and rows decay has archived so far. */
+  decayStats(namespaces?: string[]): { candidates: number; archived: number } {
+    const w = this.decayWhere(Date.now(), namespaces);
+    const candidates = w ? Number((this.db.prepare(`SELECT COUNT(*) AS n FROM notes WHERE ${w.sql}`).get(...w.params) as { n: number }).n) : 0;
+    const keys = namespaces ? namespaces.map((ns) => DECAY_META_PREFIX + ns) : null;
+    const row = (
+      keys
+        ? this.db.prepare(`SELECT COALESCE(SUM(CAST(value AS INTEGER)), 0) AS n FROM _meta WHERE key IN (${keys.map(() => "?").join(",") || "''"})`).get(...keys)
+        : this.db.prepare("SELECT COALESCE(SUM(CAST(value AS INTEGER)), 0) AS n FROM _meta WHERE key LIKE ?").get(DECAY_META_PREFIX + "%")
+    ) as { n: number };
+    return { candidates, archived: Number(row.n) };
   }
 
   /**
@@ -3758,9 +3870,14 @@ export class Store {
     if (cur && cur.superseded_by !== null) {
       throw new ValidationError(`note ${id} was replaced by note ${cur.superseded_by}; use "supersede undo" to bring it back (a plain restore would hide that it was replaced)`);
     }
+    // A restored captured row counts as just read, or the next decay sweep would archive it again at once.
     this.db
-      .prepare("UPDATE notes SET archived_at = NULL, expires_at = ? WHERE id = ? AND archived_at IS NOT NULL")
-      .run(opts.forget_after === undefined ? null : retentionDeadline(opts.forget_after), id);
+      .prepare(
+        `UPDATE notes SET archived_at = NULL, expires_at = ?,
+                last_accessed = CASE WHEN kind IN ('observation', 'summary') THEN ? ELSE last_accessed END
+          WHERE id = ? AND archived_at IS NOT NULL`
+      )
+      .run(opts.forget_after === undefined ? null : retentionDeadline(opts.forget_after), new Date().toISOString(), id);
     this.edgeIndexes.clear(); // restored note rejoins the similarity index lazily
     this.announceChange();
     return this.read(id);

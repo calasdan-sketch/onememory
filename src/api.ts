@@ -96,6 +96,7 @@ import {
   ClaimConflictError,
 } from "./tasks.js";
 import { ackChanges } from "./changes.js";
+import { qualityReport } from "./quality.js";
 import { SupersedeError, supersedePreview, supersedeConfirm, supersedeUndo, noteHistory, restoreVersion, purgeNoteHistory, type Caller } from "./supersede.js";
 import { assertPlainWriteTags, assertReviewedTag } from "./reserved-tags.js";
 import { waitForChanges, parseWait, WaitBusyError } from "./change-wait.js";
@@ -130,6 +131,8 @@ function requiredScope(method: string | undefined, path: string): Scope {
   // Restoring is equally admin: it re-exposes a note an operator retired.
   if (method === "POST" && /^\/notes\/\d+\/(archive|restore)$/.test(path)) return "admin";
   if (method === "POST" && path === "/sweep-expired") return "admin";
+  // The quality view lists titles from every writer, and approving a held write is the linter's human gate.
+  if (path === "/quality" || /^\/quarantine\/\d+\/(approve|reject)$/.test(path)) return "admin";
   // A note's earlier versions can hold text that was taken out on purpose: administrators only, reads included.
   if (/^\/notes\/\d+\/history(\/restore)?$/.test(path)) return "admin";
   if (method === "POST" || method === "PUT") return "write";
@@ -786,6 +789,39 @@ export function createApiServer(
         // A namespace-pinned principal may only retire its OWN namespace's notes.
         const archived = store.sweepExpired(Date.now(), nsCtx.active ? [nsCtx.ownNamespace] : undefined);
         sendJson(res, 200, { archived });
+        return;
+      }
+
+      // GET /quality -> the memory quality report (quality.ts). Admin; a namespace-pinned admin sees its own namespace only.
+      if (req.method === "GET" && path === "/quality") {
+        const namespace = url.searchParams.get("namespace") || undefined;
+        const namespaces = nsCtx.active ? [nsCtx.ownNamespace] : namespace ? [namespace] : undefined;
+        sendJson(res, 200, await qualityReport(store, namespaces));
+        return;
+      }
+
+      // POST /quarantine/:id/approve | reject -> the memory_quarantine tool's approve / reject, for the dashboard.
+      const qMatch = /^\/quarantine\/(\d+)\/(approve|reject)$/.exec(path);
+      if (req.method === "POST" && qMatch) {
+        const id = Number(qMatch[1]);
+        const entry = store.getQuarantine(id);
+        // Uniform "not found" for another namespace's entry: no existence oracle.
+        if (!entry || (nsCtx.active && entry.namespace !== nsCtx.ownNamespace)) {
+          sendJson(res, 404, { error: `no quarantined write with id ${id}` });
+          return;
+        }
+        try {
+          if (qMatch[2] === "reject") {
+            store.rejectQuarantine(id);
+            sendJson(res, 200, { rejected: id });
+          } else {
+            const note = store.approveQuarantine(id);
+            await maybeEmbed(store, note);
+            sendJson(res, 200, { approved: id, note });
+          }
+        } catch (e) {
+          sendError(res, e);
+        }
         return;
       }
 

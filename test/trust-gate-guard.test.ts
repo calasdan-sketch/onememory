@@ -41,7 +41,9 @@ const EXPECTED_SITES: Record<string, string[]> = {
     "local shell command (show): the operator owns the database file",
     "local shell command (lint scan): the operator owns the database file",
     "local shell command (export): the operator owns the database file",
+    "local shell command (archive/restore): the operator owns the database file",
   ],
+  "quality.ts": ["admin-only report"],
   "consolidate.ts": [
     "admin consolidation by ids: mixed trusted/distrusted sources are refused below",
     "candidate scan is filtered with store.filterVisible before use",
@@ -142,7 +144,7 @@ describe("B: one gate for reading a note", () => {
     if (/req\.method === "GET" && getId/.test(api)) routes.add("/tasks/:id");
     if (/req\.method === "GET" && SIGN_PAGES\[path\]/.test(api)) routes.add("(sign pages)");
     if (/req\.method === "GET" && sessMatch/.test(api)) routes.add("/sessions/:id");
-    const NOTE_ROUTES = ["/notes", "/notes/:id", "/search", "/stats", "/changes", "/tasks", "/tasks/:id", "/handoffs", "/catch-up", "/export", "/index", "/timeline", "/sessions", "/sessions/:id", "/files/timeline"];
+    const NOTE_ROUTES = ["/notes", "/notes/:id", "/search", "/stats", "/changes", "/tasks", "/tasks/:id", "/handoffs", "/catch-up", "/export", "/index", "/timeline", "/sessions", "/sessions/:id", "/files/timeline", "/quality"];
     const NO_NOTE_CONTENT = ["/health", "/ready", "/", "/dashboard.js", "(sign pages)", "/runner/status", "/trust"];
     assert.deepEqual([...routes].sort(), [...NOTE_ROUTES, ...NO_NOTE_CONTENT].sort(), "a GET route was added: add it to NOTE_ROUTES (and to the canary test below) or NO_NOTE_CONTENT");
 
@@ -202,6 +204,7 @@ describe("B: the canary never reaches a non-admin reader through any classified 
         [`/timeline?anchor=${evilNote}`, 200, ""],
         ["/sessions?namespace=work", 200, "sessions"],
         ["/files/timeline?path=src/x.ts", 200, "rows"],
+        ["/quality", 403, ""], // admin only: it lists every writer's titles
       ];
       for (const [p, status, must] of routes) {
         const r = await fetch(base + p, { headers: { Authorization: `Bearer ${TOKEN}` } });
