@@ -176,6 +176,13 @@ onememory setup --capture        # or answer y to "Also record what Claude does 
 - **Moves with your data:** export / import and the Markdown vault sync carry an observation's kind, session, type
   and files; `onememory encrypt enable` seals captured event outputs too. Captured rows are left out of the stale
   count, `memory_stats` totals and consolidation.
+- **Old captured rows fade out:** an observation nobody updated or read for 30 days (`ONEMEMORY_DECAY_DAYS`; summaries
+  180, `ONEMEMORY_DECAY_SUMMARY_DAYS`) is archived, never deleted, by the expiry sweep or at session end. Your own notes,
+  decisions and anything tagged `pinned` never decay. `onememory decay --dry-run` shows what would go; `onememory
+  restore <id>` brings one back; `memory_stats` reports the counts.
+- **Memory quality:** `onememory quality [--json]` (and the dashboard's **Quality** tab, admin token, `GET /quality`)
+  lists near-duplicates, stale notes with a newer twin, quarantined writes, notes the linter flags and rows about to
+  decay, each with the command or button that fixes it. Every fix previews or asks first and can be undone.
 
 **Semantic search when available:** `ONEMEMORY_EMBEDDINGS=auto` uses your local embedding endpoint when it answers
 and quietly stays on keyword search when it does not (it retries once a minute).
@@ -324,6 +331,7 @@ onememory export --format json [--attest] --out a.json     onememory import --fi
 onememory supersede --old 12 --title "..." --body "..."   # replace a note: shows what you would lose, asks you to type the count
 onememory supersede undo <id>     onememory history <id> | restore <id> <version> | purge <id>
 onememory quarantine [list | approve <id> | reject <id>]
+onememory quality [--json]     onememory decay [--dry-run]     onememory archive <id> | restore <id>
 onememory consolidate | rebuild-edges | reindex | relevant "…" | recall
 onememory bench [--json] [--suite stale|contradiction|isolation|provenance] [--strict-gaps]   # provenance benchmark (docs/BENCHMARK.md)
 ```

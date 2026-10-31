@@ -6,6 +6,17 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Decay for captured rows.** Observations nobody updated or read for `ONEMEMORY_DECAY_DAYS` (30) and session summaries idle
+  `ONEMEMORY_DECAY_SUMMARY_DAYS` (180) are archived, never deleted, by the existing expiry sweep and at session end. Ordinary notes,
+  decisions and rows tagged `pinned` never decay; `0` turns it off. `onememory decay [--dry-run]` previews or runs it now; `onememory
+  restore <id>` (new, with `onememory archive <id>`) undoes it. `memory_stats` / `GET /stats` gain `decay: { candidates, archived }`.
+  A restored captured row counts as just read, so the next sweep does not take it again.
+- **Memory quality view.** `onememory quality [--json]`, `GET /quality` (admin) and a dashboard **Quality** tab list near-duplicates,
+  stale notes with a newer twin, quarantined writes, notes the linter flags and decay candidates, each with a fix through an existing
+  safe path (supersede preview + confirm with undo, consolidate dry run, archive / restore, quarantine approve / reject). New admin
+  routes `POST /quarantine/:id/approve|reject` back the dashboard buttons.
+
 ### Changed
 - **Captured prompts and tool inputs are now encrypted at rest** when encryption is on, the same way tool outputs already were. Turning
   encryption on or off seals or opens them too. Databases made by earlier test builds of this version get the new column when opened.

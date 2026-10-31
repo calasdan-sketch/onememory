@@ -83,6 +83,8 @@ All environment variables are optional. This table lists **every** `ONEMEMORY_*`
 | `ONEMEMORY_CAPTURE_EXCLUDE` | unset | Comma-separated globs (`*`, `**`) on the working directory; sessions in a matching folder are not recorded (e.g. `**/secret-*,C:/clients/**`) |
 | `ONEMEMORY_CAPTURE_SKIP_TOOLS` | unset | Comma-separated tool names the capture hooks ignore (e.g. `TodoWrite,WebFetch`). OneMemory's own `mcp__onememory__*` tools are always skipped |
 | `ONEMEMORY_CAPTURE_RETENTION_DAYS` | `7` | Raw captured events are deleted after this many days (the observations distilled from them are kept like notes) |
+| `ONEMEMORY_DECAY_DAYS` | `30` | Captured observations nobody updated or read for this many days are **archived** (never deleted; `onememory restore <id>` brings one back) by the expiry sweep and at session end. Never decayed: your own notes, decisions, rows tagged `pinned`. `0` = decay off. Preview with `onememory decay --dry-run` |
+| `ONEMEMORY_DECAY_SUMMARY_DAYS` | `180` | The same for session summaries. `0` = summaries never decay |
 | `ONEMEMORY_LLM_URL` | unset (off) | Optional local model for session summaries: base URL of an OpenAI-compatible server (Ollama `http://127.0.0.1:11434`, LM Studio, llama.cpp). One call per session at session-end; on any failure the automatic summary stays. Needs `ONEMEMORY_LLM_MODEL`. Only loopback hosts are accepted |
 | `ONEMEMORY_LLM_MODEL` | unset | The model name sent to `ONEMEMORY_LLM_URL` (e.g. `qwen2.5:7b`) |
 | `ONEMEMORY_LLM_TIMEOUT_MS` | `30000` | Upper bound on the one summary call (1000 - 300000) |
