@@ -86,7 +86,10 @@ jobs:
           fi
           v=$(node -p "require('./package.json').version")
           [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != package.json $v"; exit 1; }
-      - run: npm publish --provenance --access public
+      # Staged: npm keeps the release as a draft until the owner clicks Approve on npmjs.com
+      # (trusted publishing always allows staging; direct publish was refused with E403 "OIDC
+      # permission denied" on 2026-10-31 even with "Allow npm publish" ticked).
+      - run: npm stage publish . --provenance --access public
       # npm masks trusted-publishing failures as a generic E404/ENEEDAUTH
       # (npm/cli#9088), so on failure read its own debug log for what the
       # OIDC exchange actually did. Long token-shaped strings are stripped.
