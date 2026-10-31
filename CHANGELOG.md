@@ -6,6 +6,15 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`onememory import --from claude-mem|mem0|basic-memory [--path p] [--dry-run] [--yes] [--namespace ns]`**: bring another memory
+  tool's notes in, with the same rules as `import --claude` (local only, dry run, secrets skipped and never shown, memory linter and
+  quarantine, re-runs add only what is new via a stable id in `source`). claude-mem's SQLite database is opened read only;
+  observations become `observation` rows with their type, files, project and original dates, and session summaries become `summary`
+  rows. mem0 reads a JSON export (categories become tags). basic-memory reads a Markdown folder, with the permalink as the id.
+  Imported rows are written by `import:<tool>` and tagged `imported:<tool>` (claude-mem's rows are model-written; there is no
+  separate label for that yet). How to switch over and cleanly uninstall the old tool: [docs/switching.md](./docs/switching.md).
+
 ## [1.7.2] - 2026-10-25
 
 Windows fixes only. **No schema change** (still v15).

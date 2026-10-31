@@ -34,7 +34,9 @@ are. **Coming from claude-bridge** (the old name)? It offers to move that entry 
 troubleshooting: [docs/live-claude-code.md](./docs/live-claude-code.md).
 
 Already have notes in Claude Code? `onememory import --claude --dry-run` shows what could be brought in from your `CLAUDE.md` files and
-Claude Code's auto memory (secrets are skipped, nothing leaves your computer).
+Claude Code's auto memory (secrets are skipped, nothing leaves your computer). Coming from claude-mem, mem0 or basic-memory?
+`onememory import --from claude-mem --dry-run` (or `mem0 --path export.json`, `basic-memory`); see [docs/switching.md](./docs/switching.md)
+for the import and a clean uninstall of the old tool.
 
 The manual way, if you prefer:
 
@@ -312,6 +314,7 @@ REST mirrors them (`/notes`, `/search`, `/relevant`, `/changes`, `/tasks`, `/han
 onememory start | mcp | doctor | init
 onememory setup [--dry-run] [--yes] [--only claude-code,claude-desktop,cursor] [--hook] [--undo]   # connect your apps; safe, backed up, undoable
 onememory import --claude [--dry-run] [--update] [--project <folder>]   # bring in CLAUDE.md files and Claude Code auto memory
+onememory import --from claude-mem|mem0|basic-memory [--path p] [--dry-run]   # switch from another memory tool (docs/switching.md)
 onememory sync --git ~/my-private-memory-repo [--encrypt]   # keep your computers in step through YOUR private git repository
 onememory changes --since last --consumer laptop
 onememory runner-status                           # is each PC's runner listening? commands waiting?

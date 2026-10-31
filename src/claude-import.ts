@@ -314,7 +314,7 @@ export function readHeld(dbPath: string): Set<string> {
   }
 }
 
-function writeHeld(dbPath: string, held: Set<string>): void {
+export function writeHeld(dbPath: string, held: Set<string>): void {
   try {
     writeFileSync(heldPath(dbPath), JSON.stringify([...held].slice(-5000)), { mode: 0o600 });
   } catch {
