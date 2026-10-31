@@ -113,6 +113,11 @@ function usage(): void {
       "            Import what Claude Code already remembers: CLAUDE.md files (user, this folder or --project) and auto memory",
       "            (~/.claude/projects/*/memory). Cut into separate notes at headings, tagged with their source file and project; running",
       "            it again adds only what is new. Anything that looks like a secret is skipped and never shown. Local only.",
+      "  import --from claude-mem|mem0|basic-memory [--path p] [--dry-run] [--yes] [--namespace ns]",
+      "            Import another memory tool's notes: claude-mem's database (~/.claude-mem/claude-mem.db, opened read only;",
+      "            observations and session summaries keep their type, files, project and dates), a mem0 JSON export (--path),",
+      "            or a basic-memory folder (~/basic-memory). Same rules as --claude: secrets skipped, re-runs add only what is new.",
+      "            How to switch over and uninstall the old tool: docs/switching.md.",
       "  import --dir <path> [--dry-run] [--allow-move]",
       "            Merge Markdown files back: newer side wins, conflicts are",
       "            reported and the losing version is saved under <dir>/.conflicts/.",
@@ -1223,9 +1228,28 @@ async function importCmd(): Promise<void> {
   const { Store, ValidationError } = await import("./store.js");
   const { importMarkdown } = await import("./sync.js");
   const { flags } = parseFlags(process.argv.slice(3), {
-    values: ["dir", "file", "project", "namespace"],
+    values: ["dir", "file", "project", "namespace", "from", "path"],
     bools: ["dry-run", "json", "allow-move", "dedupe", "require-attestation", "claude", "yes", "update", "include-index"],
   });
+  if (str(flags.from)) {
+    const { runForeignImport, FOREIGN_SOURCES } = await import("./foreign-import.js");
+    const from = str(flags.from) as (typeof FOREIGN_SOURCES)[number];
+    if (!FOREIGN_SOURCES.includes(from)) {
+      console.error(`Usage: onememory import --from ${FOREIGN_SOURCES.join("|")} [--path p] [--dry-run] [--yes] [--namespace ns]`);
+      process.exit(1);
+    }
+    const { realEnv } = await import("./setup.js");
+    const { PACKAGE_VERSION } = await import("./config.js");
+    process.exitCode = await runForeignImport(realEnv(PACKAGE_VERSION, fileURLToPath(import.meta.url)), terminalIO(), {
+      from,
+      path: str(flags.path),
+      dryRun: flags["dry-run"] === true,
+      yes: flags.yes === true,
+      namespace: str(flags.namespace),
+      dbPath: DB_PATH,
+    });
+    return;
+  }
   if (flags.claude === true) {
     const { runClaudeImport } = await import("./claude-import.js");
     const { realEnv } = await import("./setup.js");
@@ -2039,8 +2063,8 @@ async function main(): Promise<void> {
   }
   // Move 1.0.x state out of the package before anything opens the DB.
   // (`bench` runs on a throwaway store and must never touch the real data directory.)
-  // A dry run of `import --claude` or `sync` must not create anything, not even the data folder.
-  const dry = process.argv.includes("--dry-run") && ((cmd === "import" && process.argv.includes("--claude")) || cmd === "sync");
+  // A dry run of `import --claude` / `import --from` or `sync` must not create anything, not even the data folder.
+  const dry = process.argv.includes("--dry-run") && ((cmd === "import" && (process.argv.includes("--claude") || process.argv.includes("--from"))) || cmd === "sync");
   // The capture hooks (`hook`) never move or create data folders: they run on every tool call and must stay quick and quiet.
   if (!dry && !["help", "--help", "-h", "init", "bench", "setup", "hook"].includes(cmd)) (await import("./config.js")).prepareDataDir();
   // Fixed writer marker for notes this process writes with no token behind
