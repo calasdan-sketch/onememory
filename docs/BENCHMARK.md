@@ -44,7 +44,8 @@ Four suites, written as plain JSON files in [`bench/scenarios/`](https://github.
 ## What it does not measure
 
 - **Not retrieval quality.** Search here is keyword search with made-up unique words. There are no embeddings,
-  no paraphrases, no relevance judgements. For that, see the retrieval evaluation set in `evals/`.
+  no paraphrases, no relevance judgements. For that, see [Retrieval: LongMemEval-S and LoCoMo](#retrieval-longmemeval-s-and-locomo)
+  below and the retrieval evaluation set in `evals/`.
 - **Not speed, scale or concurrency.** Each scenario is a handful of calls on an empty store.
 - **Not proof of safety.** "0 leaks" means none of the probes written here leaked. It is a regression gate, not
   an audit.
@@ -202,3 +203,110 @@ system that keeps stale versions or leaks across tenants.
 
 Exit codes: `0` all good (known gaps are listed but allowed), `1` a scenario failed, a known gap now passes, or
 `--strict-gaps` found a gap, `2` bad command line.
+
+## Retrieval: LongMemEval-S and LoCoMo
+
+A second, separate benchmark measures **retrieval only** on two public long-conversation datasets. No LLM
+reads anything and no judge grades anything: each conversation is written into a fresh throwaway store, the
+question is searched, and the returned sessions (or turns) are compared with the dataset's own gold evidence.
+
+```
+onememory bench --longmemeval [--data file] [--limit N] [--mode keyword|hybrid] [--granularity session|turn] [--json]
+onememory bench --locomo      [--data file] [--limit N] [--mode keyword|hybrid] [--granularity turn|session] [--json]
+```
+
+- **Data.** LongMemEval-S, cleaned release ([`xiaowu0162/longmemeval-cleaned`](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned),
+  `longmemeval_s_cleaned.json`, 264 MB) and LoCoMo ([`snap-research/locomo`](https://github.com/snap-research/locomo),
+  `data/locomo10.json`). Without `--data` each file is downloaded once to `~/.cache/onememory-bench/`
+  (outside the repository) and reused. The file is treated as untrusted data and only `JSON.parse`d.
+- **Isolation.** The command points `ONEMEMORY_HOME` at a new temporary folder before the configuration
+  loads, drops every other `ONEMEMORY_*` setting except the embedding ones, and refuses to run unless the
+  resolved database path is inside that folder. Every haystack gets its own store, deleted afterwards.
+- **Indexing.** LongMemEval: one store per question; one note per haystack session (title = session id, body =
+  the turns as `role: content` lines), or with `--granularity turn` one note per turn, mapped back to its
+  session for scoring. Notes are backdated to `haystack_dates` and written in one transaction, without
+  similarity edges and without the write linter. LoCoMo: one store per conversation (all its questions);
+  one note per dialog turn (`speaker: text`, plus the image caption when there is one), gold = the
+  `evidence` dialog ids; `--granularity session` writes one note per session and scores sessions.
+- **Questions.** LongMemEval's 30 abstention questions (`_abs`) have no gold session and are left out: 470 of
+  500 are scored. LoCoMo questions with no usable evidence id are left out: 1,982 of 1,986.
+- **Two keyword searches are scored.** `keyword` is `store.searchRanked(question, {limit: 50})`, the FTS5/BM25
+  call behind `state_search` and `GET /search`: **every word of the query must match** (prefix AND).
+  `relevant` is `runRelevantSearch` (the `state_relevant` tool and `POST /relevant`): stop words dropped, a
+  note matching any keyword qualifies, per-keyword BM25 rankings fused with RRF. `--mode hybrid` also scores
+  `runSearch(mode: "hybrid")` (BM25 + embeddings, RRF) when an embedding server answers; otherwise it is
+  reported as skipped.
+- **Metrics.** `R@5`, `R@10`: any gold session (or turn) in the top k. `Rall@10`: every gold one in the top 10.
+  `nDCG@10` with binary relevance. `MRR` over the top 50. Search latency p50/p95 per query; indexing time per
+  haystack (single process, SQLite in a temp folder).
+
+### Results, 2026-10-31
+
+Machine: Windows 11 Home, RTX 5080 PC (the GPU is not used: no embeddings in these runs), Node v24.18.0,
+OneMemory 1.7.2 on the `feat/v2-surpass` branch. Commands exactly as above with no options except
+`--granularity` and `--json`. Wall time: LongMemEval session 30 s, turn 3 min, LoCoMo under 10 s each.
+
+**LongMemEval-S (cleaned), 470 questions, session granularity** (22,419 notes; indexing 18.4 s total, p50 38 ms per haystack)
+
+| Search | R@5 | R@10 | Rall@10 | nDCG@10 | MRR | search p50 / p95 |
+|---|---|---|---|---|---|---|
+| keyword (`searchRanked`, AND) | 11.9 | 11.9 | 6.6 | 9.8 | 11.8 | 0.85 / 1.87 ms |
+| relevant (`state_relevant`, OR + RRF) | **95.3** | **97.4** | 88.5 | 87.1 | 88.0 | 1.32 / 2.87 ms |
+
+Per question type, `relevant`:
+
+| Type | n | R@5 | R@10 | Rall@10 | nDCG@10 |
+|---|---|---|---|---|---|
+| knowledge-update | 72 | 100.0 | 100.0 | 98.6 | 96.6 |
+| multi-session | 121 | 97.5 | 98.3 | 77.7 | 85.6 |
+| single-session-assistant | 56 | 100.0 | 100.0 | 100.0 | 96.3 |
+| single-session-preference | 30 | 70.0 | 83.3 | 83.3 | 51.4 |
+| single-session-user | 64 | 98.4 | 100.0 | 100.0 | 95.2 |
+| temporal-reasoning | 127 | 92.9 | 96.1 | 83.5 | 83.4 |
+
+**LongMemEval-S (cleaned), 470 questions, turn granularity** (231,606 notes; indexing 162 s total, p50 299 ms per haystack)
+
+| Search | R@5 | R@10 | Rall@10 | nDCG@10 | MRR | search p50 / p95 |
+|---|---|---|---|---|---|---|
+| keyword (AND) | 0.9 | 0.9 | 0.0 | 0.5 | 0.9 | 1.06 / 2.17 ms |
+| relevant (OR + RRF) | 95.3 | 97.7 | 87.9 | 87.5 | 88.6 | 1.73 / 3.98 ms |
+
+**LoCoMo-10, 1,982 questions** (categories as numbered in the file; usually read as 1 multi-hop, 2 temporal,
+3 open-domain, 4 single-hop, 5 adversarial)
+
+| Granularity / search | R@5 | R@10 | Rall@10 | nDCG@10 | MRR |
+|---|---|---|---|---|---|
+| turn (dialog id), keyword (AND) | 0.1 | 0.1 | 0.1 | 0.1 | 0.1 |
+| turn (dialog id), relevant | 46.1 | 52.5 | 46.0 | 38.6 | 37.7 |
+| session, keyword (AND) | 13.7 | 13.7 | 11.6 | 12.5 | 13.3 |
+| session, relevant | 89.1 | 95.0 | 86.5 | 77.2 | 74.9 |
+
+LoCoMo turn level, `relevant`, R@10 by category: 1: 32.6, 2: 61.7, 3: 29.3, 4: 55.9, 5: 56.7 (5,882 notes,
+search p50 1.53 ms). Session level R@10 by category: 1: 92.2, 2: 92.5, 3: 80.4, 4: 97.1, 5: 97.3.
+
+**Hybrid: not measured.** No embedding model was loaded on this machine on the run date, so `--mode hybrid`
+reports itself as skipped. All numbers above are keyword-only.
+
+### How to read these numbers
+
+- **The AND search is the weak spot, and it is a real product finding.** `state_search` / `GET /search` given a
+  whole natural-language question finds the right session only 12 % of the time on LongMemEval-S, and almost
+  never at turn level, because every word ("what", "did", "I", ...) has to appear in one note. An agent that
+  passes a full question to `state_search` instead of `state_relevant` gets this behaviour.
+- **LongMemEval-S is easy for retrieval.** Each haystack has about 50 sessions, most of them filler from
+  unrelated chat datasets, so the evidence session is often the only one on its topic. High recall here does
+  not mean high recall on a real single-topic memory. LoCoMo at turn level, where every turn is from the same
+  two people, is the harder test (52.5 % R@10).
+- **Published retrieval reference.** The LongMemEval paper (Wu et al., 2024, [arXiv:2410.10813](https://arxiv.org/abs/2410.10813),
+  Appendix E.2, Table 9) reports flat BM25 with key = value at **session R@5 0.634 / R@10 0.710 (nDCG@10 0.540)**
+  and **round (turn) R@5 0.472 / R@10 0.538**; Stella V5 1.5B (dense) reaches session R@5 0.720 / R@10 0.794.
+  Its retrieval experiments use the larger **LongMemEval-M** setting (about 500 sessions per haystack) and index
+  only the user side of each session, so they are **not directly comparable** with the -S numbers above.
+  Running OneMemory on -M is the comparable experiment and has not been done yet.
+- **End-to-end QA accuracy is a different metric.** Memory vendors usually publish LongMemEval or LoCoMo
+  "accuracy" (an LLM answers from retrieved context and another LLM grades it). Those numbers depend on the
+  answering model, the prompt and the judge, and **cannot be compared** with the retrieval recall here, in
+  either direction.
+- One run per configuration. Search is deterministic; latencies vary by a few tenths of a millisecond between
+  runs. A few LoCoMo evidence entries hold several ids in one string (`"D8:6; D9:17"`) and are split; entries
+  that are not of the form `D<n>:<n>` are dropped.
