@@ -133,7 +133,7 @@ export async function injectContext(store: Store, opts: InjectOptions = {}): Pro
   const shown: NoteRecord[] = [];
   let used = 0;
   if (latestSummary) {
-    const text = `Latest session summary (#${latestSummary.id}, ${latestSummary.updated_at.slice(0, 10)}):\n${latestSummary.body.slice(0, Math.floor(budget / 3))}`;
+    const text = `Latest session summary (#${latestSummary.id}, ${latestSummary.updated_at.slice(0, 10)}): ${latestSummary.title}\n${latestSummary.body.slice(0, Math.floor(budget / 3))}`;
     parts.push(text);
     used += text.length;
     shown.push(latestSummary);
@@ -155,7 +155,7 @@ export async function injectContext(store: Store, opts: InjectOptions = {}): Pro
   const lines: string[] = [];
   const header = "Memory index (most relevant first; open with memory_get):";
   for (const n of ranked) {
-    if (shown.includes(n)) continue;
+    if (shown.some((s) => s.id === n.id)) continue;
     const line = indexLine(n);
     if (used + header.length + line.length + 1 > budget) break;
     lines.push(line);

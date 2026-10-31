@@ -46,6 +46,17 @@ describe("session-start context", () => {
     s.close();
   });
 
+  test("the latest summary is not listed again in the index or counted twice in the footer", async () => {
+    const s = new Store(":memory:");
+    s.create({ title: "Fixed failing npm test", body: "tests pass now" }, { kind: "observation", sessionId: "s", obsType: "bugfix" });
+    const sum = s.create({ title: "Session: fix tax rounding", body: "Request: fix tax rounding" }, { kind: "summary", sessionId: "s" });
+    const text = await injectContext(s, { signals: noGit });
+    assert.doesNotMatch(text, new RegExp(`\\n#${sum.id} \\[summary\\]`));
+    assert.match(text, /Showing 2 of 2 memories/);
+    assert.match(text, new RegExp(`memory_get ids=\\[${sum.id},\\d+\\]`));
+    s.close();
+  });
+
   test("distrusted writers are left out; the hook output keeps the UNTRUSTED banner", async () => {
     const dir = mkdtempSync(join(tmpdir(), "om-ctx-"));
     try {
