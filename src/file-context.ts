@@ -44,6 +44,7 @@ async function fileContext(payload: Record<string, unknown>, opts: HookOptions):
   if (res.kind === "unresolvable") return "";
   const namespace = res.kind === "resolved" ? res.namespace : undefined;
   const { Store, NOTE_KINDS } = await import("./store.js");
+  const { NEVER_SHOW_TAG } = await import("./reserved-tags.js");
   const { normPath } = await import("./extract.js");
   const store = new Store(dbPath, { noMigrate: true, busyTimeoutMs: BUSY_MS });
   try {
@@ -52,7 +53,7 @@ async function fileContext(payload: Record<string, unknown>, opts: HookOptions):
     const paths = [...new Set([rel, file.replace(/\\/g, "/")])];
     const seen = new Set<number>();
     const notes = paths
-      .flatMap((p) => store.list({ namespace, kinds: NOTE_KINDS, filePath: p, limit: MAX_ROWS, order: "created_desc" }).notes)
+      .flatMap((p) => store.list({ namespace, kinds: NOTE_KINDS, filePath: p, limit: MAX_ROWS, order: "created_desc", withoutTags: [NEVER_SHOW_TAG] }).notes)
       .filter((n) => !seen.has(n.id) && seen.add(n.id))
       .sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : b.id - a.id))
       .slice(0, MAX_ROWS);
@@ -63,7 +64,7 @@ async function fileContext(payload: Record<string, unknown>, opts: HookOptions):
     const { UNTRUSTED_BANNER } = await import("./security.js");
     const text =
       `OneMemory has earlier memory about ${rel} (advisory; read the file as usual):\n` +
-      notes.map(indexLine).join("\n") +
+      notes.map((n) => indexLine(n)).join("\n") +
       `\nOpen any with memory_get ids=[${notes.map((n) => n.id).join(",")}]`;
     return JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: UNTRUSTED_BANNER + text } });
   } finally {

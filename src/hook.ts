@@ -197,7 +197,8 @@ export async function runHook(eventArg: string, stdinText: string, opts: HookOpt
   try {
     const { runRecall } = await import("./recall.js");
     const cwd = typeof payload.cwd === "string" ? payload.cwd : undefined;
-    return await runRecall({ ...(opts.dbPath ? { dbPath: opts.dbPath } : {}), ...(cwd ? { cwd } : {}) });
+    const sessionId = typeof payload.session_id === "string" ? payload.session_id.slice(0, 200) : undefined;
+    return await runRecall({ ...(opts.dbPath ? { dbPath: opts.dbPath } : {}), ...(cwd ? { cwd } : {}), ...(sessionId ? { sessionId } : {}) });
   } catch {
     return '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""}}';
   }

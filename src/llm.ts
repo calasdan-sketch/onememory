@@ -108,6 +108,10 @@ export async function llmSummarize(store: Store, sessionId: string, env: NodeJS.
     const prompts = (db.prepare("SELECT input FROM capture_events WHERE session_id = ? AND event = 'user-prompt' ORDER BY seq LIMIT ?").all(sessionId, MAX_PROMPTS) as Array<{ input: string }>).map((p) => `- ${p.input.slice(0, 500)}`);
     const user = [`Automatic summary:\n${sum.title}\n${sum.body}`, prompts.length ? `Prompts:\n${prompts.join("\n")}` : ""].filter(Boolean).join("\n\n").slice(0, PROMPT_MAX_CHARS);
     const answer = await chat(cfg, INSTRUCTIONS, user);
+    // The meter (meter.ts): an estimate of what the call cost, sent + received, at ~4 characters a token. Numbers only.
+    const { meterAdd } = await import("./meter.js");
+    const sess = db.prepare("SELECT namespace FROM sessions WHERE id = ?").get(sessionId) as { namespace: string } | undefined;
+    meterAdd(store, sessionId, sess?.namespace ?? "", { llm: Math.ceil((INSTRUCTIONS.length + user.length + (answer?.length ?? 0)) / 4) });
     const parsed = answer === null ? null : parseAnswer(answer);
     if (!parsed) return false;
     // The deterministic lines that are facts, not prose (files, commands, errors), are kept under the model's text.

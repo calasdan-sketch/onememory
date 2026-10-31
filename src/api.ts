@@ -103,6 +103,7 @@ import type { LintFinding } from "./lint.js";
 import { memoryIndex, memoryTimeline, memoryGet, sessionList, sessionGet, fileTimeline, type ReadScope } from "./progressive.js";
 import { HOOK_EVENTS, type HookEvent, isOwnTool, recordEvent, cleanField } from "./capture.js";
 import { distillSession } from "./extract.js";
+import { meterStats } from "./meter.js";
 
 // Minimum scope a request needs: deletes, imports and full /export are admin,
 // creates/updates are write, everything else (read/search/list) is read.
@@ -1100,6 +1101,7 @@ export function createApiServer(
         }
         sendJson(res, 200, {
           ...store.accessStats(namespaces, { hideDistrusted: !isAdmin }),
+          meter: meterStats(store, namespaces),
           searchedNamespaces,
         });
         return;

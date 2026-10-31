@@ -51,6 +51,7 @@ import {
 import { parseTimePhrase } from "./time-parse.js";
 import { TIME_ZONE } from "./config.js";
 import { annotateStaleness } from "./staleness.js";
+import { meterStats } from "./meter.js";
 import {
   findCandidatesGuarded,
   resolveConsolidationNotes,
@@ -804,7 +805,7 @@ export function createMcpServer(
       title: "Memory access statistics",
       annotations: { readOnlyHint: true },
       description:
-        "Read-only access-tracking stats for the shared state store: total notes, total reads, the most-read notes, how many notes were never read (dead-memory candidates for future cleanup), and how many notes are stale (older than the configured staleness thresholds)." +
+        "Read-only access-tracking stats for the shared state store: total notes, total reads, the most-read notes, how many notes were never read (dead-memory candidates for future cleanup), and how many notes are stale (older than the configured staleness thresholds). `meter`: what OneMemory costs (estimated tokens injected at session start and the captured work they stood in for, local-model tokens, capture events, database size), aggregate numbers only." +
         (nsActive
           ? " SERVER-RESOLVED NAMESPACE: stats are scoped to the namespaces this server may read."
           : ""),
@@ -837,7 +838,7 @@ export function createMcpServer(
         // mostAccessed carries note titles -- attacker-writable content
         // returned pre-prompt -- so the untrusted-data banner applies, like
         // every other tool that echoes stored note content.
-        return untrustedResult(store.accessStats(namespaces, { hideDistrusted: !scopeAllows(scope, "admin") }));
+        return untrustedResult({ ...store.accessStats(namespaces, { hideDistrusted: !scopeAllows(scope, "admin") }), meter: meterStats(store, namespaces) });
       } catch (e) {
         return errorFor(e);
       }

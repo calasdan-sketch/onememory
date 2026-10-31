@@ -36,6 +36,39 @@ one cheap SQL query (`ORDER BY updated_at DESC`). Flags:
 Total output is capped at ~8000 characters so the hook never blows up your
 context window.
 
+### Profile, "why shown" tags and never-show
+
+With captured memory the context opens with a short profile, and every memory
+line carries the reason it was picked:
+
+```
+What I know about this project:
+Decisions: use node:sqlite, no native deps
+Key files: src/store.ts (12), src/api.ts (7)
+Last session: Session: refactor the store
+Open tasks: 2 (on the board)
+
+Recent memory (1 note):
+- [Release cadence] {recent 3d}: Ship weekly on Thursdays
+
+Memory index (most relevant first; open with memory_get):
+#41 [bugfix] Fixed the tokenizer for CJK (2026-10-11, ~40 tok) {kw,files 20d}
+
+Why shown, in {}: files = linked to files you changed, kw = matches your branch, ...
+```
+
+- The profile is built from stored notes only (no model): decisions, notes
+  tagged `convention`, the files memory mentions most, the last session and
+  the open-task count. It is capped by `ONEMEMORY_PROFILE_TOKENS` (default
+  300, never more than half the budget); `ONEMEMORY_PROFILE=off` drops it.
+- A note tagged `never-show` is never injected (nor in the profile or the
+  file-context hint). `onememory never-show <id>` sets it, `--undo` clears it;
+  the dashboard has a **never show** button on each note.
+- When Claude Code passes a `session_id` (the `onememory hook session-start`
+  path), the size of what was injected is added to the meter (`onememory
+  doctor`, `GET /stats`, the dashboard's Meter view). Plain `onememory recall`
+  is not metered.
+
 ## Install (Claude Code settings)
 
 ### Prerequisites: how will the hook invoke `onememory`?
